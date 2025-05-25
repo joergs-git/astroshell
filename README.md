@@ -1,4 +1,4 @@
-# astroshell
+# Astroshell Driver and Lunatico Cloudwatcher Solo Integration / Enhancements
 Optimized Arduino Code for controlling of my AstroShell Dome
 
 This arduino code is kind of branched from the producer of the AstroShell Telescope Domes.
