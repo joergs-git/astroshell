@@ -18,6 +18,8 @@ While I initially just planned to solve my little problem I ran into some furthe
 3. Disabled the "vibration motor option" (for whatever it was for). No clue.
 4. Added hardcoded ethernet pinging of my lunatic cloudsensor to automatically close the dome in case the clouddetector is not up and running and thus might not be able to detect rain. Dome will be closed after 3 failed pings within 3 minutes.
 5. Added a new command URL Command $S to get a quick response if the Dome is open or closed (to use it in other scripts or tools e.g. lunatic cloudwatcher solo). I place my little Bash-Shell-Script running on my Lunatico Cloudwatcher Solo device also into this repository so you get an idea of what I established for my self.
+(To start it and keep it running on the solo you have to run it with nohup. e.g. "_nohup /home/aagsolo/rainchecker.sh > /dev/null 2>&1 &_" 
+
 6. optimized memory usage of arduino
 7. disabled Serial debugging Outputs as it's conflicting with Data Input Ports 0,1 from the arduino which are used for the astroshell end-point limit switches.
 8. Some stabilty tweaks and checks
