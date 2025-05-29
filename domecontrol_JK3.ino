@@ -1,4 +1,4 @@
-//OPTIMIZED ARDUINO DOME DRIVER BY ASTROSHELL - ISR OPTIMIZED
+//OPTIMIZED ARDUINO DOME DRIVER BY ASTROSHELL - STABLE NETWORK VERSION rev6
 // --- Configuration Defines ---
 #define SMOOTH 30 
 #define MAX_MOT1_OPEN  20197  
@@ -18,6 +18,7 @@
 // --- Libraries ---
 #include <SPI.h>
 #include <Ethernet.h>
+#include <EEPROM.h>
 
 // --- Automatic Feature Control ---
 #define ENABLE_IP_AUTO_CLOSE       
@@ -48,6 +49,13 @@
 #define VCC1        A1 
 #define VCC2        A0 
 
+// --- EEPROM Addresses for persistent counters ---
+#define EEPROM_MAGIC_BYTE 0x42  // Magic byte to detect first run
+#define EEPROM_ADDR_MAGIC 0     // Address for magic byte
+#define EEPROM_ADDR_TOTAL_IP_FAILS 1  // Address for total IP failures (2 bytes)
+#define EEPROM_ADDR_AUTO_CLOSES 3     // Address for auto-close count (2 bytes)
+#define EEPROM_ADDR_LAST_FAIL_DAY 5   // Address for day counter (1 byte)
+
 // --- Global Variables ---
 boolean newInfo, sw1up_pressed_flag, sw1down_pressed_flag, sw2up_pressed_flag, sw2down_pressed_flag;
 byte cnt = 0, mot1dir = 0, mot2dir = 0, mot1speed = 0, mot2speed = 0;
@@ -61,19 +69,30 @@ EthernetServer server(80);
 
 IPAddress remoteStationIp(192, 168, 1, 151);
 const int remoteStationPort = 80;
+
+// --- Improved IP Monitoring with longer timeframes ---
 byte connectFailCount = 0;
 unsigned long lastConnectAttemptTimestamp = 0;
-const unsigned long connectCheckInterval = 60000UL; 
-const byte maxConnectFails = 3; 
+const unsigned long connectCheckInterval = 180000UL; // 3 minutes between checks (was 1 minute)
+const byte maxConnectFails = 5; // 5 fails needed (was 3)
+unsigned long firstFailTimestamp = 0; // Track when first fail occurred
+const unsigned long maxFailTimeWindow = 500000UL; // 8 minutes window for fails
+
+// Persistent counters
+unsigned int totalIpFailures = 0;     // Total IP failures since installation
+unsigned int totalAutoCloses = 0;     // Total auto-closes triggered
+byte dayCounter = 0;                  // Simple day counter (0-255)
+
 bool m1AutoClosedByIP = false; 
 bool m2AutoClosedByIP = false; 
 
 // --- Network Stability Variables ---
 unsigned long lastNetworkCheck = 0;
-const unsigned long NETWORK_CHECK_INTERVAL = 189000; // 3 minutes
+const unsigned long NETWORK_CHECK_INTERVAL = 600000; // 10 minutes (was 3 minutes)
 bool ethernet_initialized = false;
 unsigned long lastEthernetReset = 0;
-const unsigned long ETHERNET_RESET_INTERVAL = 67000; // 1 minutes
+const unsigned long ETHERNET_RESET_INTERVAL = 3600000; // 60 minutes (was 1 minute)
+unsigned long lastSuccessfulPing = 0;
 
 // ISR Optimization Variables - but preserve original logic
 volatile bool isr_button_events = false;
@@ -86,6 +105,7 @@ volatile byte isr_button_states = 0; // Bitfield for button states
 // #define SERIAL_DEBUG_IP      
 // #define SERIAL_DEBUG_BUTTONS 
 // #define SERIAL_DEBUG_LIMITS  
+// #define SERIAL_DEBUG_EEPROM
 
 volatile boolean system_fully_ready = false;
 
@@ -96,6 +116,66 @@ void handleWebClient();
 void sendFullHtmlResponse(EthernetClient& client);
 void checkRemoteConnectionAndAutoClose();
 void handleStatusUpdates();
+void initializeEEPROM();
+void saveCountersToEEPROM();
+void incrementDayCounter();
+
+// --- EEPROM Functions ---
+void initializeEEPROM() {
+  // Check if EEPROM has been initialized
+  if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC_BYTE) {
+    #if defined(SERIAL_DEBUG_EEPROM)
+    Serial.println(F("EEPROM: First run - initializing"));
+    #endif
+    
+    // First run - initialize EEPROM
+    EEPROM.write(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_BYTE);
+    EEPROM.put(EEPROM_ADDR_TOTAL_IP_FAILS, (unsigned int)0);
+    EEPROM.put(EEPROM_ADDR_AUTO_CLOSES, (unsigned int)0);
+    EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, 0);
+  } else {
+    // Load existing values
+    EEPROM.get(EEPROM_ADDR_TOTAL_IP_FAILS, totalIpFailures);
+    EEPROM.get(EEPROM_ADDR_AUTO_CLOSES, totalAutoCloses);
+    dayCounter = EEPROM.read(EEPROM_ADDR_LAST_FAIL_DAY);
+    
+    #if defined(SERIAL_DEBUG_EEPROM)
+    Serial.print(F("EEPROM: Loaded - IP Fails: ")); Serial.print(totalIpFailures);
+    Serial.print(F(", Auto-Closes: ")); Serial.print(totalAutoCloses);
+    Serial.print(F(", Day: ")); Serial.println(dayCounter);
+    #endif
+  }
+}
+
+void saveCountersToEEPROM() {
+  static unsigned long lastSave = 0;
+  
+  // Only save every 5 minutes to reduce EEPROM wear
+  if (millis() - lastSave > 300000UL) {
+    EEPROM.put(EEPROM_ADDR_TOTAL_IP_FAILS, totalIpFailures);
+    EEPROM.put(EEPROM_ADDR_AUTO_CLOSES, totalAutoCloses);
+    EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);
+    lastSave = millis();
+    
+    #if defined(SERIAL_DEBUG_EEPROM)
+    Serial.println(F("EEPROM: Counters saved"));
+    #endif
+  }
+}
+
+void incrementDayCounter() {
+  static unsigned long lastDayIncrement = 0;
+  
+  // Simple day counter - increment every 24 hours
+  if (millis() - lastDayIncrement > 86400000UL) { // 24 hours
+    dayCounter++;
+    if (dayCounter > 250) dayCounter = 0; // Wrap around before 255
+    lastDayIncrement = millis();
+    
+    // Save immediately when day changes
+    EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);
+  }
+}
 
 // --- Improved Ethernet Initialization ---
 void setupEthernet() {
@@ -124,6 +204,7 @@ void setupEthernet() {
       server.begin();
       ethernet_initialized = true;
       lastEthernetReset = millis();
+      lastSuccessfulPing = millis();
       return; // Successfully initialized
     }
     
@@ -139,7 +220,7 @@ void setupEthernet() {
 void networkWatchdog() {
   unsigned long currentTime = millis();
   
-  // Regular network checks
+  // Regular network checks - less frequent
   if (currentTime - lastNetworkCheck > NETWORK_CHECK_INTERVAL) {
     lastNetworkCheck = currentTime;
     
@@ -160,7 +241,7 @@ void networkWatchdog() {
     }
   }
   
-  // Preventive reset every 30 minutes
+  // Preventive reset every hour
   if (currentTime - lastEthernetReset > ETHERNET_RESET_INTERVAL) {
     setupEthernet();
   }
@@ -181,16 +262,20 @@ void handleStatusUpdates() {
 }
 
 void setup() {
-  #if defined(SERIAL_DEBUG_GENERAL) || defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_BUTTONS) || defined(SERIAL_DEBUG_LIMITS)
+  #if defined(SERIAL_DEBUG_GENERAL) || defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_BUTTONS) || defined(SERIAL_DEBUG_LIMITS) || defined(SERIAL_DEBUG_EEPROM)
     Serial.begin(115200);
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); } 
     Serial.println(F("------------------------------"));
+    Serial.println(F("Dome Control v3.1 - Stable Network"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
     }
   #endif
+
+  // Initialize EEPROM and load counters
+  initializeEEPROM();
 
   // Original initialization UNCHANGED
   mot1dir = 0; mot2dir = 0;
@@ -198,6 +283,8 @@ void setup() {
   m1AutoClosedByIP = false; m2AutoClosedByIP = false;
   vccerr = 0;  
   cnt = 0;      
+  connectFailCount = 0;
+  firstFailTimestamp = 0;
 
   // ISR Optimization Flags initialization
   isr_button_events = false;
@@ -248,24 +335,16 @@ void setup() {
   system_fully_ready = true; 
 }
 
-// IMPROVED checkRemoteConnectionAndAutoClose
+// IMPROVED checkRemoteConnectionAndAutoClose with time window
 void checkRemoteConnectionAndAutoClose() {
-    // KRITISCH: Ethernet nicht initialisiert = Sofortiger Auto-Close
+    // Network problems are now handled with same 15-minute rule as connection failures
+    bool networkProblem = false;
+    
     if (!ethernet_initialized) {
+        networkProblem = true;
         #if defined(SERIAL_DEBUG_IP)
-        Serial.println(F("IP Check: Ethernet not initialized - EMERGENCY AUTO-CLOSE"));
+        Serial.println(F("IP Check: Ethernet not initialized - will check time window"));
         #endif
-        
-        bool action_taken = false;
-        if (mot1dir != OPEN && !digitalRead(lim1open)) { 
-            mot1dir = OPEN; mot1timer = MAX_MOT1_OPEN; 
-            m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
-        }
-        if (mot2dir != OPEN && !digitalRead(lim2open)) { 
-            mot2dir = OPEN; mot2timer = MAX_MOT2_OPEN; 
-            m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
-        }
-        return;
     }
     
     bool domeIsNotFullyClosed;
@@ -278,12 +357,13 @@ void checkRemoteConnectionAndAutoClose() {
     }
 
     if (domeIsNotFullyClosed) {
-        // *** NEU: Erweiterte Link-Status Prüfung mit Auto-Recovery ***
+        // *** Check for network problems ***
         bool linkDown = false;
         bool needsRecovery = false;
         
         if (Ethernet.linkStatus() == LinkOFF) {
             linkDown = true;
+            networkProblem = true;
             #if defined(SERIAL_DEBUG_IP)
             Serial.println(F("IP Check: Ethernet cable disconnected"));
             #endif
@@ -292,6 +372,7 @@ void checkRemoteConnectionAndAutoClose() {
             IPAddress currentIP = Ethernet.localIP();
             if (currentIP == IPAddress(0,0,0,0)) {
                 needsRecovery = true;
+                networkProblem = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F("IP Check: Link OK but IP lost - needs recovery"));
                 #endif
@@ -300,29 +381,40 @@ void checkRemoteConnectionAndAutoClose() {
         
         // *** Auto-Recovery: Ethernet reinitialisieren wenn Link wieder da ist ***
         static bool wasLinkDown = false;
-        if (wasLinkDown && !linkDown && !needsRecovery) {
+        if (wasLinkDown && !linkDown && !needsRecovery && ethernet_initialized) {
             #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Cable reconnected - reinitializing Ethernet"));
+            Serial.println(F("IP Check: Network restored - reinitializing Ethernet"));
             #endif
             setupEthernet(); // Ethernet neu initialisieren
             wasLinkDown = false;
-        } else if (linkDown) {
+            // Reset fail counters on recovery
+            connectFailCount = 0;
+            firstFailTimestamp = 0;
+        } else if (linkDown || !ethernet_initialized) {
             wasLinkDown = true;
         }
         
         // IP-Recovery falls nötig
-        if (needsRecovery) {
+        if (needsRecovery && ethernet_initialized) {
             #if defined(SERIAL_DEBUG_IP)
             Serial.println(F("IP Check: Attempting IP recovery"));
             #endif
             setupEthernet();
         }
         
+        // Check connection with longer intervals
         if (millis() - lastConnectAttemptTimestamp >= connectCheckInterval) {
             bool connectionOK = false;
             
-            // Nur versuchen zu verbinden wenn Link da ist und IP OK
-            if (!linkDown && !needsRecovery) {
+            // If network has problems, count as failed attempt
+            if (networkProblem) {
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F("IP Check: Network problem - counting as failed attempt"));
+                #endif
+                connectionOK = false;
+            }
+            // Only try to connect if network is OK
+            else if (!linkDown && !needsRecovery && ethernet_initialized) {
                 EthernetClient netClient;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.print(F("IP Check: Connecting to "));Serial.print(remoteStationIp);Serial.println(F("..."));
@@ -331,8 +423,9 @@ void checkRemoteConnectionAndAutoClose() {
                 unsigned long connectStart = millis();
                 bool connected = netClient.connect(remoteStationIp, remoteStationPort);
                 
-                if (connected && (millis() - connectStart < 3000)) {
+                if (connected && (millis() - connectStart < 5000)) { // Longer timeout
                     connectionOK = true;
+                    lastSuccessfulPing = millis();
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F("IP Check: Connection successful."));
                     #endif
@@ -345,15 +438,12 @@ void checkRemoteConnectionAndAutoClose() {
                         netClient.stop();
                     }
                 }
-            } else {
-                #if defined(SERIAL_DEBUG_IP)
-                if (linkDown) Serial.println(F("IP Check: Skipping - cable disconnected."));
-                if (needsRecovery) Serial.println(F("IP Check: Skipping - IP recovery in progress."));
-                #endif
             }
             
             if (connectionOK) {
+                // SUCCESS - Reset all fail counters
                 connectFailCount = 0;
+                firstFailTimestamp = 0; // Reset time window
                 
                 // STOPPE AUTO-CLOSE BEI ERFOLGREICHER VERBINDUNG
                 if (m1AutoClosedByIP && mot1dir == OPEN) {
@@ -369,22 +459,51 @@ void checkRemoteConnectionAndAutoClose() {
                     #endif
                 }
             } else {
-                // Verbindung fehlgeschlagen
+                // FAILURE - Increment counter and track time
+                if (firstFailTimestamp == 0) {
+                    firstFailTimestamp = millis(); // Start time window
+                }
+                
                 connectFailCount++;
+                totalIpFailures++; // Increment persistent counter
+                
+                // Check if we're still within the 15-minute window
+                if (millis() - firstFailTimestamp > maxFailTimeWindow) {
+                    // Time window expired - reset counters
+                    #if defined(SERIAL_DEBUG_IP)
+                    Serial.println(F("IP Check: 8-minute window expired - resetting fail count"));
+                    #endif
+                    connectFailCount = 1; // Start fresh with this failure
+                    firstFailTimestamp = millis();
+                }
             }
             
             lastConnectAttemptTimestamp = millis();
             #if defined(SERIAL_DEBUG_IP)
-            Serial.print(F("IP Check: Fail count: ")); Serial.println(connectFailCount);
+            Serial.print(F("IP Check: Fail count: ")); Serial.print(connectFailCount);
+            Serial.print(F("/")); Serial.print(maxConnectFails);
+            Serial.print(F(" in ")); Serial.print((millis() - firstFailTimestamp) / 60000);
+            Serial.println(F(" minutes"));
+            if (networkProblem) {
+                if (!ethernet_initialized) Serial.println(F("Reason: Ethernet not initialized"));
+                else if (linkDown) Serial.println(F("Reason: Cable disconnected"));
+                else if (needsRecovery) Serial.println(F("Reason: IP lost"));
+            }
             #endif
         }
         
-        if (connectFailCount >= maxConnectFails) {
+        // Only trigger auto-close if we have enough failures within the time window
+        if (connectFailCount >= maxConnectFails && 
+            (millis() - firstFailTimestamp <= maxFailTimeWindow)) {
             #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Max fails. Triggering auto-close."));
-            if (linkDown) Serial.println(F("Reason: Cable disconnected"));
-            else if (needsRecovery) Serial.println(F("Reason: IP lost"));
-            else Serial.println(F("Reason: Target IP unreachable"));
+            Serial.println(F("IP Check: Max fails within 8 minutes. Triggering auto-close."));
+            if (networkProblem) {
+                if (!ethernet_initialized) Serial.println(F("Reason: Ethernet stack problem"));
+                else if (linkDown) Serial.println(F("Reason: Cable disconnected"));
+                else if (needsRecovery) Serial.println(F("Reason: IP lost"));
+            } else {
+                Serial.println(F("Reason: Target IP unreachable"));
+            }
             #endif
             
             bool action_taken = false;
@@ -396,11 +515,19 @@ void checkRemoteConnectionAndAutoClose() {
                 mot2dir = OPEN; mot2timer = MAX_MOT2_OPEN; 
                 m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
             }
+            
+            if (action_taken) {
+                totalAutoCloses++; // Increment persistent counter
+                saveCountersToEEPROM();
+            }
+            
             connectFailCount = 0; 
+            firstFailTimestamp = 0; // Reset time window
         }
     } else { 
         // Kuppel ist geschlossen - alles zurücksetzen
         connectFailCount = 0; 
+        firstFailTimestamp = 0;
         lastConnectAttemptTimestamp = millis(); 
         if (m1AutoClosedByIP) m1AutoClosedByIP = false;
         if (m2AutoClosedByIP) m2AutoClosedByIP = false;
@@ -411,6 +538,8 @@ void handleWebClient() {
   EthernetClient client = server.available();
   if (!client) return;
   
+  lastSuccessfulPing = millis(); // Update activity
+  
   #if defined(SERIAL_DEBUG_GENERAL)
   Serial.println(F("Web: Client connected."));
   #endif
@@ -418,6 +547,7 @@ void handleWebClient() {
   unsigned long clientRequestStart = millis();
   bool action_parameter_in_url = false; 
   bool plain_text_status_request = false; 
+  bool reset_counters_request = false;
 
   while (client.connected()) {
     // MUCH MORE AGGRESSIVE TIMEOUT - Key fix!
@@ -438,6 +568,12 @@ void handleWebClient() {
            #if defined(SERIAL_DEBUG_GENERAL)
               Serial.print(F("Web: Action param: $")); Serial.println(c);
            #endif
+        }
+        
+        // Check for reset counters command
+        if (c == 'R' || c == 'r') {
+          reset_counters_request = true;
+          action_parameter_in_url = true;
         }
         
  // IMPROVED WEB LOGIC - Automatic stop before new command
@@ -498,7 +634,7 @@ void handleWebClient() {
         if (c != '$') { newInfo = false; }
       } else if (newInfo && !system_fully_ready) { 
           if (c != '$') newInfo = false; 
-          if ((c >= '1' && c <= '5') || c == 'S' || c == 's') {
+          if ((c >= '1' && c <= '5') || c == 'S' || c == 's' || c == 'R' || c == 'r') {
                action_parameter_in_url = true; 
                if (c == 'S' || c == 's') plain_text_status_request = false; 
           }
@@ -509,7 +645,18 @@ void handleWebClient() {
         Serial.println(F("Web: Sending quick response"));
         #endif
 
-        if (plain_text_status_request) {
+        if (reset_counters_request) {
+          // Reset persistent counters
+          totalIpFailures = 0;
+          totalAutoCloses = 0;
+          EEPROM.put(EEPROM_ADDR_TOTAL_IP_FAILS, totalIpFailures);
+          EEPROM.put(EEPROM_ADDR_AUTO_CLOSES, totalAutoCloses);
+          
+          client.println(F("HTTP/1.1 303 See Other")); 
+          client.println(F("Location: /")); 
+          client.println(F("Connection: close")); 
+          client.println();
+        } else if (plain_text_status_request) {
           client.println(F("HTTP/1.1 200 OK"));
           client.println(F("Content-Type: text/plain"));
           client.println(F("Connection: close"));
@@ -548,7 +695,7 @@ void handleWebClient() {
 }
 
 void sendFullHtmlResponse(EthernetClient& client) {
-  // ORIGINAL HTML layout preserved  
+  // ORIGINAL HTML layout preserved with persistent counters added
   client.println(F("HTTP/1.1 200 OK")); client.println(F("Content-Type: text/html; charset=utf-8"));
   client.println(F("Connection: close"));
   if (system_fully_ready) client.println(F("Refresh: 10")); 
@@ -563,12 +710,14 @@ void sendFullHtmlResponse(EthernetClient& client) {
   client.println(F("a.button{display:inline-block;width:45%;padding:12px;margin:5px 2%;border:none;border-radius:8px;color:white!important;cursor:pointer;font-size:1em;text-align:center;text-decoration:none;box-sizing:border-box;}"));
   client.println(F("a.button.fullwidth{width:90%;}")); // For STOP button
   client.println(F(".b-open{background-color:#5cb85c;} .b-close{background-color:#337ab7;} .b-stop{background-color:#dc3545;}"));
+  client.println(F(".b-reset{background-color:#6c757d;font-size:0.8em;padding:8px;}"));
   client.println(F(".status{margin-top:5px;margin-bottom:15px;padding:8px;border:1px solid #ccc;border-radius:4px;text-align:center;font-size:0.95em;}"));
   client.println(F(".section{margin-bottom:15px;padding:10px;border:1px solid #eee;border-radius:5px;}")); 
   client.println(F(".button-pair{display:flex;justify-content:space-around;margin-bottom:5px;}"));
   client.println(F("table{width:100%;margin-top:10px;border-collapse:collapse;} td,th{padding:6px;border:1px solid #ddd;text-align:left;font-size:0.9em;}"));
   client.println(F("th{background-color:#f8f8f8;}"));
   client.println(F(".social-links{text-align:center;font-size:0.8em;margin-bottom:15px;}")); // Social links CSS
+  client.println(F(".warning{color:#d9534f;font-weight:bold;}"));
   client.println(F("</style></head><body><div class='container'>"));
   
   if (!system_fully_ready) {
@@ -655,16 +804,52 @@ void sendFullHtmlResponse(EthernetClient& client) {
       client.println(F("</div></div>"));
                                                       
       client.println(F("<div class='section'><h2>System Status</h2><table>"));
-      client.print(F("<tr><th>Sensor</th><th>State (Raw DigitalRead -> Meaning)</th></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(lim1open);client.print(F(")</td><td>")); client.print(digitalRead(lim1open) ? F("HIGH (Limit Active)") : F("LOW (Limit Inactive)")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(lim1closed);client.print(F(")</td><td>")); client.print(digitalRead(lim1closed) ? F("HIGH (Limit Active)") : F("LOW (Limit Inactive)")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(lim2open);client.print(F(")</td><td>")); client.print(digitalRead(lim2open) ? F("HIGH (Limit Active)") : F("LOW (Limit Inactive)")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(lim2closed);client.print(F(")</td><td>")); client.print(digitalRead(lim2closed) ? F("HIGH (Limit Active)") : F("LOW (Limit Inactive)")); client.println(F("</td></tr>"));
+      client.print(F("<tr><th>Sensor</th><th>State</th></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(lim1open);client.print(F(")</td><td>")); client.print(digitalRead(lim1open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(lim1closed);client.print(F(")</td><td>")); client.print(digitalRead(lim1closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(lim2open);client.print(F(")</td><td>")); client.print(digitalRead(lim2open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(lim2closed);client.print(F(")</td><td>")); client.print(digitalRead(lim2closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
       client.print(F("<tr><td>VCC1 (Main Power)</td><td>")); client.print((float)analogRead(VCC1) * 24.0f / 1023.0f * (1023.0f / VCC_RAW_MAX), 1); client.println(F("V</td></tr>"));
       client.print(F("<tr><td>SWSTOP Pressed</td><td>")); client.print(!digitalRead(SWSTOP) ? F("YES") : F("NO")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>IP Connect Fails</td><td>")); client.print(connectFailCount); client.print(F("/")); client.print(maxConnectFails); client.println(F("</td></tr>"));
       client.print(F("<tr><td>Network Status</td><td>")); client.print(ethernet_initialized ? F("OK") : F("ERROR")); client.println(F("</td></tr>"));
       client.println(F("</table></div>"));
+      
+      // --- IP Monitoring Status ---
+      client.println(F("<div class='section'><h2>IP Monitoring</h2><table>"));
+      client.print(F("<tr><td>Current IP Fails</td><td>")); 
+      client.print(connectFailCount); 
+      client.print(F("/")); 
+      client.print(maxConnectFails);
+      if (firstFailTimestamp > 0) {
+        client.print(F(" ("));
+        client.print((millis() - firstFailTimestamp) / 60000);
+        client.print(F(" min)"));
+      }
+      client.println(F("</td></tr>"));
+      
+      client.print(F("<tr><td>Total IP Failures</td><td class='"));
+      if (totalIpFailures > 100) client.print(F("warning"));
+      client.print(F("'>")); 
+      client.print(totalIpFailures); 
+      client.println(F("</td></tr>"));
+      
+      client.print(F("<tr><td>Total Auto-Closes</td><td class='"));
+      if (totalAutoCloses > 10) client.print(F("warning"));
+      client.print(F("'>")); 
+      client.print(totalAutoCloses); 
+      client.println(F("</td></tr>"));
+      
+      client.print(F("<tr><td>Days Running</td><td>")); 
+      client.print(dayCounter); 
+      client.println(F("</td></tr>"));
+      
+      client.print(F("<tr><td>Last Activity</td><td>")); 
+      client.print((millis() - lastSuccessfulPing) / 1000); 
+      client.println(F("s ago</td></tr>"));
+      
+      client.println(F("</table>"));
+      client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
+      client.println(F("</div>"));
   } 
   client.println(F("</div></body></html>"));
 }
@@ -672,10 +857,9 @@ void sendFullHtmlResponse(EthernetClient& client) {
 void loop() {
   if (system_fully_ready) { 
     networkWatchdog(); // Monitor network
-    
-    // CRITICAL: Move VCC monitoring out of ISR to prevent Ethernet timeouts
-    // handleVccMonitoring() - DISABLED for better performance
     handleStatusUpdates();    // Status updates from ISR - ORIGINAL status logic
+    incrementDayCounter();     // Update day counter
+    saveCountersToEEPROM();   // Save counters periodically
     
     #if defined(ENABLE_IP_AUTO_CLOSE)
       checkRemoteConnectionAndAutoClose();
