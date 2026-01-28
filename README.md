@@ -34,3 +34,6 @@ It's always a good idea to try out things while the dome is half open (not fully
 
 Cheers
 Joerg
+
+Addons:
+BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has a bit more memory so not running into certain issues. 
