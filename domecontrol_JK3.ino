@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - STABLE NETWORK VERSION rev7
+// ASTROSHELL DOME CONTROLLER - STABLE NETWORK VERSION rev8 (v3.2)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 // Purpose:  Controls two-shutter astronomical dome with automatic rain protection
@@ -136,15 +136,16 @@ const int remoteStationPort = 80;
 //=============================================================================
 // IP FAILURE DETECTION CONFIGURATION
 //=============================================================================
-// Auto-close triggers after 5 failed connection attempts within 8 minutes.
-// This prevents false triggers from brief network glitches.
+// Auto-close triggers after 5 failed connection attempts within 5 minutes.
+// This ensures dome closes within 5 minutes of Cloudwatcher becoming unreachable.
+// Timing: 5 checks × 1 minute interval = 5 minutes maximum response time.
 
 byte connectFailCount = 0;                          // Current consecutive failures
 unsigned long lastConnectAttemptTimestamp = 0;      // Last connection check time
-const unsigned long connectCheckInterval = 180000UL; // Check every 3 minutes
+const unsigned long connectCheckInterval = 60000UL; // Check every 1 minute
 const byte maxConnectFails = 5;                     // Failures needed to trigger
 unsigned long firstFailTimestamp = 0;               // When failure window started
-const unsigned long maxFailTimeWindow = 500000UL;   // 8-minute window for counting
+const unsigned long maxFailTimeWindow = 300000UL;   // 5-minute window for counting
 
 // --- Persistent Statistics (saved to EEPROM) ---
 unsigned int totalIpFailures = 0;     // Lifetime IP failure count
@@ -155,6 +156,12 @@ bool eepromDirty = false;             // True if counters need saving
 // --- Auto-Close State Tracking ---
 bool m1AutoClosedByIP = false;        // True if M1 was auto-closed due to IP fail
 bool m2AutoClosedByIP = false;        // True if M2 was auto-closed due to IP fail
+bool cableRemovalAutoCloseTriggered = false;  // Prevents repeated auto-close on cable removal
+
+// --- Network Monitoring Activation ---
+// IP monitoring only activates once an Ethernet cable has been detected.
+// This allows non-networked setups to operate without false auto-closes.
+bool networkMonitoringEnabled = false; // True once cable detected (stays true)
 
 //=============================================================================
 // NETWORK WATCHDOG CONFIGURATION
@@ -324,31 +331,59 @@ void setupEthernet() {
  */
 void networkWatchdog() {
   unsigned long currentTime = millis();
+  static unsigned long lastCableCheck = 0;
 
-  // Periodic health check
+  // --- Standalone mode: check for late cable insertion every 1 minute ---
+  if (!networkMonitoringEnabled) {
+    if (currentTime - lastCableCheck > 60000UL) {  // 1 minute
+      lastCableCheck = currentTime;
+      #if defined(SERIAL_DEBUG_IP)
+      Serial.print(F("Standalone: Checking for cable... Link="));
+      Serial.println(Ethernet.linkStatus() == LinkON ? 1 : 0);
+      #endif
+      // Quick non-blocking check if cable was inserted
+      if (Ethernet.linkStatus() == LinkON) {
+        #if defined(SERIAL_DEBUG_IP)
+        Serial.println(F("Standalone: Cable found! Initializing network..."));
+        #endif
+        setupEthernet();  // Now do full init since cable is present
+        if (ethernet_initialized) {
+          networkMonitoringEnabled = true;
+          #if defined(SERIAL_DEBUG_IP)
+          Serial.println(F("Standalone: Network ready - IP monitoring ENABLED"));
+          #endif
+        }
+      }
+    }
+    return;  // Skip all other network checks in standalone mode
+  }
+
+  // Periodic health check (network mode only)
   if (currentTime - lastNetworkCheck > NETWORK_CHECK_INTERVAL) {
     lastNetworkCheck = currentTime;
 
-    // Check if Ethernet cable is connected
+    // --- Network mode: monitor health ---
+    // Check if Ethernet cable is still connected
     if (Ethernet.linkStatus() == LinkOFF) {
       ethernet_initialized = false;
+      // DON'T try to recover here - let auto-close handle cable removal
+      // Calling setupEthernet() would block for ~22 seconds and interfere
+      // with the auto-close timing in checkRemoteConnectionAndAutoClose()
+      return;
     }
 
-    // Check if IP stack is functional
+    // Check if IP stack is functional (only if link is up)
     IPAddress currentIP = Ethernet.localIP();
     if (currentIP == IPAddress(0,0,0,0)) {
+      // Link is up but IP lost - software issue, try to recover
       ethernet_initialized = false;
-    }
-
-    // Attempt recovery if problems detected
-    if (!ethernet_initialized) {
       setupEthernet();
     }
   }
 
-  // Preventive hourly reset for long-term stability
-  // W5100/W5500 can develop issues over extended operation
-  if (currentTime - lastEthernetReset > ETHERNET_RESET_INTERVAL) {
+  // Preventive hourly reset for long-term stability (only when everything is working)
+  if (networkMonitoringEnabled && ethernet_initialized &&
+      (currentTime - lastEthernetReset > ETHERNET_RESET_INTERVAL)) {
     setupEthernet();
   }
 }
@@ -363,7 +398,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v3.1 - Stable Network"));
+    Serial.println(F("Dome Control v3.2 - Stable Network"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -377,6 +412,7 @@ void setup() {
   mot1dir = 0; mot2dir = 0;           // Motors off
   stop1reason = 0; stop2reason = 0;   // Clear stop reasons
   m1AutoClosedByIP = false; m2AutoClosedByIP = false;
+  cableRemovalAutoCloseTriggered = false;
   vccerr = 0;
   cnt = 0;
   connectFailCount = 0;
@@ -405,20 +441,8 @@ void setup() {
   pinMode(10, OUTPUT);
   digitalWrite(10, HIGH);
 
-  #if defined(SERIAL_DEBUG_GENERAL)
-    Serial.println(F("Setup: Pin modes set. Initializing Ethernet..."));
-  #endif
-
-  delay(500);  // Brief settling time
-
-  // --- Initialize network ---
-  setupEthernet();
-
-  #if defined(SERIAL_DEBUG_GENERAL)
-  Serial.println(F("Setup: Web server started."));
-  #endif
-
-  // --- Configure Timer2 for ISR ---
+  // --- Configure Timer2 for ISR FIRST ---
+  // This ensures physical buttons work immediately, even during Ethernet setup.
   // Timer2 generates ~61 Hz interrupt for motor control and button handling.
   // CTC mode with prescaler 1024: 16MHz / (1024 * 256) = 61 Hz
   cli();                                            // Disable interrupts
@@ -428,12 +452,41 @@ void setup() {
   TIMSK2 |= (1 << OCIE2A);                          // Enable compare interrupt
   sei();                                            // Enable interrupts
 
+  system_fully_ready = true;  // Allow ISR to process motor commands immediately
+
   #if defined(SERIAL_DEBUG_GENERAL)
-  Serial.println(F("Setup: Timer ISR configured."));
-  Serial.println(F("Setup: Complete. ISRs will be fully processed now."));
+  Serial.println(F("Setup: Timer ISR configured - buttons now active."));
   #endif
 
-  system_fully_ready = true;  // Allow ISR to process motor commands
+  // --- Quick cable detection before full Ethernet init ---
+  // Minimal SPI init to check if cable is present
+  delay(100);
+  Ethernet.begin(mac, ip);  // Quick init to read link status
+  delay(500);               // Brief stabilization
+
+  #if defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_GENERAL)
+  Serial.print(F("Setup: Initial Link="));
+  Serial.println(Ethernet.linkStatus() == LinkON ? 1 : 0);
+  #endif
+
+  if (Ethernet.linkStatus() == LinkON) {
+    // Cable present - do full Ethernet setup with retries
+    networkMonitoringEnabled = true;
+    #if defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_GENERAL)
+    Serial.println(F("Setup: Cable detected - initializing network..."));
+    #endif
+    setupEthernet();
+    #if defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_GENERAL)
+    Serial.println(F("Setup: Network ready, IP monitoring ENABLED."));
+    #endif
+  } else {
+    // No cable - skip lengthy Ethernet setup, run in standalone mode
+    networkMonitoringEnabled = false;
+    ethernet_initialized = false;
+    #if defined(SERIAL_DEBUG_IP) || defined(SERIAL_DEBUG_GENERAL)
+    Serial.println(F("Setup: No cable - STANDALONE MODE, IP monitoring DISABLED."));
+    #endif
+  }
 
   // --- Enable hardware watchdog ---
   // System auto-resets if loop() blocks for more than 8 seconds.
@@ -448,31 +501,66 @@ void setup() {
  * Monitors connectivity to Cloudwatcher and triggers auto-close on failure.
  *
  * Safety Logic:
- * - Checks connection every 3 minutes when dome is open
- * - Counts failures within a sliding 8-minute window
- * - After 5 failures in 8 minutes, auto-closes dome
- * - Recovers gracefully if connection is restored
+ * - Checks connection every 1 minute when dome is not fully closed
+ * - Counts failures within a sliding 5-minute window
+ * - After 5 consecutive failures, auto-closes dome immediately
+ * - Works regardless of dome state: fully open, intermediate, or moving
+ * - If dome is opening, it will stop and reverse to close
+ * - Recovers gracefully if connection is restored during close
  *
  * This protects the telescope from rain if the Cloudwatcher (which monitors
  * weather) becomes unreachable - we assume the worst and close the dome.
  */
 void checkRemoteConnectionAndAutoClose() {
+    // Skip all IP monitoring if no cable has ever been detected
+    // This allows non-networked setups to operate without false auto-closes
+    if (!networkMonitoringEnabled) {
+      return;
+    }
+
+    // --- Debug: Show current status ---
+    #if defined(SERIAL_DEBUG_IP)
+    static unsigned long lastDebugPrint = 0;
+    if (millis() - lastDebugPrint > 10000) {  // Print status every 10 seconds
+      lastDebugPrint = millis();
+      Serial.print(F("IP Status: Link="));
+      Serial.print(Ethernet.linkStatus() == LinkON ? 1 : 0);
+      Serial.print(F(" EthInit="));
+      Serial.print(ethernet_initialized ? 1 : 0);
+      Serial.print(F(" NetMon="));
+      Serial.print(networkMonitoringEnabled ? 1 : 0);
+      Serial.print(F(" Fails="));
+      Serial.print(connectFailCount);
+      Serial.print(F("/"));
+      Serial.print(maxConnectFails);
+      Serial.print(F(" S1closed="));
+      Serial.print(digitalRead(lim1open) ? 1 : 0);
+      Serial.print(F(" S2closed="));
+      Serial.println(digitalRead(lim2open) ? 1 : 0);
+    }
+    #endif
+
     bool networkProblem = false;
-    
+
     if (!ethernet_initialized) {
         networkProblem = true;
         #if defined(SERIAL_DEBUG_IP)
-        Serial.println(F("IP Check: Ethernet not initialized - will check time window"));
+        Serial.println(F("IP Check: EthInit=0"));
         #endif
     }
-    
+
+    // Determine if dome needs protection (any state except fully closed)
+    // Covers: fully open, intermediate position, currently opening, currently closing
     bool domeIsNotFullyClosed;
-    if (!digitalRead(lim1open) || !digitalRead(lim2open)) { 
+    if (!digitalRead(lim1open) || !digitalRead(lim2open)) {
+        // At least one shutter is not at closed position
         domeIsNotFullyClosed = true;
-    } else if (mot1dir == CLOSE || mot2dir == CLOSE) { 
+    } else if (mot1dir == CLOSE || mot2dir == CLOSE) {
+        // Motors actively opening (even if at closed limit, motor is trying to open)
         domeIsNotFullyClosed = true;
-    } else { 
-        domeIsNotFullyClosed = false; 
+    } else {
+        // Both shutters at closed position and motors not opening
+        domeIsNotFullyClosed = false;
     }
 
     if (domeIsNotFullyClosed) {
@@ -483,10 +571,48 @@ void checkRemoteConnectionAndAutoClose() {
         if (Ethernet.linkStatus() == LinkOFF) {
             linkDown = true;
             networkProblem = true;
-            #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Ethernet cable disconnected"));
-            #endif
+
+            // Cable physically removed - close dome immediately (only once per removal)
+            if (!cableRemovalAutoCloseTriggered) {
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F("IP Check: Cable removed - triggering immediate auto-close"));
+                #endif
+
+                bool action_taken = false;
+                if (mot1dir != OPEN && !digitalRead(lim1open)) {
+                    mot1dir = OPEN; mot1timer = MAX_MOT1_OPEN;
+                    m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
+                    #if defined(SERIAL_DEBUG_IP)
+                    Serial.println(F(">>> AUTO-CLOSE: S1 motor started (cable removed)"));
+                    #endif
+                }
+                if (mot2dir != OPEN && !digitalRead(lim2open)) {
+                    mot2dir = OPEN; mot2timer = MAX_MOT2_OPEN;
+                    m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
+                    #if defined(SERIAL_DEBUG_IP)
+                    Serial.println(F(">>> AUTO-CLOSE: S2 motor started (cable removed)"));
+                    #endif
+                }
+                if (action_taken) {
+                    totalAutoCloses++;
+                    eepromDirty = true;
+                    saveCountersToEEPROM();
+                    #if defined(SERIAL_DEBUG_IP)
+                    Serial.print(F(">>> AUTO-CLOSE COUNT: "));
+                    Serial.println(totalAutoCloses);
+                    #endif
+                }
+                cableRemovalAutoCloseTriggered = true;  // Prevent repeated triggering
+            }
+            return;  // Skip further checks while cable is out
         } else if (Ethernet.linkStatus() == LinkON) {
+            // Cable is back - reset the trigger flag
+            if (cableRemovalAutoCloseTriggered) {
+                cableRemovalAutoCloseTriggered = false;
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F("IP Check: Cable reconnected - reset trigger flag"));
+                #endif
+            }
             // Link ist da, aber IP prüfen
             IPAddress currentIP = Ethernet.localIP();
             if (currentIP == IPAddress(0,0,0,0)) {
@@ -524,7 +650,7 @@ void checkRemoteConnectionAndAutoClose() {
         // Check connection with longer intervals
         if (millis() - lastConnectAttemptTimestamp >= connectCheckInterval) {
             bool connectionOK = false;
-            
+
             // If network has problems, count as failed attempt
             if (networkProblem) {
                 #if defined(SERIAL_DEBUG_IP)
@@ -535,14 +661,18 @@ void checkRemoteConnectionAndAutoClose() {
             // Only try to connect if network is OK
             else if (!linkDown && !needsRecovery && ethernet_initialized) {
                 EthernetClient netClient;
+                netClient.setTimeout(3000);  // 3 second timeout (must be < 8s watchdog)
+
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.print(F("IP Check: Connecting to "));Serial.print(remoteStationIp);Serial.println(F("..."));
                 #endif
-                
+
+                wdt_reset();  // Reset watchdog before potentially blocking call
                 unsigned long connectStart = millis();
                 bool connected = netClient.connect(remoteStationIp, remoteStationPort);
-                
-                if (connected && (millis() - connectStart < 5000)) { // Longer timeout
+                wdt_reset();  // Reset watchdog after blocking call
+
+                if (connected && (millis() - connectStart < 5000)) {
                     connectionOK = true;
                     lastSuccessfulPing = millis();
                     #if defined(SERIAL_DEBUG_IP)
@@ -587,11 +717,11 @@ void checkRemoteConnectionAndAutoClose() {
                 totalIpFailures++; // Increment persistent counter
                 eepromDirty = true;
                 
-                // Check if we're still within the 8-minute window
+                // Check if we're still within the 5-minute window
                 if (millis() - firstFailTimestamp > maxFailTimeWindow) {
                     // Time window expired - reset counters
                     #if defined(SERIAL_DEBUG_IP)
-                    Serial.println(F("IP Check: 8-minute window expired - resetting fail count"));
+                    Serial.println(F("IP Check: 5-minute window expired - resetting fail count"));
                     #endif
                     connectFailCount = 1; // Start fresh with this failure
                     firstFailTimestamp = millis();
@@ -612,11 +742,11 @@ void checkRemoteConnectionAndAutoClose() {
             #endif
         }
         
-        // Only trigger auto-close if we have enough failures within the time window
-        if (connectFailCount >= maxConnectFails && 
+        // Trigger auto-close after 5 failures within 5-minute window
+        if (connectFailCount >= maxConnectFails &&
             (millis() - firstFailTimestamp <= maxFailTimeWindow)) {
             #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Max fails within 8 minutes. Triggering auto-close."));
+            Serial.println(F("IP Check: Max fails within 5 minutes. Triggering auto-close."));
             if (networkProblem) {
                 if (!ethernet_initialized) Serial.println(F("Reason: Ethernet stack problem"));
                 else if (linkDown) Serial.println(F("Reason: Cable disconnected"));
@@ -625,25 +755,39 @@ void checkRemoteConnectionAndAutoClose() {
                 Serial.println(F("Reason: Target IP unreachable"));
             }
             #endif
-            
+
+            // Close both shutters immediately
+            // - If motor is off: start closing
+            // - If motor is opening: reverse to close (soft-start handles transition)
+            // - If motor already closing: no change needed
             bool action_taken = false;
-            if (mot1dir != OPEN && !digitalRead(lim1open)) { 
-                mot1dir = OPEN; mot1timer = MAX_MOT1_OPEN; 
+            if (mot1dir != OPEN && !digitalRead(lim1open)) {
+                mot1dir = OPEN; mot1timer = MAX_MOT1_OPEN;
                 m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F(">>> AUTO-CLOSE: S1 motor started (5 failures)"));
+                #endif
             }
-            if (mot2dir != OPEN && !digitalRead(lim2open)) { 
-                mot2dir = OPEN; mot2timer = MAX_MOT2_OPEN; 
+            if (mot2dir != OPEN && !digitalRead(lim2open)) {
+                mot2dir = OPEN; mot2timer = MAX_MOT2_OPEN;
                 m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F(">>> AUTO-CLOSE: S2 motor started (5 failures)"));
+                #endif
             }
-            
+
             if (action_taken) {
-                totalAutoCloses++; // Increment persistent counter
+                totalAutoCloses++;
                 eepromDirty = true;
-                saveCountersToEEPROM(); // Force immediate save on auto-close event
+                saveCountersToEEPROM();  // Immediate save - this is a critical event
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.print(F(">>> AUTO-CLOSE COUNT: "));
+                Serial.println(totalAutoCloses);
+                #endif
             }
-            
-            connectFailCount = 0; 
-            firstFailTimestamp = 0; // Reset time window
+
+            connectFailCount = 0;
+            firstFailTimestamp = 0;
         }
     } else { 
         // Kuppel ist geschlossen - alles zurücksetzen

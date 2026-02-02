@@ -36,4 +36,65 @@ Cheers
 Joerg
 
 Addons:
-BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has a bit more memory so not running into certain issues. 
+BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has a bit more memory so not running into certain issues.
+
+## Network Monitoring Behavior - Test Cases
+
+The dome controller has smart network monitoring that adapts to different scenarios. Below are all possible combinations and expected behaviors:
+
+### Startup Scenarios
+
+| Ethernet Cable | Result | IP Monitoring |
+|----------------|--------|---------------|
+| Not connected at startup | Standalone mode, buttons work immediately | Disabled |
+| Connected at startup | Full network init (~5s), web interface active | Enabled |
+| Inserted after startup (standalone) | Detected within 1 minute, network initializes | Becomes enabled |
+
+### Cable Removal Scenarios (when monitoring is enabled)
+
+| Dome State | Cable Removed | Action | Timing |
+|------------|---------------|--------|--------|
+| Dome open | Cable physically removed | Immediate auto-close | Instant |
+| Dome partially open | Cable physically removed | Immediate auto-close | Instant |
+| Dome closed | Cable physically removed | No action needed | - |
+| Dome opening | Cable physically removed | Stops opening, starts closing | Instant |
+
+### Cloudwatcher IP Unreachable (cable connected but target not responding)
+
+| Condition | Action | Timing |
+|-----------|--------|--------|
+| Target IP unreachable | Count failures | Every 1 minute |
+| 5 failures within 5 minutes | Auto-close dome | After 5th failure |
+| Target responds again | Reset fail counter | Immediate |
+| Connection restored during auto-close | Stop closing motors | Immediate |
+
+### User Intervention During Auto-Close
+
+| User Action | Result | Network State |
+|-------------|--------|---------------|
+| Press STOP button | Motors stop immediately | Monitoring paused until cable reconnected |
+| Press direction button | Motors stop (toggle behavior) | Monitoring paused until cable reconnected |
+| Manually open dome after STOP | Dome opens, system won't interfere | Manual control mode |
+| Manually close dome | Works normally | Manual control mode |
+| Reconnect cable | Reset trigger flag, resume monitoring | Monitoring active again |
+
+### Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| Cable removed, auto-close, user STOPs, walks away | Dome stays stopped (user took control) |
+| Cable reconnected after user STOP | Monitoring resumes, will auto-close on next removal |
+| Rapid cable connect/disconnect | Only triggers once per removal (debounced) |
+| No cable ever connected | Pure standalone mode, no network checks |
+
+### Debug Output (when SERIAL_DEBUG_IP enabled)
+
+Every 10 seconds status line:
+```
+IP Status: Link=1 EthInit=1 NetMon=1 Fails=0/5 S1closed=1 S2closed=0
+```
+- Link: 0=cable disconnected, 1=cable connected
+- EthInit: 0=Ethernet not initialized, 1=initialized
+- NetMon: 0=monitoring disabled, 1=monitoring enabled
+- Fails: current fail count / max before auto-close
+- S1closed/S2closed: 0=shutter open/moving, 1=shutter at closed position 
