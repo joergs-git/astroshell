@@ -40,43 +40,74 @@ BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has
 
 ## If Your Limit Switches Are Wired Correctly
 
-My code has inverted logic because my limit switches were accidentally swapped during installation. If your AstroShell dome has **correctly wired limit switches**, you need to make the following changes in `domecontrol_JK3.ino`:
+My code has **inverted web display logic** because my limit switches were accidentally swapped during installation. The underlying motor control logic and pin definitions are **identical to the original AstroShell code** - only the web interface displays the inverted physical state.
 
-### 1. Swap the Pin Definitions (around line 69-72)
+### What Was Changed (My Swapped Wiring)
 
-**Current (inverted for my setup):**
+The pin definitions and motor constants are **unchanged** from the original. Only the **web display** was modified to show the correct physical state despite the swapped wiring:
+
+| Element | Original Display | My Modified Display |
+|---------|------------------|---------------------|
+| `lim1open` HIGH | "Opened" | "Physically CLOSED" |
+| `lim1closed` HIGH | "Closed" | "Physically OPEN" |
+| `mot1dir==OPEN` | "Opening" | "Closing (physically)" |
+| `mot1dir==CLOSE` | "Closing" | "Opening (physically)" |
+| Button $1 | "Open" | "CLOSE S1" |
+| Button $2 | "Close" | "OPEN S1" |
+
+### If Your Wiring Is Correct
+
+If your AstroShell dome has **correctly wired limit switches**, you need to revert the web display logic in `domecontrol_JK3.ino`:
+
+#### 1. Update Status Display (around line 1041-1046 and 1075-1080)
+
+**Current (for my swapped wiring):**
 ```cpp
-#define lim1open    7     // Actually detects S1 PHYSICALLY CLOSED
-#define lim1closed  2     // Actually detects S1 PHYSICALLY OPEN
-#define lim2open    1     // Actually detects S2 PHYSICALLY CLOSED
-#define lim2closed  0     // Actually detects S2 PHYSICALLY OPEN
+bool s1_is_physically_closed_state = digitalRead(lim1open);
+bool s1_is_physically_open_state = digitalRead(lim1closed);
+if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
+else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
 ```
 
 **Change to (correct wiring):**
 ```cpp
-#define lim1open    2     // Detects S1 PHYSICALLY OPEN
-#define lim1closed  7     // Detects S1 PHYSICALLY CLOSED
-#define lim2open    0     // Detects S2 PHYSICALLY OPEN
-#define lim2closed  1     // Detects S2 PHYSICALLY CLOSED
+bool s1_is_physically_closed_state = digitalRead(lim1closed);
+bool s1_is_physically_open_state = digitalRead(lim1open);
+if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
+else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
 ```
 
-### 2. Swap the Motor Direction Constants (around line 53-55)
+#### 2. Update Movement Display (around line 1050-1052 and 1084-1086)
 
-**Current (inverted for my setup):**
+**Current (for my swapped wiring):**
 ```cpp
-#define OPEN        1     // Sends motor command that PHYSICALLY CLOSES
-#define CLOSE       2     // Sends motor command that PHYSICALLY OPENS
+if (mot1dir == OPEN) { client.print(F("Closing (physically)")); ... }
+else if (mot1dir == CLOSE) { client.print(F("Opening (physically)")); }
 ```
 
 **Change to (correct wiring):**
 ```cpp
-#define OPEN        1     // Sends motor command that PHYSICALLY OPENS
-#define CLOSE       2     // Sends motor command that PHYSICALLY CLOSES
+if (mot1dir == OPEN) { client.print(F("Opening (physically)")); ... }
+else if (mot1dir == CLOSE) { client.print(F("Closing (physically)")); }
 ```
 
-### 3. Update Comments
+#### 3. Update Button Labels (around line 1036-1037 and 1070-1071)
 
-Search for comments mentioning "inverted" or "swapped" and update them to reflect your correct wiring.
+**Current (for my swapped wiring):**
+```cpp
+client.print(F("<a href='/?$2' class='button b-open'>OPEN S1</a>"));
+client.print(F("<a href='/?$1' class='button b-close'>CLOSE S1</a>"));
+```
+
+**Change to (correct wiring):**
+```cpp
+client.print(F("<a href='/?$1' class='button b-open'>OPEN S1</a>"));
+client.print(F("<a href='/?$2' class='button b-close'>CLOSE S1</a>"));
+```
+
+#### 4. Update Comments
+
+Search for comments mentioning "inverted", "swapped", or "physically" and update them to reflect your correct wiring.
 
 ### Testing
 
