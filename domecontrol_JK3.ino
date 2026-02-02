@@ -19,13 +19,13 @@
 
 // --- Motor Timing Configuration ---
 // Motor timeout in ISR ticks (~61 Hz). Safety limit if limit switches fail.
-// Calculation: 104 seconds * 61 Hz = 6344 ticks
+// Calculation: 107 seconds * 61 Hz = 6527 ticks
 #define SMOOTH 30           // Soft-start smoothness (0=instant, 254=very slow)
-#define MAX_MOT1_OPEN  6344 // Shutter 1 close timeout (104 sec)
-#define MAX_MOT1_CLOSE 6344 // Shutter 1 open timeout (104 sec)
+#define MAX_MOT1_OPEN  6527 // Shutter 1 close timeout (107 sec)
+#define MAX_MOT1_CLOSE 6527 // Shutter 1 open timeout (107 sec)
 #define MAX_MOT1_VCC_CLOSE_ACTION MAX_MOT1_OPEN
-#define MAX_MOT2_OPEN  6344 // Shutter 2 close timeout (104 sec)
-#define MAX_MOT2_CLOSE 6344 // Shutter 2 open timeout (104 sec)
+#define MAX_MOT2_OPEN  6527 // Shutter 2 close timeout (107 sec)
+#define MAX_MOT2_CLOSE 6527 // Shutter 2 open timeout (107 sec)
 #define MAX_MOT2_VCC_CLOSE_ACTION MAX_MOT2_OPEN
 
 // --- Network Configuration ---
