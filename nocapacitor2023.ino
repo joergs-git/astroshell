@@ -266,7 +266,7 @@ ISR(TIMER2_COMPA_vect){
 
 
 //  Cloud sensor
-  if(!digitalRead(CLOUD)){if(cloudsensortimer<200)cloudsensortimer++;}else cloudsensortimer;
+  if(!digitalRead(CLOUD)){if(cloudsensortimer<200)cloudsensortimer++;}else if(cloudsensortimer)cloudsensortimer--;
   if(cloudsensortimer>60 && !closesignal){ //1 second delay
     if(!digitalRead(lim1closed)){mot1dir=CLOSE;mot1timer=MAX_MOT1_CLOSE;} //closing(if not already closed)
     if(!digitalRead(lim2closed)){mot2dir=CLOSE;mot2timer=MAX_MOT2_CLOSE;}
