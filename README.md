@@ -38,6 +38,50 @@ Joerg
 Addons:
 BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has a bit more memory so not running into certain issues.
 
+## If Your Limit Switches Are Wired Correctly
+
+My code has inverted logic because my limit switches were accidentally swapped during installation. If your AstroShell dome has **correctly wired limit switches**, you need to make the following changes in `domecontrol_JK3.ino`:
+
+### 1. Swap the Pin Definitions (around line 69-72)
+
+**Current (inverted for my setup):**
+```cpp
+#define lim1open    7     // Actually detects S1 PHYSICALLY CLOSED
+#define lim1closed  2     // Actually detects S1 PHYSICALLY OPEN
+#define lim2open    1     // Actually detects S2 PHYSICALLY CLOSED
+#define lim2closed  0     // Actually detects S2 PHYSICALLY OPEN
+```
+
+**Change to (correct wiring):**
+```cpp
+#define lim1open    2     // Detects S1 PHYSICALLY OPEN
+#define lim1closed  7     // Detects S1 PHYSICALLY CLOSED
+#define lim2open    0     // Detects S2 PHYSICALLY OPEN
+#define lim2closed  1     // Detects S2 PHYSICALLY CLOSED
+```
+
+### 2. Swap the Motor Direction Constants (around line 53-55)
+
+**Current (inverted for my setup):**
+```cpp
+#define OPEN        1     // Sends motor command that PHYSICALLY CLOSES
+#define CLOSE       2     // Sends motor command that PHYSICALLY OPENS
+```
+
+**Change to (correct wiring):**
+```cpp
+#define OPEN        1     // Sends motor command that PHYSICALLY OPENS
+#define CLOSE       2     // Sends motor command that PHYSICALLY CLOSES
+```
+
+### 3. Update Comments
+
+Search for comments mentioning "inverted" or "swapped" and update them to reflect your correct wiring.
+
+### Testing
+
+After making changes, test carefully with the dome in an intermediate position so you can intervene if something moves in the wrong direction!
+
 ## Network Monitoring Behavior - Test Cases
 
 The dome controller has smart network monitoring that adapts to different scenarios. Below are all possible combinations and expected behaviors:
