@@ -996,7 +996,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
   if (system_fully_ready) client.println(F("Refresh: 10"));
   else client.println(F("Refresh: 2")); 
   client.println();
-  client.println(F("<!DOCTYPE HTML><html><head><title>AstroShell DomeControl JK3</title>"));
+  client.println(F("<!DOCTYPE HTML><html><head><title>AstroShell DomeControl JK3.2</title>"));
   client.println(F("<meta name='viewport' content='width=device-width, initial-scale=1.0'>"));
   client.println(F("<style>"));
   client.println(F("body{font-family:Arial,sans-serif;margin:0;padding:10px;background-color:#f0f0f0;color:#333;}"));
@@ -1019,7 +1019,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
        client.println(F("<h1>Dome System Initializing...</h1>"));
        client.println(F("<div class='status'>Please wait. Web interface will be active shortly.</div>"));
   } else {
-      client.println(F("<h1>AstroShell Dome Control JK3</h1>"));
+      client.println(F("<h1>AstroShell Dome Control JK3.2</h1>"));
       client.println(F("<div class='social-links'>"));
       client.print(F("<a href='https://app.astrobin.com/u/joergsflow#gallery' target='_blank' rel='noopener noreferrer'>joergsflow Astrobin</a>"));
       client.print(F(" | ")); // Separator between links
