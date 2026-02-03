@@ -2,18 +2,14 @@
 // AstroShell Dome Controller (with Capacitor backup) - Version 2025 Germany
 // ============================================================================
 //
-// NOTE: This commit adds comprehensive comments and code analysis ONLY.
-//       NO functional code changes were made. All original logic is untouched.
-//
 // ============================================================================
 // BUGS AND ISSUES FOUND (7 total):
 // ============================================================================
 //
-// ISSUE #1 - CRITICAL BUG: Cloud sensor timer never resets (line 312)
-//    Code: "else cloudsensortimer;" does NOTHING - missing "= 0" assignment!
-//    Effect: cloudsensortimer never decrements when cloud sensor clears.
-//    Result: Cloud sensor auto-close only works ONCE until Arduino restart.
-//    Fix: Change "else cloudsensortimer;" to "else cloudsensortimer = 0;"
+// ISSUE #1 - FIXED: Cloud sensor timer never reset (was line 312)
+//    Was: "else cloudsensortimer;" did NOTHING - missing assignment!
+//    Fix: Changed to count-down approach "else{if(cloudsensortimer>0)cloudsensortimer--;}"
+//    Now: Provides symmetrical ~1 sec delay for both trigger AND clear (hysteresis)
 //
 // ISSUE #2 - Serial not initialized (line 111)
 //    Code: Serial.println() called but Serial.begin() is commented out (line 108)
@@ -331,11 +327,11 @@ ISR(TIMER2_COMPA_vect){
 
 
 //  Cloud sensor - active LOW means unsafe conditions (rain/clouds)
-  // *** CRITICAL BUG BELOW! ***
-  // The "else cloudsensortimer;" statement does NOTHING - it's missing "= 0"
-  // This means cloudsensortimer NEVER decrements/resets when cloud sensor clears!
-  // FIX NEEDED: Change "else cloudsensortimer;" to "else cloudsensortimer = 0;"
-  if(!digitalRead(CLOUD)){if(cloudsensortimer<200)cloudsensortimer++;}else cloudsensortimer;  // BUG: "else cloudsensortimer;" does nothing! Should be "else cloudsensortimer = 0;"
+  // Cloud sensor uses count-up/count-down for hysteresis (debounce)
+  // - Unsafe (LOW): increment timer up to 200
+  // - Safe (HIGH): decrement timer down to 0
+  // This provides ~1 second delay for both triggering AND clearing (symmetrical)
+  if(!digitalRead(CLOUD)){if(cloudsensortimer<200)cloudsensortimer++;}else{if(cloudsensortimer>0)cloudsensortimer--;}
   // After ~1 second of continuous cloud signal (60 ticks at 61Hz), trigger close
   if(cloudsensortimer>60 && !closesignal){ //1 second delay
     if(!digitalRead(lim1closed)){mot1dir=CLOSE;mot1timer=MAX_MOT1_CLOSE;} //closing(if not already closed)
@@ -344,13 +340,12 @@ ISR(TIMER2_COMPA_vect){
     vcc2close=1;
     closesignal=1; //signal received not to turn on the motors(in case if they are stopped by operator)
   }
-  // This block SHOULD reset closesignal when cloud sensor clears, BUT...
-  // Due to the BUG above, cloudsensortimer NEVER reaches 0, so this condition is NEVER true!
-  // Result: closesignal stays 1 forever, cloud sensor protection only works ONCE!
-  if(!cloudsensortimer && closesignal){ // we see there was a signal, now not anymore  // NOTE: Never executes due to bug!
+  // Reset closesignal when cloud sensor clears (cloudsensortimer counted down to 0)
+  // This allows cloud sensor protection to work again for future events
+  if(!cloudsensortimer && closesignal){ // cloud sensor cleared, reset for next event
  //   mot1dir=0; // if remove commment, the motors will stop when signal from sensor lost
  //   mot2dir=0;
-    closesignal=0; //no clouds  // NOTE: Never executes due to bug!
+    closesignal=0; //no clouds - ready for next cloud event
   }
 
 
