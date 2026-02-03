@@ -1,0 +1,16 @@
+[Unit]
+Description=AstroShell Tick Logger - Motor Runtime Data Collector
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/aagsolo
+ExecStart=/usr/bin/python3 /usr/local/bin/astroshell_ticklogger.py
+Restart=always
+RestartSec=10
+MemoryMax=50M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Read before editing** - Always read a file before making changes
 - **Preserve code style** - Match existing formatting, indentation, and naming conventions
 - **Comments-only commits** - When adding comments/analysis without code changes, state this clearly in the commit message
+- **Use different MAC and IP for testing before git commit and push** - During development use always a different IP e.g. 192.168.1.178 instead of .177 and a different MAC Adresse e.g. {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEA}. When committing change this back to .177 and ED.
+
 
 ## Project Overview
 

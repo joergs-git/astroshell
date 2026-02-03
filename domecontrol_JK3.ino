@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - STABLE NETWORK VERSION rev8 (v3.2)
+// ASTROSHELL DOME CONTROLLER - STABLE NETWORK VERSION rev9 (v3.3)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 // Purpose:  Controls two-shutter astronomical dome with automatic rain protection
@@ -12,6 +12,14 @@
 // - Hardware watchdog for system recovery
 // - EEPROM persistence for failure counters
 // - Physical button control with debouncing
+// - Motor runtime tick logging for temperature correlation analysis (v3.3)
+//
+// v3.3 Changes:
+// - Added motor runtime measurement in ISR ticks
+// - Only valid full-runs are recorded (start at limit, stop at opposite limit)
+// - Web UI toggle ($L) to enable/disable logging (default: off after reboot)
+// - HTTP GET push to Cloudwatcher Solo:88 for CSV logging
+// - Web UI shows live tick counter and last valid measurements
 //
 // Safety Note: Limit switch names are swapped due to installation wiring.
 // "lim1open" actually detects physically CLOSED state, etc.
@@ -192,6 +200,43 @@ unsigned long lastSuccessfulPing = 0;                  // Last successful activi
 volatile boolean system_fully_ready = false;  // True after setup() completes
 
 //=============================================================================
+// TICK LOGGING - Motor Runtime Measurement
+//=============================================================================
+// Measures actual motor runtime in ISR ticks for temperature correlation analysis.
+// Only valid full-runs are recorded (start at one limit, stop at opposite limit).
+// Data can be pushed to external server for logging when toggle is enabled.
+
+// --- Tick Logging Toggle (Web UI controllable, off after reboot) ---
+bool tickLoggingEnabled = false;              // Must be enabled via web UI
+
+// --- Tick Logging Server Configuration ---
+const int tickLogServerPort = 88;             // Port for tick log receiver (same IP as Cloudwatcher)
+
+// --- Motor 1 Tick Tracking (ISR variables must be volatile) ---
+volatile word m1_tick_counter = 0;            // Current tick count during run
+volatile bool m1_full_run_active = false;     // True if started at a limit switch
+volatile bool m1_was_closing = false;         // True if direction is open→close (physically)
+volatile byte m1_prev_dir = 0;                // Previous motor direction for transition detection
+
+// --- Motor 2 Tick Tracking ---
+volatile word m2_tick_counter = 0;
+volatile bool m2_full_run_active = false;
+volatile bool m2_was_closing = false;
+volatile byte m2_prev_dir = 0;
+
+// --- Last Valid Measurements (available for display and push) ---
+volatile word m1_last_ticks_closing = 0;      // Last valid open→close ticks (M1)
+volatile word m1_last_ticks_opening = 0;      // Last valid close→open ticks (M1)
+volatile word m2_last_ticks_closing = 0;      // Last valid open→close ticks (M2)
+volatile word m2_last_ticks_opening = 0;      // Last valid close→open ticks (M2)
+
+// --- Data Ready Flags (signal main loop to push data) ---
+volatile bool m1_data_ready = false;          // True when new valid M1 data available
+volatile bool m2_data_ready = false;          // True when new valid M2 data available
+volatile byte m1_last_direction = 0;          // 1=closing, 2=opening (for push)
+volatile byte m2_last_direction = 0;
+
+//=============================================================================
 // FUNCTION PROTOTYPES
 //=============================================================================
 void setupEthernet();                           // Initialize Ethernet with retry
@@ -202,6 +247,7 @@ void checkRemoteConnectionAndAutoClose();       // IP monitoring logic
 void initializeEEPROM();                        // Load/init persistent storage
 void saveCountersToEEPROM();                    // Save counters if changed
 void incrementDayCounter();                     // Track uptime days
+void pushTickDataIfReady();                     // Push tick data to logging server
 
 //=============================================================================
 // EEPROM FUNCTIONS - Persistent Storage Management
@@ -269,6 +315,86 @@ void incrementDayCounter() {
     lastDayIncrement = millis();
     eepromDirty = true;
     EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);  // Immediate save
+  }
+}
+
+//=============================================================================
+// TICK DATA PUSH - Send motor runtime to logging server
+//=============================================================================
+/**
+ * Pushes tick data to external logging server when:
+ * - A valid full-run measurement is available (data_ready flag set)
+ * - Tick logging is enabled via web UI toggle
+ * - Network is available
+ *
+ * Uses minimal HTTP GET request to port 88 on Cloudwatcher IP.
+ * Server is expected to add timestamp and temperature, then log to CSV.
+ *
+ * GET /log?m=<motor>&d=<direction>&t=<ticks>
+ *   m = Motor number (1 or 2)
+ *   d = Direction (1=closing/open→close, 2=opening/close→open)
+ *   t = Tick count
+ */
+void pushTickDataIfReady() {
+  // Skip if logging disabled or network not ready
+  if (!tickLoggingEnabled || !ethernet_initialized || !networkMonitoringEnabled) {
+    return;
+  }
+
+  // Check Motor 1 data
+  if (m1_data_ready) {
+    word ticks = (m1_last_direction == 1) ? m1_last_ticks_closing : m1_last_ticks_opening;
+
+    wdt_reset();  // Reset watchdog before potentially blocking call
+    EthernetClient logClient;
+    logClient.setTimeout(2000);  // 2 second timeout
+
+    if (logClient.connect(remoteStationIp, tickLogServerPort)) {
+      // Build minimal HTTP GET request
+      logClient.print(F("GET /log?m=1&d="));
+      logClient.print(m1_last_direction);
+      logClient.print(F("&t="));
+      logClient.print(ticks);
+      logClient.println(F(" HTTP/1.0"));
+      logClient.print(F("Host: "));
+      logClient.println(remoteStationIp);
+      logClient.println(F("Connection: close"));
+      logClient.println();
+
+      // Don't wait for response - just disconnect
+      delay(50);  // Brief delay for data to be sent
+      logClient.stop();
+    }
+    wdt_reset();
+
+    m1_data_ready = false;  // Clear flag regardless of success
+  }
+
+  // Check Motor 2 data
+  if (m2_data_ready) {
+    word ticks = (m2_last_direction == 1) ? m2_last_ticks_closing : m2_last_ticks_opening;
+
+    wdt_reset();
+    EthernetClient logClient;
+    logClient.setTimeout(2000);
+
+    if (logClient.connect(remoteStationIp, tickLogServerPort)) {
+      logClient.print(F("GET /log?m=2&d="));
+      logClient.print(m2_last_direction);
+      logClient.print(F("&t="));
+      logClient.print(ticks);
+      logClient.println(F(" HTTP/1.0"));
+      logClient.print(F("Host: "));
+      logClient.println(remoteStationIp);
+      logClient.println(F("Connection: close"));
+      logClient.println();
+
+      delay(50);
+      logClient.stop();
+    }
+    wdt_reset();
+
+    m2_data_ready = false;
   }
 }
 
@@ -398,7 +524,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v3.2 - Stable Network"));
+    Serial.println(F("Dome Control v3.3 - Stable Network"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -813,6 +939,7 @@ void checkRemoteConnectionAndAutoClose() {
  *   /?$5  - STOP all motors
  *   /?$S  - Return plain text status (OPEN/CLOSED)
  *   /?$R  - Reset persistent counters
+ *   /?$L  - Toggle tick logging on/off
  *
  * Design notes:
  * - 1.5 second timeout prevents blocking on slow/broken connections
@@ -861,7 +988,13 @@ void handleWebClient() {
           reset_counters_request = true;
           action_parameter_in_url = true;
         }
-        
+
+        // Check for tick logging toggle command
+        if (c == 'L' || c == 'l') {
+          tickLoggingEnabled = !tickLoggingEnabled;  // Toggle on/off
+          action_parameter_in_url = true;
+        }
+
  // IMPROVED WEB LOGIC - Automatic stop before new command
         if (c == '1') {
           // Auto-stop if motor is running in different direction
@@ -996,7 +1129,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
   if (system_fully_ready) client.println(F("Refresh: 10"));
   else client.println(F("Refresh: 2")); 
   client.println();
-  client.println(F("<!DOCTYPE HTML><html><head><title>AstroShell DomeControl JK3.2</title>"));
+  client.println(F("<!DOCTYPE HTML><html><head><title>AstroShell DomeControl JK3.3</title>"));
   client.println(F("<meta name='viewport' content='width=device-width, initial-scale=1.0'>"));
   client.println(F("<style>"));
   client.println(F("body{font-family:Arial,sans-serif;margin:0;padding:10px;background-color:#f0f0f0;color:#333;}"));
@@ -1019,7 +1152,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
        client.println(F("<h1>Dome System Initializing...</h1>"));
        client.println(F("<div class='status'>Please wait. Web interface will be active shortly.</div>"));
   } else {
-      client.println(F("<h1>AstroShell Dome Control JK3.2</h1>"));
+      client.println(F("<h1>AstroShell Dome Control JK3.3</h1>"));
       client.println(F("<div class='social-links'>"));
       client.print(F("<a href='https://app.astrobin.com/u/joergsflow#gallery' target='_blank' rel='noopener noreferrer'>joergsflow Astrobin</a>"));
       client.print(F(" | ")); // Separator between links
@@ -1145,7 +1278,98 @@ void sendFullHtmlResponse(EthernetClient& client) {
       client.println(F("</table>"));
       client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
       client.println(F("</div>"));
-  } 
+
+      // --- Tick Logging Section ---
+      client.println(F("<div class='section'><h2>Motor Runtime Logging</h2>"));
+
+      // Toggle button with status
+      client.print(F("<p>Status: <strong>"));
+      client.print(tickLoggingEnabled ? F("ENABLED") : F("DISABLED"));
+      client.println(F("</strong></p>"));
+      client.print(F("<a href='/?$L' class='button "));
+      client.print(tickLoggingEnabled ? F("b-stop") : F("b-open"));
+      client.print(F(" fullwidth'>"));
+      client.print(tickLoggingEnabled ? F("Disable Logging") : F("Enable Logging"));
+      client.println(F("</a>"));
+
+      // Current tick counters (live during motor run)
+      client.println(F("<h3>Current Run</h3><table>"));
+      client.print(F("<tr><td>M1 Running</td><td>"));
+      if (mot1dir != 0 && m1_full_run_active) {
+        client.print(m1_tick_counter);
+        client.print(F(" ticks ("));
+        client.print(m1_was_closing ? F("closing") : F("opening"));
+        client.print(F(")"));
+      } else if (mot1dir != 0) {
+        client.print(F("intermediate start"));
+      } else {
+        client.print(F("-"));
+      }
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>M2 Running</td><td>"));
+      if (mot2dir != 0 && m2_full_run_active) {
+        client.print(m2_tick_counter);
+        client.print(F(" ticks ("));
+        client.print(m2_was_closing ? F("closing") : F("opening"));
+        client.print(F(")"));
+      } else if (mot2dir != 0) {
+        client.print(F("intermediate start"));
+      } else {
+        client.print(F("-"));
+      }
+      client.println(F("</td></tr></table>"));
+
+      // Last valid measurements
+      client.println(F("<h3>Last Valid Full-Runs</h3><table>"));
+      client.print(F("<tr><th>Motor</th><th>Open&rarr;Close</th><th>Close&rarr;Open</th></tr>"));
+
+      client.print(F("<tr><td>M1 (East)</td><td>"));
+      if (m1_last_ticks_closing > 0) {
+        client.print(m1_last_ticks_closing);
+        client.print(F(" ("));
+        client.print((float)m1_last_ticks_closing / 61.0f, 1);
+        client.print(F("s)"));
+      } else {
+        client.print(F("-"));
+      }
+      client.print(F("</td><td>"));
+      if (m1_last_ticks_opening > 0) {
+        client.print(m1_last_ticks_opening);
+        client.print(F(" ("));
+        client.print((float)m1_last_ticks_opening / 61.0f, 1);
+        client.print(F("s)"));
+      } else {
+        client.print(F("-"));
+      }
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>M2 (West)</td><td>"));
+      if (m2_last_ticks_closing > 0) {
+        client.print(m2_last_ticks_closing);
+        client.print(F(" ("));
+        client.print((float)m2_last_ticks_closing / 61.0f, 1);
+        client.print(F("s)"));
+      } else {
+        client.print(F("-"));
+      }
+      client.print(F("</td><td>"));
+      if (m2_last_ticks_opening > 0) {
+        client.print(m2_last_ticks_opening);
+        client.print(F(" ("));
+        client.print((float)m2_last_ticks_opening / 61.0f, 1);
+        client.print(F("s)"));
+      } else {
+        client.print(F("-"));
+      }
+      client.println(F("</td></tr></table>"));
+
+      client.print(F("<p style='font-size:0.8em;'>Push target: "));
+      client.print(remoteStationIp);
+      client.print(F(":"));
+      client.print(tickLogServerPort);
+      client.println(F("</p></div>"));
+  }
   client.println(F("</div></body></html>"));
 }
 
@@ -1163,6 +1387,8 @@ void loop() {
     #if defined(ENABLE_IP_AUTO_CLOSE)
       checkRemoteConnectionAndAutoClose();  // Safety monitoring
     #endif
+
+    pushTickDataIfReady();      // Push tick data to logging server if available
   }
 
   handleWebClient();  // Process any pending HTTP requests
@@ -1345,4 +1571,110 @@ ISR(TIMER2_COMPA_vect) {
   if (digitalRead(SW1down)) { sw1down_pressed_flag = false; }
   if (digitalRead(SW2up))   { sw2up_pressed_flag = false; }
   if (digitalRead(SW2down)) { sw2down_pressed_flag = false; }
+
+  //=========================================================================
+  // TICK LOGGING - Motor Runtime Measurement (added for temperature analysis)
+  //=========================================================================
+  // Detects motor state transitions and measures full-run tick counts.
+  // Only records valid full-runs: start at one limit, stop at opposite limit.
+  // This section is positioned AFTER all motor control decisions are made.
+
+  //--- MOTOR 1 TICK TRACKING ---
+  // Detect motor START (transition from stopped to running)
+  if (mot1dir != 0 && m1_prev_dir == 0) {
+    // Motor just started - check if at a limit switch (valid full-run start)
+    bool at_open_limit = digitalRead(lim1closed);   // lim1closed = physically OPEN
+    bool at_closed_limit = digitalRead(lim1open);   // lim1open = physically CLOSED
+
+    if (at_open_limit || at_closed_limit) {
+      // Started at a limit - this could be a valid full-run
+      m1_full_run_active = true;
+      m1_tick_counter = 0;
+      m1_was_closing = (mot1dir == OPEN);  // OPEN command = physically closing
+    } else {
+      // Started from intermediate position - not a full-run
+      m1_full_run_active = false;
+    }
+  }
+
+  // Count ticks while motor is running and full-run is active
+  if (mot1dir != 0 && m1_full_run_active) {
+    m1_tick_counter++;
+  }
+
+  // Detect motor STOP (transition from running to stopped)
+  if (mot1dir == 0 && m1_prev_dir != 0) {
+    // Motor just stopped - check if we completed a valid full-run
+    if (m1_full_run_active) {
+      bool at_target = false;
+
+      if (m1_was_closing && digitalRead(lim1open)) {
+        // Was closing and reached closed limit - VALID
+        at_target = true;
+        m1_last_ticks_closing = m1_tick_counter;
+        m1_last_direction = 1;  // closing
+      }
+      else if (!m1_was_closing && digitalRead(lim1closed)) {
+        // Was opening and reached open limit - VALID
+        at_target = true;
+        m1_last_ticks_opening = m1_tick_counter;
+        m1_last_direction = 2;  // opening
+      }
+
+      if (at_target) {
+        m1_data_ready = true;  // Signal main loop to push data
+      }
+      // If not at target: manual stop, timeout, etc. - discard measurement
+
+      m1_full_run_active = false;
+    }
+  }
+
+  m1_prev_dir = mot1dir;  // Save for next iteration
+
+  //--- MOTOR 2 TICK TRACKING ---
+  // Detect motor START
+  if (mot2dir != 0 && m2_prev_dir == 0) {
+    bool at_open_limit = digitalRead(lim2closed);   // lim2closed = physically OPEN
+    bool at_closed_limit = digitalRead(lim2open);   // lim2open = physically CLOSED
+
+    if (at_open_limit || at_closed_limit) {
+      m2_full_run_active = true;
+      m2_tick_counter = 0;
+      m2_was_closing = (mot2dir == OPEN);
+    } else {
+      m2_full_run_active = false;
+    }
+  }
+
+  // Count ticks while motor is running
+  if (mot2dir != 0 && m2_full_run_active) {
+    m2_tick_counter++;
+  }
+
+  // Detect motor STOP
+  if (mot2dir == 0 && m2_prev_dir != 0) {
+    if (m2_full_run_active) {
+      bool at_target = false;
+
+      if (m2_was_closing && digitalRead(lim2open)) {
+        at_target = true;
+        m2_last_ticks_closing = m2_tick_counter;
+        m2_last_direction = 1;
+      }
+      else if (!m2_was_closing && digitalRead(lim2closed)) {
+        at_target = true;
+        m2_last_ticks_opening = m2_tick_counter;
+        m2_last_direction = 2;
+      }
+
+      if (at_target) {
+        m2_data_ready = true;
+      }
+
+      m2_full_run_active = false;
+    }
+  }
+
+  m2_prev_dir = mot2dir;
 }
