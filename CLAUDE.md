@@ -24,7 +24,8 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
 | `nocapacitor2023.ino` | Original AstroShell reference code (unmodified) |
-| `cloudwatcher-raincheckerV3.sh` | Bash script for Cloudwatcher Solo rain detection |
+| `cloudwatcher-raincheckerV3.sh` | **Rain checker** - Auto-closes dome on rain, Pushover alerts |
+| `cloudwatcher-rainchecker.service` | Systemd service file for rain checker autostart |
 | `README.md` | User documentation with wiring notes |
 
 ## Hardware Configuration
@@ -97,9 +98,11 @@ const unsigned long maxFailTimeWindow = 300000UL;     // 5-min failure window
 
 ### cloudwatcher-raincheckerV3.sh
 ```bash
-RAIN_THRESHOLD=2900     # Rain detected when value < this
-DOME_IP="192.168.1.177" # Dome controller IP
-MAX_LOG_LINES=5000      # Log rotation limit
+RAIN_THRESHOLD=2900         # Rain detected when value < this
+DRY_COOLDOWN_MINUTES=30     # Minutes before "dry" notification
+DOME_IP="192.168.1.177"     # Dome controller IP
+CHECK_INTERVAL=10           # Seconds between checks
+RAIN_ACTION_COOLDOWN=300    # Seconds after dome close (5 min)
 ```
 
 ## Motor Runtime Tick Logging (v3.3)
@@ -158,10 +161,43 @@ Serial debugging conflicts with limit switch pins 0/1. Only enable with limit sw
 // #define SERIAL_DEBUG_EEPROM
 ```
 
-### Cloudwatcher Script Deployment
+## Rain Checker (Cloudwatcher Solo / Pi3)
+
+Monitors rain sensor and automatically closes dome. Sends Pushover notifications.
+
+### Functionality
+1. Reads rain value from `aag_json.dat` every 10 seconds
+2. If rain detected (< 2900): Closes dome ($3 West, $1 East), sends Pushover alert
+3. 30-minute cooldown before "dry" notification (prevents spam during showers)
+4. Ping monitoring (rain AND dry): Alerts if dome unreachable
+
+### Location on Pi (read-only root filesystem)
+- Script: `/usr/local/bin/cloudwatcher-rainchecker.sh`
+- Service: `/etc/systemd/system/cloudwatcher-rainchecker.service`
+- Log file: `/home/aagsolo/rainchecker.log` (tmpfs)
+- Status flags: `/home/aagsolo/RAINTRIGGERED`, `DRYTRIGGERED`, `PINGALARM` (tmpfs)
+
+### Service Management
 ```bash
-nohup /home/aagsolo/rainchecker.sh > /dev/null 2>&1 &
+systemctl start cloudwatcher-rainchecker
+systemctl stop cloudwatcher-rainchecker
+systemctl status cloudwatcher-rainchecker
+journalctl -u cloudwatcher-rainchecker -f
+tail -f /home/aagsolo/rainchecker.log
 ```
+
+### Installation
+```bash
+mount -o remount,rw /
+cp cloudwatcher-raincheckerV3.sh /usr/local/bin/cloudwatcher-rainchecker.sh
+chmod +x /usr/local/bin/cloudwatcher-rainchecker.sh
+cp cloudwatcher-rainchecker.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable cloudwatcher-rainchecker
+mount -o remount,ro /
+systemctl start cloudwatcher-rainchecker
+```
+
 Requires `jq` for JSON parsing (falls back to grep/sed).
 
 ## Known Issues in controller_wcapacitor_2025_germany.ino
