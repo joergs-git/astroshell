@@ -6,7 +6,7 @@
 // BUGS AND ISSUES FOUND (7 total):
 // ============================================================================
 //
-// ISSUE #1 - FIXED: Cloud sensor timer never reset (was line 312)
+// ISSUE #1 - FIXED: Cloud sensor timer never reset (was line 312 now 334)
 //    Was: "else cloudsensortimer;" did NOTHING - missing assignment!
 //    Fix: Changed to count-down approach "else{if(cloudsensortimer>0)cloudsensortimer--;}"
 //    Now: Provides symmetrical ~1 sec delay for both trigger AND clear (hysteresis)
@@ -385,3 +385,4 @@ ISR(TIMER2_COMPA_vect){
   if(digitalRead(SW2up)  ){sw2up=0;}
   if(digitalRead(SW2down)){sw2down=0;}
 }
+
