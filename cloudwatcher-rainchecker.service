@@ -1,0 +1,16 @@
+[Unit]
+Description=AstroShell Rain Checker - Automatic Dome Protection
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/aagsolo
+ExecStart=/usr/local/bin/cloudwatcher-rainchecker.sh
+Restart=always
+RestartSec=10
+MemoryMax=30M
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

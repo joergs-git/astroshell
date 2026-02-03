@@ -1,223 +1,364 @@
 #!/bin/bash
-# Script is to be started permanently in background using the following command
-#     nohup /home/aagsolo/rainchecker.sh > /dev/null 2>&1 &
-# 
-# --- Configuration ---
-#STATUS_FILE="/home/aagsolo/aag_json_test.dat"
+#==============================================================================
+# AstroShell Rain Checker - Automatic Dome Protection
+#==============================================================================
+# Monitors Cloudwatcher Solo rain sensor and closes dome automatically.
+# Sends Pushover notifications for rain alerts and connectivity issues.
+#
+# Target Hardware: Cloudwatcher Solo (Raspberry Pi 3)
+# Dome Controller: Arduino MEGA at 192.168.1.177
+#
+#==============================================================================
+# FUNCTIONALITY
+#==============================================================================
+# 1. Reads rain value from aag_json.dat every 10 seconds
+# 2. If rain detected (value < threshold):
+#    - Sends Pushover alert
+#    - Closes both dome shutters ($3=West, $1=East)
+#    - Sets RAIN_TRIGGERED flag to prevent repeated actions
+# 3. If dry (value >= threshold) for 30+ minutes after rain:
+#    - Sends "dry" notification (optional)
+#    - Clears rain flag
+# 4. Ping monitoring (rain AND dry):
+#    - Alerts if dome controller unreachable
+#    - Clears alarm when connectivity restored
+#
+#==============================================================================
+# FILE LOCATIONS (read-only root filesystem)
+#==============================================================================
+# Script (persistent):   /usr/local/bin/cloudwatcher-rainchecker.sh
+# Service (persistent):  /etc/systemd/system/cloudwatcher-rainchecker.service
+# Log file (tmpfs):      /home/aagsolo/rainchecker.log
+# Status flags (tmpfs):  /home/aagsolo/RAINTRIGGERED, DRYTRIGGERED, PINGALARM
+# Weather data (tmpfs):  /home/aagsolo/aag_json.dat
+#
+#==============================================================================
+# INSTALLATION
+#==============================================================================
+# # SSH to the Solo
+# ssh root@192.168.1.151
+#
+# # Make root filesystem writable
+# mount -o remount,rw /
+#
+# # Copy script
+# cp cloudwatcher-raincheckerV3.sh /usr/local/bin/cloudwatcher-rainchecker.sh
+# chmod +x /usr/local/bin/cloudwatcher-rainchecker.sh
+#
+# # Create systemd service (see cloudwatcher-rainchecker.service)
+# cp cloudwatcher-rainchecker.service /etc/systemd/system/
+# systemctl daemon-reload
+# systemctl enable cloudwatcher-rainchecker
+#
+# # Protect filesystem
+# mount -o remount,ro /
+#
+# # Start service
+# systemctl start cloudwatcher-rainchecker
+#
+#==============================================================================
+# SERVICE MANAGEMENT
+#==============================================================================
+# Start:    systemctl start cloudwatcher-rainchecker
+# Stop:     systemctl stop cloudwatcher-rainchecker
+# Restart:  systemctl restart cloudwatcher-rainchecker
+# Status:   systemctl status cloudwatcher-rainchecker
+# Logs:     journalctl -u cloudwatcher-rainchecker -f
+#           tail -f /home/aagsolo/rainchecker.log
+#
+#==============================================================================
+# CONFIGURATION
+#==============================================================================
+
+# --- File Paths ---
 STATUS_FILE="/home/aagsolo/aag_json.dat"
 RAIN_TRIGGERED="/home/aagsolo/RAINTRIGGERED"
 DRY_TRIGGERED="/home/aagsolo/DRYTRIGGERED"
 PING_ALARM="/home/aagsolo/PINGALARM"
+LAST_RAIN_TIME="/home/aagsolo/LASTRAINTIME"
+LOG_FILE="/home/aagsolo/rainchecker.log"
 
-# Rain threshold: Actions are triggered when rain value falls *below* this value.
+# --- Thresholds ---
+# Rain detected when value falls BELOW this threshold
 RAIN_THRESHOLD=2900
 
-# Log file configuration
-LOG_FILE="/home/aagsolo/rainchecker.log"
+# Minutes of continuous dry weather before sending "dry" notification
+DRY_COOLDOWN_MINUTES=30
+
+# --- Log Configuration ---
 MAX_LOG_LINES=5000
 
-# Pushover configuration (better to define as variables above for security reasons)
+# --- Pushover Configuration ---
 PUSHOVER_TOKEN="xxxxx"
 PUSHOVER_USER="yyyyy"
 PUSHOVER_API_URL="https://api.pushover.net/1/messages.json"
-PUSHOVER_INFO_URL="http://94.zz.xx.yy:8888"
+# Optional: Dashboard URL included in notifications (comment out to disable)
+# PUSHOVER_INFO_URL="http://your-dashboard:8888"
 
-# Target IP for dome control
+# --- Dome Controller ---
 DOME_IP="192.168.1.177"
 
-# --- Logging Functions ---
+# --- Timing ---
+CHECK_INTERVAL=10       # Seconds between checks
+RAIN_ACTION_COOLDOWN=300  # Seconds to wait after dome close action (5 min)
+
+#==============================================================================
+# LOGGING FUNCTIONS
+#==============================================================================
+
 log_message() {
     local message="$1"
-    local timestamped_message
-    timestamped_message="$(date '+%Y-%m-%d %H:%M:%S'): $message"
-    echo "$timestamped_message" # Output to console
-    echo "$timestamped_message" >> "$LOG_FILE" # Output to log file
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "$timestamp: $message"
+    echo "$timestamp: $message" >> "$LOG_FILE"
 }
 
 trim_log_file() {
     if [[ -f "$LOG_FILE" ]]; then
         local line_count
-        line_count=$(wc -l < "$LOG_FILE" | tr -d ' ') # Ensure only the number is read
+        line_count=$(wc -l < "$LOG_FILE" | tr -d ' ')
         if (( line_count > MAX_LOG_LINES )); then
-            log_message "Log file $LOG_FILE will be trimmed to the last $MAX_LOG_LINES lines (Current: $line_count lines)."
-            local temp_log_file
-            temp_log_file=$(mktemp "${LOG_FILE}.XXXXXX") # Safe temporary filename
-            if tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "$temp_log_file"; then
-                mv "$temp_log_file" "$LOG_FILE"
+            log_message "Trimming log file to $MAX_LOG_LINES lines (was: $line_count)"
+            local temp_file
+            temp_file=$(mktemp "${LOG_FILE}.XXXXXX")
+            if tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "$temp_file"; then
+                mv "$temp_file" "$LOG_FILE"
             else
-                log_message "ERROR: Trimming log file $LOG_FILE failed."
-                rm -f "$temp_log_file" # Delete temporary file in case of error
+                log_message "ERROR: Failed to trim log file"
+                rm -f "$temp_file"
             fi
         fi
     fi
 }
 
-# --- Helper Functions ---
-# Function to extract rain value
+#==============================================================================
+# HELPER FUNCTIONS
+#==============================================================================
+
+# Extract rain value from JSON file
 get_rain_value() {
-    local extracted_value
     if [[ ! -f "$STATUS_FILE" ]] || [[ ! -r "$STATUS_FILE" ]]; then
-        log_message "ERROR: Status file $STATUS_FILE not found or not readable."
+        log_message "ERROR: Status file $STATUS_FILE not found or not readable"
         echo ""
         return 1
     fi
 
+    local value
     if command -v jq > /dev/null; then
-        extracted_value=$(jq -r '.rain' "$STATUS_FILE" 2>/dev/null)
-        if [[ "$?" -ne 0 ]] || [[ "$extracted_value" == "null" ]] || [[ -z "$extracted_value" ]]; then
-            echo ""
-            return 1
-        fi
+        value=$(jq -r '.rain // empty' "$STATUS_FILE" 2>/dev/null)
     else
-        extracted_value=$(grep '"rain"\s*:' "$STATUS_FILE" | sed -n 's/.*"rain"\s*:\s*\([0-9]\+\).*/\1/p')
-        if [[ -z "$extracted_value" ]]; then
-            echo ""
-            return 1
-        fi
+        value=$(grep -o '"rain"[[:space:]]*:[[:space:]]*[0-9]*' "$STATUS_FILE" | grep -o '[0-9]*$')
     fi
 
-    if [[ "$extracted_value" =~ ^[0-9]+$ ]]; then
-        echo "$extracted_value"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
         return 0
     else
+        log_message "ERROR: Invalid rain value: '$value'"
         echo ""
         return 1
     fi
 }
 
-# Function to check dome status
+# Check dome status via HTTP
 check_dome_status() {
-    local dome_status
-    dome_status=$(curl -s --connect-timeout 5 --max-time 10 "http://$DOME_IP/\$S" 2>/dev/null | tr -d '\r\n\t ' | tr '[:lower:]' '[:upper:]')
-    
-    if [[ $? -ne 0 ]] || [[ -z "$dome_status" ]]; then
-        log_message "ERROR: Could not retrieve dome status from $DOME_IP/\$S."
+    local status
+    status=$(curl -s --connect-timeout 5 --max-time 10 "http://$DOME_IP/?\$S" 2>/dev/null | tr -d '\r\n\t ' | tr '[:lower:]' '[:upper:]')
+
+    if [[ -z "$status" ]]; then
         echo "ERROR"
         return 1
     fi
-    
-    echo "$dome_status"
+
+    echo "$status"
     return 0
 }
 
-# --- Main Script ---
-log_message "Rain checker script started. Log file: $LOG_FILE"
+# Ping test for dome controller
+check_dome_ping() {
+    if ping -c 1 -W 3 "$DOME_IP" > /dev/null 2>&1; then
+        return 0  # Success
+    else
+        return 1  # Failed
+    fi
+}
+
+# Send Pushover notification
+send_pushover() {
+    local title="$1"
+    local message="$2"
+    local priority="${3:-0}"
+
+    local cmd="curl -s --form-string \"token=$PUSHOVER_TOKEN\" \
+                      --form-string \"user=$PUSHOVER_USER\" \
+                      --form-string \"title=$title\" \
+                      --form-string \"message=$message\" \
+                      --form-string \"priority=$priority\""
+
+    # Add URL if configured
+    if [[ -n "${PUSHOVER_INFO_URL:-}" ]]; then
+        cmd="$cmd --form-string \"url=$PUSHOVER_INFO_URL\""
+    fi
+
+    eval "$cmd \"$PUSHOVER_API_URL\"" > /dev/null 2>&1
+}
+
+# Get current Unix timestamp
+get_timestamp() {
+    date +%s
+}
+
+# Check if enough time has passed since last rain
+is_dry_cooldown_passed() {
+    if [[ ! -f "$LAST_RAIN_TIME" ]]; then
+        return 0  # No rain recorded, cooldown passed
+    fi
+
+    local last_rain
+    last_rain=$(cat "$LAST_RAIN_TIME" 2>/dev/null)
+
+    if [[ ! "$last_rain" =~ ^[0-9]+$ ]]; then
+        return 0  # Invalid timestamp, assume cooldown passed
+    fi
+
+    local now
+    now=$(get_timestamp)
+    local elapsed=$(( (now - last_rain) / 60 ))  # Minutes
+
+    if (( elapsed >= DRY_COOLDOWN_MINUTES )); then
+        return 0  # Cooldown passed
+    else
+        return 1  # Still in cooldown
+    fi
+}
+
+#==============================================================================
+# CLEANUP ON EXIT
+#==============================================================================
+
+cleanup() {
+    log_message "Rain checker script stopping (received signal)"
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT SIGHUP
+
+#==============================================================================
+# MAIN SCRIPT
+#==============================================================================
+
+log_message "=============================================="
+log_message "Rain checker script started"
+log_message "Rain threshold: < $RAIN_THRESHOLD"
+log_message "Dry cooldown: $DRY_COOLDOWN_MINUTES minutes"
+log_message "Dome IP: $DOME_IP"
+log_message "=============================================="
 
 while true; do
-    RAIN_VALUE_STR=$(get_rain_value)
-    
-    if [[ $? -ne 0 ]] || [[ -z "$RAIN_VALUE_STR" ]]; then
-        log_message "Warning: Could not extract valid rain value from $STATUS_FILE. Received value: '$RAIN_VALUE_STR'. Skipping cycle."
-        sleep 10
-        trim_log_file # Also trim log in case of error
+    # --- Get Rain Value ---
+    RAIN_VALUE=$(get_rain_value)
+
+    if [[ -z "$RAIN_VALUE" ]]; then
+        log_message "Warning: Could not read rain value, skipping cycle"
+        sleep "$CHECK_INTERVAL"
+        trim_log_file
         continue
     fi
 
-    RAIN_VALUE=$((RAIN_VALUE_STR))
-    log_message "Current rain value: $RAIN_VALUE (Rain threshold: < $RAIN_THRESHOLD)"
-
-    if [[ "$RAIN_VALUE" -lt "$RAIN_THRESHOLD" ]]; then
-        # Rain detected - PRIORITY: Rain sensor check
-        log_message "RAIN DETECTED! Checking dome status..."
-        
-        # Check dome status
-        DOME_STATUS=$(check_dome_status)
-        if [[ "$DOME_STATUS" == "ERROR" ]]; then
-            log_message "Warning: Dome status could not be retrieved. Performing ping test..."
-            # Fallback to ping test if status query fails
-        else
-            log_message "Dome status: $DOME_STATUS"
-            
-            if [[ "$DOME_STATUS" == "CLOSE" ]] || [[ "$DOME_STATUS" == "CLOSED" ]]; then
-                log_message "Dome is already closed. No action required."
-                # Set rain flag if not already set
-                if [[ ! -f "$RAIN_TRIGGERED" ]]; then
-                    touch "$RAIN_TRIGGERED"
-                    if [[ -f "$DRY_TRIGGERED" ]]; then
-                        rm -f "$DRY_TRIGGERED"
-                    fi
-                fi
-                sleep 10
-                trim_log_file
-                continue
-            fi
-        fi
-        
-        # Ping test (only if dome is not already closed or status unknown)
-        if [[ ! -f "$PING_ALARM" ]]; then # Only check ping if no alarm is active or if it was successful
-             if ! ping -c 1 "$DOME_IP" > /dev/null 2>&1; then
-                log_message "Ping error to $DOME_IP detected – Sending ping alarm!"
-                curl -s --form-string "token=$PUSHOVER_TOKEN" \
-                         --form-string "user=$PUSHOVER_USER" \
-                         --form-string "title=Ping Error (Rain active)" \
-                         --form-string "message=Ping to $DOME_IP failed! Rain value: $RAIN_VALUE" \
-                         --form-string "priority=1" \
-                         "$PUSHOVER_API_URL" > /dev/null
-                touch "$PING_ALARM"
-            fi
-        else # PING_ALARM exists
-            if ping -c 1 "$DOME_IP" > /dev/null 2>&1; then
-                 log_message "Ping to $DOME_IP successful again. Ping alarm is reset."
-                 rm -f "$PING_ALARM"
-            # else: Ping still failing, PING_ALARM remains
-            fi
-        fi
-    
-        if [[ ! -f "$RAIN_TRIGGERED" ]]; then
-            log_message "RAAAAIN (Value: $RAIN_VALUE). Dome will be closed."
-        
-            curl -s --form-string "token=$PUSHOVER_TOKEN" \
-                     --form-string "user=$PUSHOVER_USER" \
-                     --form-string "title=RAAAAIN! (Value: $RAIN_VALUE)" \
-                     --form-string "message=Dome closing!" \
-                     --form-string "url=$PUSHOVER_INFO_URL" \
-                     --form-string "priority=1" \
-                     "$PUSHOVER_API_URL" > /dev/null
-
-            log_message "WEST ($DOME_IP/\$3) closing!"
-            curl -X GET -H "Content-Type: application/json" "http://$DOME_IP/\$3" >/dev/null
-            sleep 3
-            log_message "EAST ($DOME_IP/\$1) closing!"
-            curl -X GET -H "Content-Type: application/json" "http://$DOME_IP/\$1" >/dev/null
-
-            touch "$RAIN_TRIGGERED"
-            if [[ -f "$DRY_TRIGGERED" ]]; then
-                rm -f "$DRY_TRIGGERED"
-            fi
-            log_message "Rain mode activated. Waiting 5 minutes before next rain action (if flag is removed)."
-            sleep 300
-        else
-            log_message "Rain already reported and dome action triggered (Value: $RAIN_VALUE). Waiting..."
+    # --- Ping Check (always, rain or dry) ---
+    if ! check_dome_ping; then
+        if [[ ! -f "$PING_ALARM" ]]; then
+            log_message "PING FAILED to $DOME_IP - sending alarm!"
+            send_pushover "Dome Ping Error" "Cannot reach dome at $DOME_IP! Rain value: $RAIN_VALUE" 1
+            touch "$PING_ALARM"
         fi
     else
-        # Dry
-        if [[ -f "$RAIN_TRIGGERED" ]]; then
-            log_message "Dry (Value: $RAIN_VALUE >= $RAIN_THRESHOLD). Rain status is cleared."
-            rm -f "$RAIN_TRIGGERED"
-        fi
-        
         if [[ -f "$PING_ALARM" ]]; then
-            log_message "Dry period: Ping alarm for $DOME_IP is reset."
+            log_message "Ping to $DOME_IP restored"
             rm -f "$PING_ALARM"
         fi
-
-        if [[ ! -f "$DRY_TRIGGERED" ]]; then
-            log_message "DRYYYYY (Value: $RAIN_VALUE). Sending notification."
-            curl -s --form-string "token=$PUSHOVER_TOKEN" \
-                     --form-string "user=$PUSHOVER_USER" \
-                     --form-string "title=DRYYYYY! (Value: $RAIN_VALUE)" \
-                     --form-string "message=No more rain!" \
-                     --form-string "url=$PUSHOVER_INFO_URL" \
-                     --form-string "priority=1" \
-                     "$PUSHOVER_API_URL" > /dev/null
-            touch "$DRY_TRIGGERED"
-        else
-            # Already reported as dry, no action needed, just log for debugging if desired.
-            # log_message "Dry status already active (Value: $RAIN_VALUE)."
-            : # No-op, just continue
-        fi
     fi
-    
-    sleep 10
+
+    # --- Rain Detection ---
+    if (( RAIN_VALUE < RAIN_THRESHOLD )); then
+        # RAIN DETECTED
+        log_message "Rain detected! Value: $RAIN_VALUE (threshold: $RAIN_THRESHOLD)"
+
+        # Record rain time for cooldown calculation
+        get_timestamp > "$LAST_RAIN_TIME"
+
+        # Clear dry flag (we're in rain now)
+        rm -f "$DRY_TRIGGERED"
+
+        if [[ ! -f "$RAIN_TRIGGERED" ]]; then
+            # First rain detection - take action!
+            log_message "=== RAIN ALERT - CLOSING DOME ==="
+
+            # Check current dome status
+            DOME_STATUS=$(check_dome_status)
+            log_message "Dome status: $DOME_STATUS"
+
+            if [[ "$DOME_STATUS" == "CLOSED" ]]; then
+                log_message "Dome already closed, sending notification only"
+                send_pushover "Rain Alert" "Rain detected (Value: $RAIN_VALUE). Dome already closed." 1
+            else
+                # Send alert
+                send_pushover "RAIN! Closing Dome" "Rain value: $RAIN_VALUE - Closing dome now!" 1
+
+                # Close dome (West first, then East)
+                log_message "Closing WEST shutter ($DOME_IP/?\$3)"
+                curl -s --max-time 10 "http://$DOME_IP/?\$3" > /dev/null 2>&1
+                sleep 3
+
+                log_message "Closing EAST shutter ($DOME_IP/?\$1)"
+                curl -s --max-time 10 "http://$DOME_IP/?\$1" > /dev/null 2>&1
+
+                log_message "Dome close commands sent"
+            fi
+
+            # Set rain flag
+            touch "$RAIN_TRIGGERED"
+
+            # Wait before next action cycle
+            log_message "Waiting $((RAIN_ACTION_COOLDOWN / 60)) minutes before next rain action"
+            sleep "$RAIN_ACTION_COOLDOWN"
+            continue
+        else
+            # Rain continues, flag already set
+            log_message "Rain continues (Value: $RAIN_VALUE), dome already triggered"
+        fi
+
+    else
+        # DRY
+        if [[ -f "$RAIN_TRIGGERED" ]]; then
+            # Was raining, now dry - check cooldown
+            if is_dry_cooldown_passed; then
+                log_message "Dry for $DRY_COOLDOWN_MINUTES+ minutes (Value: $RAIN_VALUE)"
+
+                if [[ ! -f "$DRY_TRIGGERED" ]]; then
+                    # Send dry notification (only once)
+                    send_pushover "Weather Clear" "Dry for $DRY_COOLDOWN_MINUTES+ minutes. Rain value: $RAIN_VALUE" 0
+                    touch "$DRY_TRIGGERED"
+                fi
+
+                # Clear rain flag
+                rm -f "$RAIN_TRIGGERED"
+                rm -f "$LAST_RAIN_TIME"
+            else
+                # Still in cooldown period
+                local remaining
+                if [[ -f "$LAST_RAIN_TIME" ]]; then
+                    local last_rain=$(cat "$LAST_RAIN_TIME")
+                    local now=$(get_timestamp)
+                    remaining=$(( DRY_COOLDOWN_MINUTES - ((now - last_rain) / 60) ))
+                    log_message "Dry (Value: $RAIN_VALUE) but in cooldown, ${remaining}min remaining"
+                fi
+            fi
+        fi
+        # If never rained (no RAIN_TRIGGERED), just continue silently
+    fi
+
+    sleep "$CHECK_INTERVAL"
     trim_log_file
 done
