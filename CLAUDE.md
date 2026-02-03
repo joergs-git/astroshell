@@ -19,7 +19,9 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 
 | File | Purpose |
 |------|---------|
-| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA, enhanced version with network monitoring |
+| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v3.3 with network monitoring and tick logging |
+| `astroshell_ticklogger.py` | **Pi server** - Receives tick data from Arduino, logs to CSV with temperature |
+| `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
 | `nocapacitor2023.ino` | Original AstroShell reference code (unmodified) |
 | `cloudwatcher-raincheckerV3.sh` | Bash script for Cloudwatcher Solo rain detection |
@@ -43,6 +45,7 @@ All real-time operations run in the interrupt service routine:
 - Button debouncing (cnt > 6 ticks = ~100ms)
 - Limit switch monitoring
 - Motor timeout safety (6527 ticks = 107 seconds)
+- Tick counting for motor runtime measurement (v3.3)
 
 ### Network Monitoring
 - Checks Cloudwatcher IP every **1 minute** (`connectCheckInterval = 60000`)
@@ -65,6 +68,7 @@ All real-time operations run in the interrupt service routine:
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get status: "OPEN" or "CLOSE" |
 | `/?$R` | Reset EEPROM counters |
+| `/?$L` | Toggle tick logging on/off (default: off after reboot) |
 
 **Note:** Button labels in code are inverted due to hardware wiring swap. The web interface shows physical reality.
 
@@ -96,6 +100,46 @@ const unsigned long maxFailTimeWindow = 300000UL;     // 5-min failure window
 RAIN_THRESHOLD=2900     # Rain detected when value < this
 DOME_IP="192.168.1.177" # Dome controller IP
 MAX_LOG_LINES=5000      # Log rotation limit
+```
+
+## Motor Runtime Tick Logging (v3.3)
+
+Measures motor runtime in ISR ticks for temperature correlation analysis. Purpose: determine temperature-dependent motor timeout coefficients.
+
+### How It Works
+1. Arduino counts ticks during motor full-runs (start at one limit, stop at opposite)
+2. Only valid measurements are recorded (manual stops, timeouts discarded)
+3. When toggle enabled (`$L`), Arduino pushes data to Solo:88 via HTTP GET
+4. Pi server logs to CSV with timestamp and ambient temperature
+
+### Tick Logger Server (Cloudwatcher Solo / Pi3)
+
+**Location on Pi (read-only root filesystem):**
+- Script: `/usr/local/bin/astroshell_ticklogger.py`
+- Service: `/etc/systemd/system/astroshell_ticklogger.service`
+- CSV output: `/home/aagsolo/motor_ticks.csv` (tmpfs, lost on reboot)
+- Weather data: `/home/aagsolo/aag_json.dat`
+
+**Server Endpoints (port 88):**
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /log?m=1&d=1&t=5234` | Log tick data (m=motor, d=direction, t=ticks) |
+| `GET /env` | Get temperature and coefficient for Arduino |
+| `GET /status` | Health check |
+
+**Service Management:**
+```bash
+systemctl start astroshell_ticklogger
+systemctl stop astroshell_ticklogger
+systemctl status astroshell_ticklogger
+journalctl -u astroshell_ticklogger -f
+```
+
+**Modifying files on read-only Solo:**
+```bash
+mount -o remount,rw /
+# make changes
+mount -o remount,ro /
 ```
 
 ## Development Notes
