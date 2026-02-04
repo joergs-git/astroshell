@@ -1,6 +1,6 @@
 # AstroShell Dome Controller
 
-**Enhanced Arduino firmware for AstroShell telescope domes with automatic rain protection with lunaticoastro's cloudwatcher solo**
+**Enhanced Arduino fail-safe firmware for AstroShell telescope domes with automatic rain protection with lunaticoastro's cloudwatcher solo**
 
 [![Platform](https://img.shields.io/badge/Platform-Arduino%20MEGA-blue)]()
 [![License](https://img.shields.io/badge/License-Free%20to%20Use-green)]()
