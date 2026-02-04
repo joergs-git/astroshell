@@ -104,6 +104,8 @@ DOME_IP="192.168.1.177"     # Dome controller IP
 CHECK_INTERVAL=10           # Seconds between checks
 RAIN_ACTION_COOLDOWN=300    # Seconds after dome close (5 min)
 PING_FAIL_THRESHOLD=3       # Consecutive ping failures before alarm
+SCHEDULED_CHECK_HOURS="8 13 16"  # Hours to check if dome is open
+CLOSE_VERIFY_DELAY=180      # Seconds before verifying close (3 min)
 ```
 
 ## Motor Runtime Tick Logging (v3.3)
@@ -171,12 +173,14 @@ Monitors rain sensor and automatically closes dome. Sends Pushover notifications
 2. If rain detected (< 2900): Closes dome ($3 West, $1 East), sends Pushover alert
 3. 30-minute cooldown before "dry" notification (prevents spam during showers)
 4. Ping monitoring (rain AND dry): Alerts after 3 consecutive failures (configurable)
+5. Scheduled status checks (8:00, 13:00, 16:00): Alerts if dome is open
+6. Close verification: 3 min after rain close, sends success/failure notification
 
 ### Location on Pi (read-only root filesystem)
 - Script: `/usr/local/bin/cloudwatcher-rainchecker.sh`
 - Service: `/etc/systemd/system/cloudwatcher-rainchecker.service`
 - Log file: `/home/aagsolo/rainchecker.log` (tmpfs)
-- Status flags: `/home/aagsolo/RAINTRIGGERED`, `DRYTRIGGERED`, `PINGALARM`, `PINGFAILCOUNT` (tmpfs)
+- Status flags: `/home/aagsolo/RAINTRIGGERED`, `DRYTRIGGERED`, `PINGALARM`, `PINGFAILCOUNT`, `LASTSCHEDULEDCHECK`, `CLOSEVERIFYTIME`, `CLOSEVERIFYALERTED` (tmpfs)
 
 ### Service Management
 ```bash
