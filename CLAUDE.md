@@ -73,6 +73,19 @@ All real-time operations run in the interrupt service routine:
 
 **Note:** Button labels in code are inverted due to hardware wiring swap. The web interface shows physical reality.
 
+## Motor Stop Reason Codes
+
+Displayed on web interface under "Stop Reason":
+
+| Code | Meaning | Web Display |
+|------|---------|-------------|
+| 0 | Limit switch reached | "Limit 'Phys. Open/Closed'" |
+| 1 | Physical button or SWSTOP | "Button/SWSTOP" |
+| 2 | Web command ($5 or direction change) | "Web STOP" |
+| 3 | IP failure auto-close | "IP Fail Auto-Close" |
+| 4 | VCC failure auto-close | "VCC Fail Auto-Close" |
+| 5 | Motor timeout reached | "TIMEOUT at X ticks" |
+
 ## Critical Code Quirk - Inverted Limit Switches
 
 Due to installation wiring error, limit switch names are **inverted** in code:
