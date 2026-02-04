@@ -236,6 +236,14 @@ volatile bool m2_data_ready = false;          // True when new valid M2 data ava
 volatile byte m1_last_direction = 0;          // 1=closing, 2=opening (for push)
 volatile byte m2_last_direction = 0;
 
+// --- Interrupted Stop Tracking (stops before reaching target limit) ---
+volatile bool m1_interrupt_ready = false;     // True when M1 stopped before target
+volatile bool m2_interrupt_ready = false;     // True when M2 stopped before target
+volatile word m1_interrupt_ticks = 0;         // Tick count at interruption
+volatile word m2_interrupt_ticks = 0;
+volatile byte m1_interrupt_direction = 0;     // 1=was closing, 2=was opening
+volatile byte m2_interrupt_direction = 0;
+
 //=============================================================================
 // FUNCTION PROTOTYPES
 //=============================================================================
@@ -248,6 +256,7 @@ void initializeEEPROM();                        // Load/init persistent storage
 void saveCountersToEEPROM();                    // Save counters if changed
 void incrementDayCounter();                     // Track uptime days
 void pushTickDataIfReady();                     // Push tick data to logging server
+void pushInterruptDataIfReady();                // Push interrupted stop data
 
 //=============================================================================
 // EEPROM FUNCTIONS - Persistent Storage Management
@@ -395,6 +404,78 @@ void pushTickDataIfReady() {
     wdt_reset();
 
     m2_data_ready = false;
+  }
+}
+
+//=============================================================================
+// INTERRUPT DATA PUSH - Send interrupted stop data to logging server
+//=============================================================================
+/**
+ * Pushes interrupted stop data when motor stopped before reaching target.
+ * This captures: manual stops, web stops, emergency stops, timeouts.
+ *
+ * GET /interrupt?m=<motor>&d=<direction>&t=<ticks>
+ *   m = Motor number (1 or 2)
+ *   d = Direction (1=was closing, 2=was opening)
+ *   t = Tick count at interruption
+ */
+void pushInterruptDataIfReady() {
+  // Skip if logging disabled or network not ready
+  if (!tickLoggingEnabled || !ethernet_initialized || !networkMonitoringEnabled) {
+    // Still clear flags to prevent buildup
+    m1_interrupt_ready = false;
+    m2_interrupt_ready = false;
+    return;
+  }
+
+  // Check Motor 1 interrupt
+  if (m1_interrupt_ready) {
+    wdt_reset();
+    EthernetClient logClient;
+    logClient.setTimeout(2000);
+
+    if (logClient.connect(remoteStationIp, tickLogServerPort)) {
+      logClient.print(F("GET /interrupt?m=1&d="));
+      logClient.print(m1_interrupt_direction);
+      logClient.print(F("&t="));
+      logClient.print(m1_interrupt_ticks);
+      logClient.println(F(" HTTP/1.0"));
+      logClient.print(F("Host: "));
+      logClient.println(remoteStationIp);
+      logClient.println(F("Connection: close"));
+      logClient.println();
+
+      delay(50);
+      logClient.stop();
+    }
+    wdt_reset();
+
+    m1_interrupt_ready = false;
+  }
+
+  // Check Motor 2 interrupt
+  if (m2_interrupt_ready) {
+    wdt_reset();
+    EthernetClient logClient;
+    logClient.setTimeout(2000);
+
+    if (logClient.connect(remoteStationIp, tickLogServerPort)) {
+      logClient.print(F("GET /interrupt?m=2&d="));
+      logClient.print(m2_interrupt_direction);
+      logClient.print(F("&t="));
+      logClient.print(m2_interrupt_ticks);
+      logClient.println(F(" HTTP/1.0"));
+      logClient.print(F("Host: "));
+      logClient.println(remoteStationIp);
+      logClient.println(F("Connection: close"));
+      logClient.println();
+
+      delay(50);
+      logClient.stop();
+    }
+    wdt_reset();
+
+    m2_interrupt_ready = false;
   }
 }
 
@@ -1389,6 +1470,7 @@ void loop() {
     #endif
 
     pushTickDataIfReady();      // Push tick data to logging server if available
+    pushInterruptDataIfReady(); // Push interrupted stop data if available
   }
 
   handleWebClient();  // Process any pending HTTP requests
@@ -1623,8 +1705,12 @@ ISR(TIMER2_COMPA_vect) {
 
       if (at_target) {
         m1_data_ready = true;  // Signal main loop to push data
+      } else {
+        // Interrupted stop (manual, web, timeout, emergency) - log it
+        m1_interrupt_ticks = m1_tick_counter;
+        m1_interrupt_direction = m1_was_closing ? 1 : 2;
+        m1_interrupt_ready = true;
       }
-      // If not at target: manual stop, timeout, etc. - discard measurement
 
       m1_full_run_active = false;
     }
@@ -1670,6 +1756,11 @@ ISR(TIMER2_COMPA_vect) {
 
       if (at_target) {
         m2_data_ready = true;
+      } else {
+        // Interrupted stop (manual, web, timeout, emergency) - log it
+        m2_interrupt_ticks = m2_tick_counter;
+        m2_interrupt_direction = m2_was_closing ? 1 : 2;
+        m2_interrupt_ready = true;
       }
 
       m2_full_run_active = false;

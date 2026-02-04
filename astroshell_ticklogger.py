@@ -103,6 +103,10 @@ GET /log?m=<motor>&d=<direction>&t=<ticks>
     t: Tick count from Arduino ISR (~61 ticks/second)
     Returns: "OK" or "ERROR"
 
+GET /interrupt?m=<motor>&d=<direction>&t=<ticks>
+    Logs interrupted stop (motor stopped before reaching target limit).
+    Same parameters as /log, logs to same CSV with "INTERRUPTED" marker.
+
 GET /env
     Returns current temperature and coefficient for Arduino.
     Format: "<temperature>,<coefficient>" (e.g. "18.5,1.0")
@@ -187,6 +191,32 @@ def log_tick_data(motor, direction, ticks):
         print(f"CSV write error: {e}")
         return False
 
+def log_interrupt_data(motor, direction, ticks):
+    """
+    Logs an interrupted stop to CSV (motor stopped before reaching target).
+
+    Args:
+        motor: 1 or 2
+        direction: 1 (was closing) or 2 (was opening)
+        ticks: ISR tick count at interruption
+    """
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    temperature = get_solo_temperature()
+
+    # Direction with INTERRUPTED marker
+    dir_str = "INTERRUPTED-closing" if direction == "1" else "INTERRUPTED-opening"
+
+    line = f"{timestamp},{motor},{dir_str},{ticks},{temperature}\n"
+
+    try:
+        with open(CSV_FILE, 'a') as f:
+            f.write(line)
+        print(f"INTERRUPT: M{motor} {dir_str} at {ticks} ticks @ {temperature}C")
+        return True
+    except IOError as e:
+        print(f"CSV write error: {e}")
+        return False
+
 class TickLoggerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for tick logging."""
 
@@ -208,6 +238,26 @@ class TickLoggerHandler(BaseHTTPRequestHandler):
 
             if motor and direction and ticks:
                 success = log_tick_data(motor, direction, ticks)
+                self.send_response(200 if success else 500)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'OK' if success else b'ERROR')
+            else:
+                self.send_response(400)
+                self.send_header('Content-Type', 'text/plain')
+                self.end_headers()
+                self.wfile.write(b'Missing parameters (m, d, t required)')
+
+        elif parsed.path == '/interrupt':
+            # Parse query parameters for interrupted stop
+            params = parse_qs(parsed.query)
+
+            motor = params.get('m', [None])[0]
+            direction = params.get('d', [None])[0]
+            ticks = params.get('t', [None])[0]
+
+            if motor and direction and ticks:
+                success = log_interrupt_data(motor, direction, ticks)
                 self.send_response(200 if success else 500)
                 self.send_header('Content-Type', 'text/plain')
                 self.end_headers()
