@@ -141,7 +141,7 @@ Measures motor runtime in ISR ticks for temperature correlation analysis. Purpos
 - Service: `/etc/systemd/system/astroshell_ticklogger.service`
 - CSV output: `/home/aagsolo/motor_ticks.csv` (tmpfs, backed up to Synology)
 - Weather data: `/home/aagsolo/aag_json.dat`
-- Synology backup: `solo@192.168.1.113:/volume1/homes/solo/motor_ticks.csv`
+- Synology backup: `solo@192.168.1.113:/volume1/homes/solo/motor_ticks_<UTC-timestamp>.csv`
 
 **Server Endpoints (port 88):**
 | Endpoint | Purpose |
