@@ -21,7 +21,12 @@ Weather JSON (tmpfs):   /home/aagsolo/aag_json.dat (created by Solo)
 
 Note: The Solo has a read-only root filesystem to protect the SD card.
       /home/aagsolo is a tmpfs (RAM disk) - data is lost on reboot.
-      For long-term storage, implement Supabase push later.
+      Periodic backup to Synology NAS via SCP preserves data.
+
+Synology Backup (one-time SSH key setup on Solo as root):
+      1. ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+      2. ssh-copy-id solo@192.168.1.113
+      (Step 1 MUST run before step 2, otherwise "No identities found" error)
 
 ==============================================================================
 INSTALLATION (one-time setup)
@@ -127,6 +132,7 @@ timestamp_utc,motor,direction,ticks,temperature
 
 import os
 import json
+import subprocess
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -135,6 +141,12 @@ from urllib.parse import urlparse, parse_qs
 SERVER_PORT = 88
 CSV_FILE = "/home/aagsolo/motor_ticks.csv"
 AAG_JSON_FILE = "/home/aagsolo/aag_json.dat"  # Cloudwatcher Solo weather data (read-only)
+
+# --- Synology Backup Configuration ---
+SYNOLOGY_ENABLED = True
+SYNOLOGY_HOST = "192.168.1.113"
+SYNOLOGY_USER = "solo"
+SYNOLOGY_PATH = "/volume1/homes/solo/"
 
 def get_solo_temperature():
     """
@@ -186,6 +198,7 @@ def log_tick_data(motor, direction, ticks):
         with open(CSV_FILE, 'a') as f:
             f.write(line)
         print(f"Logged: M{motor} {dir_str} {ticks} ticks @ {temperature}C")
+        backup_to_synology()  # Sync to NAS after each record
         return True
     except IOError as e:
         print(f"CSV write error: {e}")
@@ -212,10 +225,41 @@ def log_interrupt_data(motor, direction, ticks):
         with open(CSV_FILE, 'a') as f:
             f.write(line)
         print(f"INTERRUPT: M{motor} {dir_str} at {ticks} ticks @ {temperature}C")
+        backup_to_synology()  # Sync to NAS after each record
         return True
     except IOError as e:
         print(f"CSV write error: {e}")
         return False
+
+def backup_to_synology():
+    """
+    Copies CSV file to Synology NAS via SCP.
+    Called after each new data record. Overwrites same file on Synology.
+    Runs silently - errors are logged but don't affect main operation.
+    """
+    if not SYNOLOGY_ENABLED:
+        return
+
+    if not os.path.exists(CSV_FILE):
+        return
+
+    remote_path = f"{SYNOLOGY_USER}@{SYNOLOGY_HOST}:{SYNOLOGY_PATH}motor_ticks.csv"
+
+    try:
+        result = subprocess.run(
+            ['scp', '-q', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+             CSV_FILE, remote_path],
+            capture_output=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            print(f"Backup: Synced to Synology")
+        else:
+            print(f"Backup: SCP failed - {result.stderr.decode().strip()}")
+    except subprocess.TimeoutExpired:
+        print("Backup: SCP timeout")
+    except Exception as e:
+        print(f"Backup: Error - {e}")
 
 class TickLoggerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for tick logging."""
@@ -305,6 +349,10 @@ def main():
     # Test temperature fetch on startup
     temp = get_solo_temperature()
     print(f"Current temperature: {temp}C")
+
+    # Log Synology backup status
+    if SYNOLOGY_ENABLED:
+        print(f"Backup: Syncing to {SYNOLOGY_USER}@{SYNOLOGY_HOST} after each record")
 
     server = HTTPServer(('0.0.0.0', SERVER_PORT), TickLoggerHandler)
     print(f"Server listening on port {SERVER_PORT}...")
