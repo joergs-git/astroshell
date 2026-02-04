@@ -20,8 +20,14 @@
 #    - Sends "dry" notification (optional)
 #    - Clears rain flag
 # 4. Ping monitoring (rain AND dry):
-#    - Alerts if dome controller unreachable
+#    - Alerts after 3 consecutive failures (configurable)
 #    - Clears alarm when connectivity restored
+# 5. Scheduled status checks (8:00, 13:00, 16:00):
+#    - Alerts if dome is OPEN at configured times
+#    - One alert per configured hour per day
+# 6. Close verification:
+#    - 3 minutes after rain close command, verifies dome actually closed
+#    - Sends success or failure Pushover notification
 #
 #==============================================================================
 # FILE LOCATIONS (read-only root filesystem)
@@ -105,6 +111,17 @@ DOME_IP="192.168.1.177"
 # --- Timing ---
 CHECK_INTERVAL=10       # Seconds between checks
 RAIN_ACTION_COOLDOWN=300  # Seconds to wait after dome close action (5 min)
+
+# --- Scheduled Dome Status Checks ---
+# Send Pushover alert if dome is OPEN at these hours (24h format, space-separated)
+SCHEDULED_CHECK_HOURS="8 13 16"
+LAST_SCHEDULED_CHECK="/home/aagsolo/LASTSCHEDULEDCHECK"
+
+# --- Close Verification ---
+# Verify dome actually closed after rain close command
+CLOSE_VERIFY_DELAY=180          # Seconds to wait before verifying (3 min)
+CLOSE_VERIFY_TIME="/home/aagsolo/CLOSEVERIFYTIME"
+CLOSE_VERIFY_ALERTED="/home/aagsolo/CLOSEVERIFYALERTED"
 
 #==============================================================================
 # LOGGING FUNCTIONS
@@ -257,6 +274,8 @@ log_message "Rain checker script started"
 log_message "Rain threshold: < $RAIN_THRESHOLD"
 log_message "Dry cooldown: $DRY_COOLDOWN_MINUTES minutes"
 log_message "Dome IP: $DOME_IP"
+log_message "Scheduled checks: $SCHEDULED_CHECK_HOURS hours"
+log_message "Close verify delay: $((CLOSE_VERIFY_DELAY / 60)) minutes"
 log_message "=============================================="
 
 while true; do
@@ -305,6 +324,61 @@ while true; do
         fi
     fi
 
+    # --- Scheduled Dome Status Check ---
+    # Alert if dome is open at configured hours (8:00, 13:00, 16:00)
+    current_hour=$(date +%H | sed 's/^0//')  # Remove leading zero
+    for check_hour in $SCHEDULED_CHECK_HOURS; do
+        if (( current_hour == check_hour )); then
+            # Check if we already alerted this hour
+            last_check=""
+            if [[ -f "$LAST_SCHEDULED_CHECK" ]]; then
+                last_check=$(cat "$LAST_SCHEDULED_CHECK" 2>/dev/null)
+            fi
+            today_hour="$(date +%Y-%m-%d)-${check_hour}"
+            if [[ "$last_check" != "$today_hour" ]]; then
+                # Haven't checked this hour today
+                DOME_STATUS=$(check_dome_status)
+                if [[ "$DOME_STATUS" == "OPEN" ]]; then
+                    log_message "Scheduled check: Dome is OPEN at ${check_hour}:00"
+                    send_pushover "Dome Status Alert" "Scheduled check: Dome is OPEN at ${check_hour}:00. Rain value: $RAIN_VALUE" 0
+                else
+                    log_message "Scheduled check: Dome is CLOSED at ${check_hour}:00 (OK)"
+                fi
+                echo "$today_hour" > "$LAST_SCHEDULED_CHECK"
+            fi
+            break
+        fi
+    done
+
+    # --- Close Verification ---
+    # Check if dome actually closed after rain close command
+    if [[ -f "$CLOSE_VERIFY_TIME" ]]; then
+        close_time=$(cat "$CLOSE_VERIFY_TIME" 2>/dev/null)
+        if [[ "$close_time" =~ ^[0-9]+$ ]]; then
+            now=$(get_timestamp)
+            elapsed=$((now - close_time))
+            if (( elapsed >= CLOSE_VERIFY_DELAY )); then
+                # Time to verify
+                if [[ ! -f "$CLOSE_VERIFY_ALERTED" ]]; then
+                    DOME_STATUS=$(check_dome_status)
+                    if [[ "$DOME_STATUS" != "CLOSED" ]]; then
+                        log_message "CLOSE VERIFICATION FAILED: Dome still $DOME_STATUS after $((CLOSE_VERIFY_DELAY / 60)) minutes!"
+                        send_pushover "Dome Close Failed!" "Dome is still $DOME_STATUS after close command! Check manually. Rain value: $RAIN_VALUE" 1
+                    else
+                        log_message "Close verification: Dome successfully closed"
+                        send_pushover "Dome Closed OK" "Dome successfully closed after rain alert. Rain value: $RAIN_VALUE" 0
+                    fi
+                    # Clean up verification files (done regardless of success/failure)
+                    rm -f "$CLOSE_VERIFY_TIME"
+                    touch "$CLOSE_VERIFY_ALERTED"
+                fi
+            fi
+        else
+            # Invalid timestamp, clean up
+            rm -f "$CLOSE_VERIFY_TIME"
+        fi
+    fi
+
     # --- Rain Detection ---
     if (( RAIN_VALUE < RAIN_THRESHOLD )); then
         # RAIN DETECTED
@@ -340,6 +414,11 @@ while true; do
                 curl -s --max-time 10 "http://$DOME_IP/?\$1" > /dev/null 2>&1
 
                 log_message "Dome close commands sent"
+
+                # Start close verification timer
+                get_timestamp > "$CLOSE_VERIFY_TIME"
+                rm -f "$CLOSE_VERIFY_ALERTED"
+                log_message "Close verification scheduled in $((CLOSE_VERIFY_DELAY / 60)) minutes"
             fi
 
             # Set rain flag
