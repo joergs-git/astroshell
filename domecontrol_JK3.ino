@@ -122,7 +122,7 @@ volatile word mot1timer = 0;          // Motor 1 timeout countdown (ISR ticks)
 volatile word mot2timer = 0;          // Motor 2 timeout countdown (ISR ticks)
 
 // --- Stop Reason Tracking ---
-// 0=Limit switch/Timeout, 1=Button/SWSTOP, 2=Web command, 3=IP failure, 4=VCC failure
+// 0=Limit switch, 1=Button/SWSTOP, 2=Web command, 3=IP failure, 4=VCC failure, 5=Timeout
 volatile byte stop1reason = 0;
 volatile byte stop2reason = 0;
 
@@ -1267,13 +1267,14 @@ void sendFullHtmlResponse(EthernetClient& client) {
 
       if(mot1dir == 0) {
           client.print(F("<br><strong>Stop Reason:</strong> "));
-          if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (lim1closed)")); 
+          if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (lim1closed)"));
           else if (s1_is_physically_closed_state && stop1reason==0) client.print(F("Limit 'Phys. Closed' (lim1open)"));
           else if (stop1reason == 1) client.print(F("Button/SWSTOP"));
           else if (stop1reason == 2) client.print(F("Web STOP"));
           else if (stop1reason == 3 && m1AutoClosedByIP) client.print(F("IP Fail Auto-Close"));
           else if (stop1reason == 4) client.print(F("VCC Fail Auto-Close"));
-          else if (!s1_is_physically_open_state && !s1_is_physically_closed_state) client.print(F("User/Timeout"));
+          else if (stop1reason == 5) { client.print(F("TIMEOUT at ")); client.print(m1_interrupt_ticks); client.print(F(" ticks")); }
+          else if (!s1_is_physically_open_state && !s1_is_physically_closed_state) client.print(F("Manual Stop"));
           else client.print(F("Unknown"));
       }
       client.println(F("</div></div>"));
@@ -1307,7 +1308,8 @@ void sendFullHtmlResponse(EthernetClient& client) {
           else if (stop2reason == 2) client.print(F("Web STOP"));
           else if (stop2reason == 3 && m2AutoClosedByIP) client.print(F("IP Fail Auto-Close"));
           else if (stop2reason == 4) client.print(F("VCC Fail Auto-Close"));
-          else if (!s2_is_physically_open_state && !s2_is_physically_closed_state) client.print(F("User/Timeout"));
+          else if (stop2reason == 5) { client.print(F("TIMEOUT at ")); client.print(m2_interrupt_ticks); client.print(F(" ticks")); }
+          else if (!s2_is_physically_open_state && !s2_is_physically_closed_state) client.print(F("Manual Stop"));
           else client.print(F("Unknown"));
       }
       client.println(F("</div></div>"));
@@ -1567,7 +1569,7 @@ ISR(TIMER2_COMPA_vect) {
     else {
       mot1dir = 0;  // Timeout reached - stop motor
       if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) {
-        stop1reason = 0; m1AutoClosedByIP = false;
+        stop1reason = 5; m1AutoClosedByIP = false;  // 5 = Timeout
       }
     }
   }
@@ -1576,7 +1578,7 @@ ISR(TIMER2_COMPA_vect) {
     else {
       mot2dir = 0;  // Timeout reached - stop motor
       if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) {
-        stop2reason = 0; m2AutoClosedByIP = false;
+        stop2reason = 5; m2AutoClosedByIP = false;  // 5 = Timeout
       }
     }
   }
