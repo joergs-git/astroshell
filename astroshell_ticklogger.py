@@ -133,6 +133,7 @@ timestamp_utc,motor,direction,ticks,temperature
 import os
 import json
 import subprocess
+import threading
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -233,9 +234,9 @@ def log_interrupt_data(motor, direction, ticks):
 
 def backup_to_synology():
     """
-    Copies CSV file to Synology NAS via SCP.
-    Called after each new data record. Overwrites same file on Synology.
-    Runs silently - errors are logged but don't affect main operation.
+    Copies CSV file to Synology NAS via SCP with UTC timestamp in filename.
+    Runs in background thread so HTTP handler is never blocked.
+    Errors are logged but don't affect main operation.
     """
     if not SYNOLOGY_ENABLED:
         return
@@ -243,23 +244,29 @@ def backup_to_synology():
     if not os.path.exists(CSV_FILE):
         return
 
-    remote_path = f"{SYNOLOGY_USER}@{SYNOLOGY_HOST}:{SYNOLOGY_PATH}motor_ticks.csv"
+    def _scp_worker():
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+        remote_filename = f"motor_ticks_{timestamp}.csv"
+        remote_path = f"{SYNOLOGY_USER}@{SYNOLOGY_HOST}:{SYNOLOGY_PATH}{remote_filename}"
 
-    try:
-        result = subprocess.run(
-            ['scp', '-q', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
-             CSV_FILE, remote_path],
-            capture_output=True,
-            timeout=30
-        )
-        if result.returncode == 0:
-            print(f"Backup: Synced to Synology")
-        else:
-            print(f"Backup: SCP failed - {result.stderr.decode().strip()}")
-    except subprocess.TimeoutExpired:
-        print("Backup: SCP timeout")
-    except Exception as e:
-        print(f"Backup: Error - {e}")
+        try:
+            result = subprocess.run(
+                ['scp', '-q', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+                 CSV_FILE, remote_path],
+                capture_output=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                print(f"Backup: {remote_filename}")
+            else:
+                print(f"Backup: SCP failed - {result.stderr.decode().strip()}")
+        except subprocess.TimeoutExpired:
+            print("Backup: SCP timeout")
+        except Exception as e:
+            print(f"Backup: Error - {e}")
+
+    thread = threading.Thread(target=_scp_worker, daemon=True)
+    thread.start()
 
 class TickLoggerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for tick logging."""
