@@ -11,6 +11,8 @@
 //    Fix: Changed to count-down approach "else{if(cloudsensortimer>0)cloudsensortimer--;}"
 //    Now: Provides symmetrical ~1 sec delay for both trigger AND clear (hysteresis)
 //
+//   -------------
+//
 // ISSUE #2 - Serial not initialized (line 111)
 //    Code: Serial.println() called but Serial.begin() is commented out (line 108)
 //    Effect: Serial output does nothing, wastes CPU cycles.
@@ -385,4 +387,5 @@ ISR(TIMER2_COMPA_vect){
   if(digitalRead(SW2up)  ){sw2up=0;}
   if(digitalRead(SW2down)){sw2down=0;}
 }
+
 
