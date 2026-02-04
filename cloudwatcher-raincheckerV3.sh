@@ -75,6 +75,10 @@ STATUS_FILE="/home/aagsolo/aag_json.dat"
 RAIN_TRIGGERED="/home/aagsolo/RAINTRIGGERED"
 DRY_TRIGGERED="/home/aagsolo/DRYTRIGGERED"
 PING_ALARM="/home/aagsolo/PINGALARM"
+PING_FAIL_COUNT="/home/aagsolo/PINGFAILCOUNT"
+
+# --- Ping Failure Threshold ---
+PING_FAIL_THRESHOLD=3   # Consecutive failures before alarm
 LAST_RAIN_TIME="/home/aagsolo/LASTRAINTIME"
 LOG_FILE="/home/aagsolo/rainchecker.log"
 
@@ -267,13 +271,34 @@ while true; do
     fi
 
     # --- Ping Check (always, rain or dry) ---
+    # Requires PING_FAIL_THRESHOLD consecutive failures before alarm
     if ! check_dome_ping; then
-        if [[ ! -f "$PING_ALARM" ]]; then
-            log_message "PING FAILED to $DOME_IP - sending alarm!"
-            send_pushover "Dome Ping Error" "Cannot reach dome at $DOME_IP! Rain value: $RAIN_VALUE" 1
-            touch "$PING_ALARM"
+        # Increment failure counter
+        local fail_count=1
+        if [[ -f "$PING_FAIL_COUNT" ]]; then
+            fail_count=$(cat "$PING_FAIL_COUNT" 2>/dev/null)
+            if [[ "$fail_count" =~ ^[0-9]+$ ]]; then
+                fail_count=$((fail_count + 1))
+            else
+                fail_count=1
+            fi
+        fi
+        echo "$fail_count" > "$PING_FAIL_COUNT"
+
+        if (( fail_count >= PING_FAIL_THRESHOLD )); then
+            if [[ ! -f "$PING_ALARM" ]]; then
+                log_message "PING FAILED $fail_count times to $DOME_IP - sending alarm!"
+                send_pushover "Dome Ping Error" "Cannot reach dome at $DOME_IP ($fail_count consecutive failures)! Rain value: $RAIN_VALUE" 1
+                touch "$PING_ALARM"
+            fi
+        else
+            log_message "Ping failed to $DOME_IP ($fail_count/$PING_FAIL_THRESHOLD)"
         fi
     else
+        # Ping succeeded - reset counter and clear alarm
+        if [[ -f "$PING_FAIL_COUNT" ]]; then
+            rm -f "$PING_FAIL_COUNT"
+        fi
         if [[ -f "$PING_ALARM" ]]; then
             log_message "Ping to $DOME_IP restored"
             rm -f "$PING_ALARM"
