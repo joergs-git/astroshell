@@ -114,7 +114,7 @@ Measures motor runtime in ISR ticks for temperature correlation analysis. Purpos
 
 ### How It Works
 1. Arduino counts ticks during motor full-runs (start at one limit, stop at opposite)
-2. Only valid measurements are recorded (manual stops, timeouts discarded)
+2. Valid full-runs logged to `/log` endpoint, interrupted stops (timeout, manual, web) logged to `/interrupt`
 3. When toggle enabled (`$L`), Arduino pushes data to Solo:88 via HTTP GET
 4. Pi server logs to CSV with timestamp and ambient temperature
 
@@ -129,9 +129,17 @@ Measures motor runtime in ISR ticks for temperature correlation analysis. Purpos
 **Server Endpoints (port 88):**
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /log?m=1&d=1&t=5234` | Log tick data (m=motor, d=direction, t=ticks) |
+| `GET /log?m=1&d=1&t=5234` | Log valid full-run (m=motor, d=direction, t=ticks) |
+| `GET /interrupt?m=1&d=1&t=5234` | Log interrupted stop (timeout, manual, web stop) |
 | `GET /env` | Get temperature and coefficient for Arduino |
 | `GET /status` | Health check |
+
+**CSV Format:**
+```
+timestamp_utc,motor,direction,ticks,temperature
+2026-02-04T09:33:28Z,1,closing,5800,3.0           # Valid full-run
+2026-02-04T09:35:00Z,2,INTERRUPTED-closing,6527,3.1  # Timeout/manual stop
+```
 
 **Service Management:**
 ```bash
