@@ -26,6 +26,8 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `nocapacitor2023.ino` | Original AstroShell reference code (unmodified) |
 | `cloudwatcher-raincheckerV3.sh` | **Rain checker** - Auto-closes dome on rain, Pushover alerts |
 | `cloudwatcher-rainchecker.service` | Systemd service file for rain checker autostart |
+| `open_astroshell.bat` | **NINA script** - Opens dome via sequence instruction, Pushover notification |
+| `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `README.md` | User documentation with wiring notes |
 
 ## Hardware Configuration

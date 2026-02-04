@@ -79,6 +79,22 @@ This firmware is enhanced from the original AstroShell code with these improveme
 
 ---
 
+## Repository Files
+
+| File | Description |
+|------|-------------|
+| `domecontrol_JK3.ino` | Main Arduino firmware (v3.3) with network monitoring, tick logging, web UI |
+| `cloudwatcher-raincheckerV3.sh` | Rain checker script for Cloudwatcher Solo - auto-closes dome on rain |
+| `cloudwatcher-rainchecker.service` | Systemd service for rain checker autostart |
+| `astroshell_ticklogger.py` | Motor runtime logger server - receives tick data, logs to CSV |
+| `astroshell_ticklogger.service` | Systemd service for tick logger autostart |
+| `open_astroshell.bat` | Windows batch script for NINA - opens dome with Pushover notification |
+| `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
+| `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
+| `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
+
+---
+
 ## Important: Limit Switch Wiring
 
 My dome had limit switches accidentally swapped during installation. The code compensates for this in the web display only. **If your switches are wired correctly**, see the section below for how to revert the display logic.
