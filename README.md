@@ -1,42 +1,92 @@
-# Astroshell Driver and Lunatico Cloudwatcher Solo Integration / Enhancements
-Optimized Arduino Code for controlling of my AstroShell Dome
-(Also have a look at the litte [https](https://github.com/joergs-git/astroshell/wiki) Wiki page)
+# AstroShell Dome Controller
 
-This arduino code is kind of branched from the producer of the AstroShell Telescope Domes.
-As I was not supersatisfied with some aspects I enhanced it to my likings. 
+**Enhanced Arduino firmware for AstroShell telescope domes with automatic rain protection**
 
-So feel free to use it too. 
-One important hint: When my dome was installed the technician team accidentally swapped 
-the limit-endpoint-switches so my dome reported open while it was actually closed and vice versa.
-Because I didn't wanted to re-solder all the cablings I simply asked AstroShell for the code to make the necessary logical changes there
-and thus avoided re-cabling.
+[![Platform](https://img.shields.io/badge/Platform-Arduino%20MEGA-blue)]()
+[![License](https://img.shields.io/badge/License-Free%20to%20Use-green)]()
 
-While I initially just planned to solve my little problem I ran into some further ideas which I implemented into this code now too:
+> Also check out the [Wiki](https://github.com/joergs-git/astroshell/wiki) for additional documentation.
 
-1. A enhanced UI webfront-end which works better for iphones as well as tablets (imho)
-2. Disabled the cloudsensor evaluation because it simply doesn't make sense at all (imho)
-3. Disabled the "vibration motor option" (for whatever it was for). No clue.
-4. Added hardcoded ethernet pinging of my lunatic cloudsensor to automatically close the dome in case the clouddetector is not up and running and thus might not be able to detect rain. Dome will be closed after 3 failed pings within 3 minutes.
-5. Added a new command URL Command $S to get a quick response if the Dome is open or closed (to use it in other scripts or tools e.g. lunatic cloudwatcher solo). I place my little Bash-Shell-Script running on my Lunatico Cloudwatcher Solo device also into this repository so you get an idea of what I established for my self.
-(To start it and keep it running on the solo you have to run it with nohup. e.g. "_nohup /home/aagsolo/rainchecker.sh > /dev/null 2>&1 &_" 
+---
 
-6. optimized memory usage of arduino
-7. disabled Serial debugging Outputs as it's conflicting with Data Input Ports 0,1 from the arduino which are used for the astroshell end-point limit switches.
-8. Some stabilty tweaks and checks
-9. Showing some further switch informations and results of pinging the cloudwatcher
-10. created a linux bash shell script running on Cloudwatcher Solo from Lunatico to check for raindrops and close it automatically. Also if the PC is not running/working.
-11. Overall mostly failure proof safety now. (not 100% though of course).
+## Key Features
 
-The logic of the motor itself was not touched at all.
+| Feature | Description |
+|---------|-------------|
+| **Automatic Rain Protection** | Closes dome automatically when rain detected via Cloudwatcher Solo |
+| **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (5 failures in 5 min) |
+| **Cable Removal Detection** | Instant dome closure if Ethernet cable is disconnected |
+| **Mobile-Friendly Web UI** | Responsive design works on phones, tablets, and desktops |
+| **Hardware Watchdog** | 8-second watchdog ensures automatic recovery from hangs |
+| **Motor Runtime Logging** | Tick-based logging for temperature correlation analysis |
+| **Pushover Notifications** | Real-time alerts for rain, connectivity issues, and dome status |
 
-If you like to use it, feel free doing so. But on your own risk of course.
-It's always a good idea to try out things while the dome is half open (not fully closed or fully open) so you have a chance you can react in case of....
+---
 
-Cheers
-Joerg
+## Safety Features at a Glance
 
-Addons:
-BTW I meanwhile replaced the UNO of the Astroshell into a Arduino MEGA which has a bit more memory so not running into certain issues.
+```
+Telescope Protection Priority:
+
+  Rain Detected          Cloudwatcher        Ethernet Cable
+       via                Unreachable           Removed
+   Cloudwatcher           (5 min)             (Instant)
+       |                     |                    |
+       v                     v                    v
+   +-----------------------------------------------+
+   |           AUTOMATIC DOME CLOSURE              |
+   +-----------------------------------------------+
+                         |
+                         v
+              Pushover Notification
+                    to Owner
+```
+
+---
+
+## Quick Start
+
+1. **Upload** `domecontrol_JK3.ino` to Arduino MEGA
+2. **Configure** IP addresses in the code (dome: 192.168.1.177, Cloudwatcher: 192.168.1.151)
+3. **Deploy** rain checker script to Cloudwatcher Solo (optional but recommended)
+4. **Access** web interface at `http://192.168.1.177`
+
+---
+
+## What's Different from Original AstroShell Code
+
+This firmware is enhanced from the original AstroShell code with these improvements:
+
+| Area | Enhancement |
+|------|-------------|
+| **Web Interface** | Modern responsive UI for mobile devices |
+| **Network Monitoring** | IP failsafe auto-close (original had none) |
+| **Rain Protection** | Integrated Cloudwatcher Solo rain checker script |
+| **Stability** | Hardware watchdog, memory optimization, removed unused features |
+| **API** | Added `$S` status command, `$L` logging toggle, `$R` counter reset |
+| **Diagnostics** | Motor tick logging, timeout tracking, detailed stop reasons |
+
+**Note:** The motor control logic is unchanged from the original - only safety features and UI were enhanced.
+
+---
+
+## Hardware
+
+- **Controller:** Arduino MEGA 2560 (upgraded from UNO for more memory)
+- **Network:** W5500 Ethernet Shield
+- **Weather:** Lunatico Cloudwatcher Solo (optional but recommended)
+
+---
+
+## Important: Limit Switch Wiring
+
+My dome had limit switches accidentally swapped during installation. The code compensates for this in the web display only. **If your switches are wired correctly**, see the section below for how to revert the display logic.
+
+---
+
+*Feel free to use this code at your own risk. Always test with the dome in an intermediate position!*
+
+*Cheers, Joerg*
 
 ## If Your Limit Switches Are Wired Correctly
 
