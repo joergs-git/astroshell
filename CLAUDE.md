@@ -132,14 +132,16 @@ Measures motor runtime in ISR ticks for temperature correlation analysis. Purpos
 2. Valid full-runs logged to `/log` endpoint, interrupted stops (timeout, manual, web) logged to `/interrupt`
 3. When toggle enabled (`$L`), Arduino pushes data to Solo:88 via HTTP GET
 4. Pi server logs to CSV with timestamp and ambient temperature
+5. CSV is backed up to Synology NAS via SCP after each new record
 
 ### Tick Logger Server (Cloudwatcher Solo / Pi3)
 
 **Location on Pi (read-only root filesystem):**
 - Script: `/usr/local/bin/astroshell_ticklogger.py`
 - Service: `/etc/systemd/system/astroshell_ticklogger.service`
-- CSV output: `/home/aagsolo/motor_ticks.csv` (tmpfs, lost on reboot)
+- CSV output: `/home/aagsolo/motor_ticks.csv` (tmpfs, backed up to Synology)
 - Weather data: `/home/aagsolo/aag_json.dat`
+- Synology backup: `solo@192.168.1.113:/volume1/homes/solo/motor_ticks.csv`
 
 **Server Endpoints (port 88):**
 | Endpoint | Purpose |
@@ -162,6 +164,12 @@ systemctl start astroshell_ticklogger
 systemctl stop astroshell_ticklogger
 systemctl status astroshell_ticklogger
 journalctl -u astroshell_ticklogger -f
+```
+
+**Synology Backup Setup (one-time on Solo as root):**
+```bash
+ssh-keygen -t rsa -N "" -f ~/.ssh/id_rsa
+ssh-copy-id solo@192.168.1.113
 ```
 
 **Modifying files on read-only Solo:**
