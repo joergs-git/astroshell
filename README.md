@@ -51,6 +51,7 @@ Telescope Protection Priority:
 3. **Deploy** rain checker script to Cloudwatcher Solo (optional but recommended)
 4. **Access** web interface at `http://192.168.1.177`
 
+5. **Addons:** If you want to have it perfect I recommend you also use the batch files to control dome from NINA and also install the cloudwatcher-rainchecker and astroshell-ticklogger services on your cloudwatcher solo device. After that you're really super set. Also I recommend you registering a Pushover API account for messaging services if you don't already have one. Just have a look into the different files where you can see further explanations and howtos.
 ---
 
 ## What's Different from Original AstroShell Code
