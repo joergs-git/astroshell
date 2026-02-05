@@ -90,8 +90,71 @@ This firmware is enhanced from the original AstroShell code with these improveme
 | `astroshell_ticklogger.service` | Systemd service for tick logger autostart |
 | `open_astroshell.bat` | Windows batch script for NINA - opens dome with Pushover notification |
 | `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
+| `motortick-statistic-batchrun.sh` | Automated dome open/close cycles for motor tick statistics collection |
 | `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
 | `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
+
+---
+
+## Motor Tick Statistic Batch Runner
+
+Automated script to collect motor tick runtime data by repeatedly opening and closing the dome. Runs manually on the Cloudwatcher Solo (Pi3) during daytime.
+
+### What It Does
+
+One **run** = dome CLOSED → OPEN → CLOSED. Default: **20 runs** per session.
+
+Motor runtime varies with temperature (oil viscosity). Rest periods between direction changes are **randomized between 5 and 30 minutes** to collect data at varying motor temperatures — short rests keep the oil warm, long rests let it cool to ambient.
+
+### How It Works
+
+1. Enables tick logging on Arduino (`$L`)
+2. Verifies dome at closed endpoints (both shutters at limit switches)
+3. Checks weather — only opens when dry
+4. Opens dome, waits 200s, verifies both shutters at open endpoints
+5. Rests 5-30 min (random), monitors rain while open
+6. Checks dome state — detects if closed externally during rest
+7. Closes dome (no weather check needed), waits 200s, verifies closed endpoints
+8. Run complete — repeats until all runs finished
+
+**Weather strategy:** Rain is only checked before **opening**. Closing is always safe. If rain starts while open, the dome closes immediately and the run does not count.
+
+**Endpoint verification:** After each motor run, the script parses the Arduino web page to confirm both shutters reached their target limit switches. Any "Intermediate" state triggers a Pushover alert.
+
+**Pushover:** Every notification includes "Run X/Y". Messages sent for: script start/complete/stop, every open and close, interrupted runs, rain events, and rest periods with planned wait time.
+
+### Usage
+
+```bash
+ssh root@192.168.1.151
+/usr/local/bin/motortick-statistic-batchrun.sh
+# Stop with Ctrl+C (dome will be closed safely)
+```
+
+### Installation
+
+```bash
+mount -o remount,rw /
+cp motortick-statistic-batchrun.sh /usr/local/bin/
+chmod +x /usr/local/bin/motortick-statistic-batchrun.sh
+mount -o remount,ro /
+```
+
+### Configuration (edit script header)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_RUNS` | 20 | Number of full open/close cycles |
+| `MOTOR_WAIT_SECONDS` | 200 | Wait for motors to reach endpoints |
+| `MIN_REST_MINUTES` | 5 | Minimum rest between direction changes |
+| `MAX_REST_MINUTES` | 30 | Maximum rest (randomized) |
+| `RAIN_THRESHOLD` | 2900 | Rain detection threshold (same as rain checker) |
+
+### Prerequisites
+
+- `astroshell_ticklogger.py` running on Solo port 88
+- `aag_json.dat` updated by Cloudwatcher software
+- Rain checker may remain running for safety (script cooperates)
 
 ---
 
