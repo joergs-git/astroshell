@@ -28,6 +28,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `cloudwatcher-rainchecker.service` | Systemd service file for rain checker autostart |
 | `open_astroshell.bat` | **NINA script** - Opens dome via sequence instruction, Pushover notification |
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
+| `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `README.md` | User documentation with wiring notes |
 
 ## Hardware Configuration
@@ -235,6 +236,90 @@ systemctl start cloudwatcher-rainchecker
 ```
 
 Requires `jq` for JSON parsing (falls back to grep/sed).
+
+## Motor Tick Statistic Batch Runner (Cloudwatcher Solo / Pi3)
+
+Automated dome open/close cycles to collect motor tick runtime data. Designed for manual daytime execution on the Solo Pi. One "run" = dome CLOSED -> OPEN -> CLOSED.
+
+### Purpose
+
+Motor runtime (ISR ticks) varies with temperature due to motor oil viscosity. This script repeatedly cycles the dome with randomized rest periods (5-30 min) to collect data across varying oil temperatures:
+- Short rest (5 min): motor oil still warm from previous run
+- Long rest (30 min): motor oil cools to ambient temperature
+- Random distribution provides data points across the cooling curve
+
+### Behavior
+
+1. Enables tick logging on Arduino (`$L`) if not already enabled
+2. Verifies dome at CLOSED endpoints (both shutters at limit switches)
+3. Checks weather - only opens when dry
+4. Opens dome (West `$4`, East `$2`), waits 200s for motors
+5. Verifies BOTH shutters at OPEN endpoints (parses web page HTML)
+6. Rests random 5-30 min (rain monitored during open rest)
+7. Checks dome state - detects if closed externally during rest
+8. Closes dome (West `$3`, East `$1`), waits 200s - no weather check needed
+9. Verifies BOTH shutters at CLOSED endpoints
+10. Run complete. Rests random 5-30 min, then repeats
+11. After MAX_RUNS (default 20), sends summary and exits
+
+### Endpoint Verification
+
+After each motor run, the script parses the Arduino web page to confirm both shutters reached their target limit switch. Checks for "Physically OPEN" / "Physically CLOSED" state strings. Any "Intermediate" state triggers an INTERRUPT alert via Pushover, and the run does not count.
+
+### Weather Strategy
+
+- Rain is only checked **before opening** the dome. Closing is always safe.
+- During open rest periods, rain is checked every 60 seconds.
+- If rain detected while open: dome closes immediately, run does not count.
+- If rain checker or manual closes dome during rest: detected and handled gracefully.
+
+### Pushover Notifications
+
+Every message includes "Run X/Y" (current/total). Sent for:
+- Script start / complete / stopped (Ctrl+C)
+- Every dome open and close (start + endpoint confirmation)
+- Interrupted motor runs (shutter not at expected endpoint)
+- Rain detected / cleared
+- Run completion with next rest time
+
+### Configuration
+
+```bash
+MAX_RUNS=20                 # Number of full open/close cycles
+MOTOR_WAIT_SECONDS=200      # Wait for motors to reach endpoints
+MIN_REST_MINUTES=5          # Minimum rest between direction changes
+MAX_REST_MINUTES=30         # Maximum rest (randomized)
+RAIN_THRESHOLD=2900         # Same as rain checker
+DOME_IP="192.168.1.177"     # Dome controller
+```
+
+### Location on Pi
+
+- Script: `/usr/local/bin/motortick-statistic-batchrun.sh`
+- Log file: `/home/aagsolo/batchrun.log` (tmpfs)
+
+### Usage
+
+```bash
+ssh root@192.168.1.151
+/usr/local/bin/motortick-statistic-batchrun.sh
+# Stop with Ctrl+C (dome will be closed safely)
+```
+
+### Installation
+
+```bash
+mount -o remount,rw /
+cp motortick-statistic-batchrun.sh /usr/local/bin/
+chmod +x /usr/local/bin/motortick-statistic-batchrun.sh
+mount -o remount,ro /
+```
+
+### Prerequisites
+
+- `astroshell_ticklogger.py` running on Solo port 88
+- `aag_json.dat` updated by Cloudwatcher software
+- Rain checker may remain running for safety (script cooperates)
 
 ## Known Issues in controller_wcapacitor_2025_germany.ino
 
