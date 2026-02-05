@@ -229,8 +229,8 @@ void loop(){
 
             if(mot1dir==0){
               client.println("Stopped<br>");
-              if(digitalRead(lim1open))  client.print("by "Opened" limit switch");
-         else if(digitalRead(lim1closed))client.print("by "Closed" limit switch");
+              if(digitalRead(lim1open))  client.print("by \"Opened\" limit switch");
+         else if(digitalRead(lim1closed))client.print("by \"Closed\" limit switch");
          else if(stop1reason==1)client.println("by button");
          else if(stop1reason==2)client.println("by remote command");
             }
@@ -251,8 +251,8 @@ void loop(){
           }
             if(mot2dir==0){
               client.println("Stopped<br>");
-              if(digitalRead(lim2open))  client.println("by "Opened" limit switch");
-         else if(digitalRead(lim2closed))client.println("by "Closed" limit switch");
+              if(digitalRead(lim2open))  client.println("by \"Opened\" limit switch");
+         else if(digitalRead(lim2closed))client.println("by \"Closed\" limit switch");
          else if(stop2reason==1)client.print("by button");
          else if(stop2reason==2)client.print("by remote command");
             }
