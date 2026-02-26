@@ -293,7 +293,7 @@ while true; do
     # Requires PING_FAIL_THRESHOLD consecutive failures before alarm
     if ! check_dome_ping; then
         # Increment failure counter
-        local fail_count=1
+        fail_count=1
         if [[ -f "$PING_FAIL_COUNT" ]]; then
             fail_count=$(cat "$PING_FAIL_COUNT" 2>/dev/null)
             if [[ "$fail_count" =~ ^[0-9]+$ ]]; then
@@ -320,6 +320,7 @@ while true; do
         fi
         if [[ -f "$PING_ALARM" ]]; then
             log_message "Ping to $DOME_IP restored"
+            send_pushover "Dome Ping Restored" "Dome at $DOME_IP is reachable again. Rain value: $RAIN_VALUE" 0
             rm -f "$PING_ALARM"
         fi
     fi
@@ -451,10 +452,10 @@ while true; do
                 rm -f "$LAST_RAIN_TIME"
             else
                 # Still in cooldown period
-                local remaining
+                remaining=0
                 if [[ -f "$LAST_RAIN_TIME" ]]; then
-                    local last_rain=$(cat "$LAST_RAIN_TIME")
-                    local now=$(get_timestamp)
+                    last_rain=$(cat "$LAST_RAIN_TIME")
+                    now=$(get_timestamp)
                     remaining=$(( DRY_COOLDOWN_MINUTES - ((now - last_rain) / 60) ))
                     log_message "Dry (Value: $RAIN_VALUE) but in cooldown, ${remaining}min remaining"
                 fi
