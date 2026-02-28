@@ -353,7 +353,7 @@ volatile boolean system_fully_ready = false;  // True after setup() completes
 // Data can be pushed to external server for logging when toggle is enabled.
 
 // --- Tick Logging Toggle (Web UI controllable, off after reboot) ---
-bool tickLoggingEnabled = false;              // Must be enabled via web UI
+bool tickLoggingEnabled = true;               // Enabled by default, toggle via web UI ($L)
 
 // --- Tick Logging Server Configuration ---
 const int tickLogServerPort = 88;             // Port for tick log receiver (same IP as Cloudwatcher)
