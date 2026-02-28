@@ -723,6 +723,7 @@ void pushInterruptDataIfReady() {
  * Uses async (non-blocking) conversion mode.
  */
 void setupDS18B20() {
+  delay(100);  // Allow DS18B20 to finish its own power-on boot before scanning bus
   ds18b20.begin();
 
   if (ds18b20.getDeviceCount() > 0) {
