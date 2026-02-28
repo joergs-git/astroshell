@@ -105,7 +105,7 @@ All real-time operations run in the interrupt service routine:
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get status: "OPEN" or "CLOSE" |
 | `/?$R` | Reset EEPROM counters |
-| `/?$L` | Toggle tick logging on/off (default: off after reboot) |
+| `/?$L` | Toggle tick logging on/off (default: ON after reboot) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be fully closed (v4.0) |
 
@@ -411,8 +411,20 @@ This file has documented bugs (see file header for full list):
 ### Sensor Testing (v4.0)
 
 1. **DS18B20**: Verify temperature on web UI. Unplug → confirm "Not connected" and static 6527 timeout fallback
-2. **VL53L0X**: Verify distance on web UI. Move hand → see distance change. Unplug → frozen detection auto-disabled
+2. **VL53L0X**: Verify distance on web UI. Move hand → see distance change. Unplug → frozen detection shows "Disabled (sensor disconnected)"
 3. **ToF calibration**: Close dome → click "Calibrate ToF Baseline" → verify baseline stored → reboot → verify persists
 4. **Frozen dome simulation**: Block ToF sensor during open → verify stop + reverse + 3 retries + lockout
 5. **Unlock**: After lockout → click "UNLOCK DOME" → verify open commands work again
 6. **Graceful degradation**: Disconnect both sensors → verify system behaves identically to v3.3
+7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup.
+
+### Important Implementation Details (v4.0)
+
+These patterns were discovered during lab testing and are critical for future modifications:
+
+- **ISR vs loop() race condition**: The frozen dome state machine runs in `loop()` and uses its own `fd_prev_mot1dir`/`fd_prev_mot2dir` static locals to detect motor start transitions. Do NOT use the ISR's `m1_prev_dir`/`m2_prev_dir` — the ISR updates them at 61 Hz before `loop()` runs, so `loop()` never sees the 0→CLOSE transition.
+- **Sensor hot-plug re-detection**: Both DS18B20 and VL53L0X have 30-second periodic re-detection loops that re-scan the bus after 10 consecutive failures. Without this, unplugging and reconnecting a sensor requires a reboot.
+- **DS18B20 startup delay**: A `delay(100)` before `ds18b20.begin()` in `setupDS18B20()` is required — the sensor needs time to boot after power-on. Without it, detection fails at startup and takes ~80 seconds via the re-detection path.
+- **DS18B20 pullup resistor**: 4.7kΩ required (5.1kΩ also works). Without pullup, OneWire open-drain bus cannot communicate.
+- **URL encoding**: Event detail strings sent to the Solo must be URL-encoded (spaces → `%20`). Python's `BaseHTTPRequestHandler` rejects URLs with literal spaces (HTTP 400). Encoding is done in a local buffer before `print()`, not char-by-char via `write()` (which caused TCP issues on W5100/W5500).
+- **Python stdout buffering**: The ticklogger service file must use `python3 -u` (unbuffered) or `print()` output won't appear in `journalctl`. The `-u` flag is set in `astroshell_ticklogger.service`.
