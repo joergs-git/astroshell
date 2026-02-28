@@ -1,8 +1,9 @@
 # AstroShell Dome Controller
 
-**Enhanced Arduino fail-safe firmware for AstroShell telescope domes with automatic rain protection with lunaticoastro's cloudwatcher solo**
+**Enhanced Arduino fail-safe firmware for AstroShell telescope domes with automatic rain protection, temperature-based dynamic motor timeout, and frozen dome detection**
 
 [![Platform](https://img.shields.io/badge/Platform-Arduino%20MEGA-blue)]()
+[![Version](https://img.shields.io/badge/Version-4.0-green)]()
 [![License](https://img.shields.io/badge/License-Free%20to%20Use-green)]()
 
 > Also check out the [Wiki](https://github.com/joergs-git/astroshell/wiki) for additional documentation.
@@ -16,10 +17,12 @@
 | **Automatic Rain Protection** | Closes dome automatically when rain detected via Cloudwatcher Solo |
 | **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (5 failures in 5 min) |
 | **Cable Removal Detection** | Instant dome closure if Ethernet cable is disconnected |
+| **Dynamic Motor Timeout** | Temperature-based timeout from 253-cycle regression analysis (v4.0) |
+| **Frozen Dome Detection** | VL53L0X ToF sensor detects frozen halves, auto-retries with lockout (v4.0) |
+| **Event Notifications** | Pushover alerts for frozen dome, sensor failures, signal conflicts (v4.0) |
 | **Mobile-Friendly Web UI** | Responsive design works on phones, tablets, and desktops |
 | **Hardware Watchdog** | 8-second watchdog ensures automatic recovery from hangs |
-| **Motor Runtime Logging** | Tick-based logging for temperature correlation analysis |
-| **Pushover Notifications** | Real-time alerts for rain, connectivity issues, and dome status |
+| **Motor Runtime Logging** | Tick-based logging with temperature and ToF data for analysis |
 
 ---
 
@@ -28,54 +31,97 @@
 ```
 Telescope Protection Priority:
 
-  Rain Detected          Cloudwatcher        Ethernet Cable
-       via                Unreachable           Removed
-   Cloudwatcher           (5 min)             (Instant)
-       |                     |                    |
-       v                     v                    v
-   +-----------------------------------------------+
-   |           AUTOMATIC DOME CLOSURE              |
-   +-----------------------------------------------+
-                         |
-                         v
-              Pushover Notification
-                    to Owner
+  Rain Detected          Cloudwatcher        Ethernet Cable       Dome Halves
+       via                Unreachable           Removed            Frozen (v4.0)
+   Cloudwatcher           (5 min)             (Instant)           (Detected by ToF)
+       |                     |                    |                    |
+       v                     v                    v                    v
+   +-----------------------------------------------+   +--------------------+
+   |           AUTOMATIC DOME CLOSURE              |   | 3x Retry + Lockout |
+   +-----------------------------------------------+   +--------------------+
+                         |                                       |
+                         v                                       v
+              Pushover Notification                   Pushover Notification
+                    to Owner                               to Owner
 ```
+
+---
+
+## What's New in v4.0
+
+| Feature | Description |
+|---------|-------------|
+| **DS18B20 Temperature Probe** | Ambient temperature on pin 22 for dynamic timeout computation |
+| **Dynamic Motor Timeout** | Linear regression model replaces static 107s timeout — adapts to temperature |
+| **VL53L0X ToF Sensor** | Measures gap between dome halves via I2C (pins 20/21) |
+| **Frozen Dome Detection** | 3 retry attempts with 20s gravity wait, then lockout |
+| **ToF Calibration** | `/?$C` stores current closed distance in EEPROM |
+| **Dome Unlock** | `/?$U` clears frozen lockout |
+| **Event Notifications** | Arduino pushes events to Solo:88, Solo sends Pushover alerts |
+| **Conflicting Signals** | Detects limit switch vs ToF disagreement (rate-limited alerts) |
+| **Graceful Degradation** | All new features auto-disable if sensors disconnected |
 
 ---
 
 ## Quick Start
 
-1. **Upload** `domecontrol_JK3.ino` to Arduino MEGA
-2. **Configure** IP addresses in the code (dome: 192.168.1.177, Cloudwatcher: 192.168.1.151)
-3. **Deploy** rain checker script to Cloudwatcher Solo (optional but recommended)
-4. **Access** web interface at `http://192.168.1.177`
+1. **Install Libraries** in Arduino IDE Library Manager:
+   - `OneWire` by Jim Studt
+   - `DallasTemperature` by Miles Burton
+   - `VL53L0X` by Pololu
+2. **Upload** `domecontrol_JK3.ino` to Arduino MEGA
+3. **Configure** IP addresses in the code (dome: 192.168.1.177, Cloudwatcher: 192.168.1.151)
+4. **Wire sensors** (see Hardware Setup below)
+5. **Calibrate ToF** — close dome, navigate to web UI, click "Calibrate ToF Baseline"
+6. **Deploy** tick logger + event server to Cloudwatcher Solo (optional but recommended)
+7. **Access** web interface at `http://192.168.1.177`
 
-5. **Addons:** If you want to have it perfect I recommend you also use the batch files to control dome from NINA and also install the cloudwatcher-rainchecker and astroshell-ticklogger services on your cloudwatcher solo device. After that you're really super set. Also I recommend you registering a Pushover API account for messaging services if you don't already have one. Just have a look into the different files where you can see further explanations and howtos.
----
-
-## What's Different from Original AstroShell Code
-
-This firmware is enhanced from the original AstroShell code with these improvements:
-
-| Area | Enhancement |
-|------|-------------|
-| **Web Interface** | Modern responsive UI for mobile devices |
-| **Network Monitoring** | IP failsafe auto-close (original had none) |
-| **Rain Protection** | Integrated Cloudwatcher Solo rain checker script |
-| **Stability** | Hardware watchdog, memory optimization, removed unused features |
-| **API** | Added `$S` status command, `$L` logging toggle, `$R` counter reset |
-| **Diagnostics** | Motor tick logging, timeout tracking, detailed stop reasons |
-
-**Note:** The motor control logic is unchanged from the original - only safety features and UI were enhanced.
+8. **Addons:** If you want to have it perfect I recommend you also use the batch files to control dome from NINA and also install the cloudwatcher-rainchecker and astroshell-ticklogger services on your cloudwatcher solo device. After that you're really super set. Also I recommend you registering a Pushover API account for messaging services if you don't already have one. Just have a look into the different files where you can see further explanations and howtos.
 
 ---
 
-## Hardware
+## Hardware Setup
+
+### Required Components
 
 - **Controller:** Arduino MEGA 2560 (upgraded from UNO for more memory)
 - **Network:** W5500 Ethernet Shield
 - **Weather:** Lunatico Cloudwatcher Solo (optional but recommended)
+- **Temperature:** DS18B20 waterproof probe (v4.0)
+- **Distance:** VL53L0X Time-of-Flight sensor breakout (v4.0)
+
+### Sensor Wiring (v4.0)
+
+#### DS18B20 Temperature Probe (Pin 22)
+```
+Arduino MEGA Pin 22 ──── DS18B20 Data (yellow/white wire)
+                    │
+                    ├── 4.7kΩ pullup to 5V
+                    │
+Arduino 5V ──────── DS18B20 Vcc (red wire)
+Arduino GND ─────── DS18B20 GND (black wire)
+```
+- Use external Vcc power (not parasitic mode) for reliability
+- Pin 22 is MEGA-exclusive — guaranteed no conflict with existing wiring
+
+#### VL53L0X Time-of-Flight Sensor (I2C)
+```
+Arduino MEGA Pin 20 (SDA) ──── VL53L0X SDA
+Arduino MEGA Pin 21 (SCL) ──── VL53L0X SCL
+Arduino 3.3V ────────────────── VL53L0X VIN
+Arduino GND ─────────────────── VL53L0X GND
+```
+- Mount across the gap between dome halves at a point where movement is visible
+- Closed distance will be calibrated via web UI — no need to hardcode
+
+### ToF Sensor Mounting
+
+The VL53L0X should be mounted so it measures the distance across the gap between the two dome halves. When the dome opens, the gap increases. The exact mounting position doesn't matter — calibration stores whatever "closed" distance your installation produces.
+
+**Tips:**
+- Mount on the fixed part of the dome frame, pointing at the moving half
+- Protect from rain/condensation with a small shield or enclosure
+- Test by manually moving the dome — distance should increase clearly when opening
 
 ---
 
@@ -83,16 +129,33 @@ This firmware is enhanced from the original AstroShell code with these improveme
 
 | File | Description |
 |------|-------------|
-| `domecontrol_JK3.ino` | Main Arduino firmware (v3.3) with network monitoring, tick logging, web UI |
+| `domecontrol_JK3.ino` | Main Arduino firmware (v4.0) with safety sensors, dynamic timeout, frozen dome detection |
 | `cloudwatcher-raincheckerV3.sh` | Rain checker script for Cloudwatcher Solo - auto-closes dome on rain |
 | `cloudwatcher-rainchecker.service` | Systemd service for rain checker autostart |
-| `astroshell_ticklogger.py` | Motor runtime logger server - receives tick data, logs to CSV |
+| `astroshell_ticklogger.py` | Motor runtime & event server - receives tick data + events, logs CSV, sends Pushover |
 | `astroshell_ticklogger.service` | Systemd service for tick logger autostart |
 | `open_astroshell.bat` | Windows batch script for NINA - opens dome with Pushover notification |
 | `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
 | `motortick-statistic-batchrun.sh` | Automated dome open/close cycles for motor tick statistics collection |
 | `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
 | `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
+
+---
+
+## Web API Commands
+
+| Command | Action |
+|---------|--------|
+| `/?$1` | CLOSE Shutter 1 (East) |
+| `/?$2` | OPEN Shutter 1 (East) — blocked during frozen lockout |
+| `/?$3` | CLOSE Shutter 2 (West) |
+| `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
+| `/?$5` | Emergency STOP all motors |
+| `/?$S` | Get plain text status: "OPEN" or "CLOSED" |
+| `/?$R` | Reset EEPROM counters |
+| `/?$L` | Toggle tick logging on/off |
+| `/?$U` | Unlock dome from frozen lockout (v4.0) |
+| `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
 
 ---
 
@@ -158,6 +221,49 @@ mount -o remount,ro /
 
 ---
 
+## Dynamic Motor Timeout (v4.0)
+
+Motor runtime varies with ambient temperature due to motor oil viscosity. The v4.0 firmware uses a linear regression model derived from 253 measured motor cycles (-1.6C to 22.6C) to compute temperature-appropriate timeouts.
+
+### How It Works
+
+- DS18B20 reads temperature every 5 seconds (non-blocking async)
+- Four separate regression formulas for M1/M2 closing/opening
+- Integer-only computation in loop() — no float math
+- ISR reads precomputed timeout values atomically (16-bit AVR)
+- Falls back to static 6527 ticks (107s) if sensor fails
+
+### Temperature Effect
+
+| Temperature | Approx M1 Close Timeout | Approx M1 Open Timeout |
+|-------------|------------------------|----------------------|
+| -5C | ~6800 ticks (limited to 6527) | ~6260 ticks |
+| 0C | ~6700 ticks (limited to 6527) | ~6190 ticks |
+| 10C | ~6500 ticks | ~6040 ticks |
+| 20C | ~6310 ticks | ~5900 ticks |
+
+---
+
+## Frozen Dome Detection (v4.0)
+
+In winter, dome halves can freeze together at the top. The motor opens the bottom but the top stays stuck, creating a crash risk when frost releases later. The VL53L0X ToF sensor detects this by measuring the gap between dome halves.
+
+### How It Works
+
+1. When an OPEN command starts, frozen detection monitors the ToF distance
+2. After ~4 seconds of motor running, checks if gap increased by >30mm
+3. If gap hasn't increased: STOP motor → wait 20s for gravity → re-check
+4. If gravity separated halves: resume opening
+5. If still stuck: reverse motor to close → retry (up to 3 attempts)
+6. After 3 failed attempts: LOCKOUT — all open commands blocked
+7. Unlock via web UI (`/?$U`) or physical button
+
+### Calibration
+
+Close the dome fully, then navigate to the web UI and click "Calibrate ToF Baseline". This stores the current ToF distance as the reference for "closed". The calibration persists in EEPROM across reboots.
+
+---
+
 ## Important: Limit Switch Wiring
 
 My dome had limit switches accidentally swapped during installation. The code compensates for this in the web display only. **If your switches are wired correctly**, see the section below for how to revert the display logic.
@@ -189,25 +295,21 @@ The pin definitions and motor constants are **unchanged** from the original. Onl
 
 If your AstroShell dome has **correctly wired limit switches**, you need to revert the web display logic in `domecontrol_JK3.ino`:
 
-#### 1. Update Status Display (around line 1041-1046 and 1075-1080)
+#### 1. Update Status Display
 
 **Current (for my swapped wiring):**
 ```cpp
 bool s1_is_physically_closed_state = digitalRead(lim1open);
 bool s1_is_physically_open_state = digitalRead(lim1closed);
-if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
-else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
 ```
 
 **Change to (correct wiring):**
 ```cpp
 bool s1_is_physically_closed_state = digitalRead(lim1closed);
 bool s1_is_physically_open_state = digitalRead(lim1open);
-if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
-else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
 ```
 
-#### 2. Update Movement Display (around line 1050-1052 and 1084-1086)
+#### 2. Update Movement Display
 
 **Current (for my swapped wiring):**
 ```cpp
@@ -221,7 +323,7 @@ if (mot1dir == OPEN) { client.print(F("Opening (physically)")); ... }
 else if (mot1dir == CLOSE) { client.print(F("Closing (physically)")); }
 ```
 
-#### 3. Update Button Labels (around line 1036-1037 and 1070-1071)
+#### 3. Update Button Labels
 
 **Current (for my swapped wiring):**
 ```cpp
@@ -302,4 +404,4 @@ IP Status: Link=1 EthInit=1 NetMon=1 Fails=0/5 S1closed=1 S2closed=0
 - EthInit: 0=Ethernet not initialized, 1=initialized
 - NetMon: 0=monitoring disabled, 1=monitoring enabled
 - Fails: current fail count / max before auto-close
-- S1closed/S2closed: 0=shutter open/moving, 1=shutter at closed position 
+- S1closed/S2closed: 0=shutter open/moving, 1=shutter at closed position

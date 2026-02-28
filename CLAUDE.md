@@ -13,14 +13,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AstroShell Dome Controller - Arduino-based control system for a two-shutter astronomical telescope dome with automatic rain protection via Lunatico Cloudwatcher Solo integration.
+AstroShell Dome Controller - Arduino-based control system for a two-shutter astronomical telescope dome with automatic rain protection via Lunatico Cloudwatcher Solo integration, temperature-based dynamic motor timeout, and frozen dome detection.
 
 ### Repository Files
 
 | File | Purpose |
 |------|---------|
-| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v3.3 with network monitoring and tick logging |
-| `astroshell_ticklogger.py` | **Pi server** - Receives tick data from Arduino, logs to CSV with temperature |
+| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.0 with safety sensors, dynamic timeout, frozen dome detection |
+| `astroshell_ticklogger.py` | **Pi server** - Receives tick data + events from Arduino, logs to CSV, sends Pushover alerts |
 | `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
 | `nocapacitor2023.ino` | Original AstroShell reference code (unmodified) |
@@ -39,7 +39,12 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 - **Motors**: Two DC motors with PWM soft-start (pins 3, 5, 6, 9)
 - **Limit switches**: Pins 0, 1, 2, 7 (pins 0/1 conflict with Serial - debugging disabled)
 - **Buttons**: A2-A5 (shutter controls), pin 8 (emergency STOP)
+- **DS18B20**: Pin 22 (MEGA-exclusive, 4.7k pullup to 5V, external Vcc power)
+- **VL53L0X**: I2C pins 20 (SDA), 21 (SCL) (MEGA-exclusive)
 - **Watchdog**: 8-second hardware watchdog via avr/wdt.h
+
+### Pin Policy
+NO existing pins/wiring can be changed (hardwired on the board). Only MEGA-exclusive pins (14+, 20/21) are used for new sensors, guaranteeing no conflicts with existing hardwired connections.
 
 ## Architecture - domecontrol_JK3.ino (Main)
 
@@ -48,14 +53,42 @@ All real-time operations run in the interrupt service routine:
 - Motor PWM control with soft-start (SMOOTH=30)
 - Button debouncing (cnt > 6 ticks = ~100ms)
 - Limit switch monitoring
-- Motor timeout safety (6527 ticks = 107 seconds)
-- Tick counting for motor runtime measurement (v3.3)
+- Motor timeout safety (dynamic or static 6527 ticks)
+- Tick counting for motor runtime measurement
+- Frozen dome tick counter (~4 clock cycles overhead when active)
+
+### Sensors (v4.0)
+- **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout
+- **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection
+- Both sensors degrade gracefully: 10 consecutive failures → feature disabled
+
+### Dynamic Motor Timeout (v4.0)
+- Linear regression model from 253 cycle analysis (-1.6C to 22.6C)
+- Four separate coefficients for M1/M2 closing/opening
+- Integer-only math (no floats): `timeout = base - (slope100 * temp_x10) / 1000 + margin`
+- Clamped to [2000, 6527] ticks
+- Falls back to static 6527 on temperature sensor failure
+
+### Frozen Dome Detection (v4.0)
+- VL53L0X ToF measures gap between dome halves across mounting point
+- EEPROM-calibrated baseline: `/?$C` stores current distance as "closed"
+- After ~4 sec of opening: checks if gap increased by >30mm (tolerance)
+- If frozen: STOP motor → 20s gravity wait → re-check → retry or reverse
+- 3 attempts maximum, then LOCKOUT (all open commands blocked)
+- `/?$U` unlocks dome from lockout
+- Disabled when ToF not calibrated or disconnected
 
 ### Network Monitoring
 - Checks Cloudwatcher IP every **1 minute** (`connectCheckInterval = 60000`)
 - After **5 failures within 5 minutes**, dome auto-closes
 - Cable removal triggers **immediate** auto-close
 - Uses `netClient.setTimeout(3000)` to prevent watchdog timeout
+
+### Event Notifications (v4.0)
+- Arduino pushes events to Solo:88/event via HTTP GET
+- Solo server sends Pushover alerts (background thread)
+- Rate-limited: 10s minimum between events, 5min for conflict events
+- Events: frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict
 
 ### Web Server (Port 80)
 - Auto-refresh every 10 seconds
@@ -66,13 +99,15 @@ All real-time operations run in the interrupt service routine:
 | Command | Physical Action |
 |---------|-----------------|
 | `/?$1` | CLOSE Shutter 1 (East) |
-| `/?$2` | OPEN Shutter 1 (East) |
+| `/?$2` | OPEN Shutter 1 (East) — blocked during frozen lockout |
 | `/?$3` | CLOSE Shutter 2 (West) |
-| `/?$4` | OPEN Shutter 2 (West) |
+| `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get status: "OPEN" or "CLOSE" |
 | `/?$R` | Reset EEPROM counters |
 | `/?$L` | Toggle tick logging on/off (default: off after reboot) |
+| `/?$U` | Unlock dome from frozen lockout (v4.0) |
+| `/?$C` | Calibrate ToF baseline — dome must be fully closed (v4.0) |
 
 **Note:** Button labels in code are inverted due to hardware wiring swap. The web interface shows physical reality.
 
@@ -88,6 +123,7 @@ Displayed on web interface under "Stop Reason":
 | 3 | IP failure auto-close | "IP Fail Auto-Close" |
 | 4 | VCC failure auto-close | "VCC Fail Auto-Close" |
 | 5 | Motor timeout reached | "TIMEOUT at X ticks" |
+| 6 | Frozen dome auto-reverse (v4.0) | "FROZEN DOME Auto-Reverse" |
 
 ## Critical Code Quirk - Inverted Limit Switches
 
@@ -101,12 +137,35 @@ lim2closed (pin 0) → Actually detects PHYSICALLY OPEN
 
 The **motor control logic is unchanged** from original. Only the **web display** was inverted to show physical reality. See README.md for details if adapting for correctly-wired installations.
 
+## EEPROM Memory Map
+
+| Offset | Size | Content |
+|--------|------|---------|
+| 0 | 1 byte | Magic byte (0x42) |
+| 1-2 | 2 bytes | Total IP failures (uint16) |
+| 3-4 | 2 bytes | Auto-close events (uint16) |
+| 5 | 1 byte | Uptime day counter |
+| 6-7 | 2 bytes | ToF baseline distance in mm (v4.0) |
+| 8 | 1 byte | ToF calibration magic (0xA5) (v4.0) |
+
 ## Key Configuration Constants
 
 ### domecontrol_JK3.ino
 ```cpp
 #define SMOOTH 30                           // Soft-start smoothness
-#define MAX_MOT1_OPEN  6527                 // Motor timeout (107 sec at 61Hz)
+#define MAX_MOT1_OPEN  6527                 // Motor timeout fallback (107 sec at 61Hz)
+
+// Dynamic timeout regression coefficients (v4.0)
+#define DYN_M1_CLOSE_BASE    6096           // M1 closing: base ticks at 0C
+#define DYN_M1_CLOSE_SLOPE   1945           // M1 closing: slope * 100
+#define DYN_M1_CLOSE_MARGIN  601            // M1 closing: safety margin ticks
+
+// Frozen dome detection (v4.0)
+#define TOF_OPEN_TOLERANCE     30           // mm: gap increase to detect opening
+#define TOF_CHECK_TICKS       244           // ~4 sec of motor before first check
+#define FROZEN_GRAVITY_WAIT  20000          // ms: wait with motor off
+#define FROZEN_MAX_RETRIES       3          // Attempts before lockout
+
 const unsigned long connectCheckInterval = 60000UL;   // IP check every 1 min
 const byte maxConnectFails = 5;             // Failures to trigger close
 const unsigned long maxFailTimeWindow = 300000UL;     // 5-min failure window
@@ -124,18 +183,19 @@ SCHEDULED_CHECK_HOURS="8 13 16"  # Hours to check if dome is open
 CLOSE_VERIFY_DELAY=180      # Seconds before verifying close (3 min)
 ```
 
-## Motor Runtime Tick Logging (v3.3)
+## Motor Runtime Tick Logging
 
-Measures motor runtime in ISR ticks for temperature correlation analysis. Purpose: determine temperature-dependent motor timeout coefficients.
+Measures motor runtime in ISR ticks for temperature correlation analysis.
 
 ### How It Works
 1. Arduino counts ticks during motor full-runs (start at one limit, stop at opposite)
-2. Valid full-runs logged to `/log` endpoint, interrupted stops (timeout, manual, web) logged to `/interrupt`
+2. Valid full-runs logged to `/log` endpoint, interrupted stops logged to `/interrupt`
 3. When toggle enabled (`$L`), Arduino pushes data to Solo:88 via HTTP GET
-4. Pi server logs to CSV with timestamp and ambient temperature
-5. CSV is backed up to Synology NAS via SCP after each new record
+4. All requests include temperature (DS18B20) and ToF distance (VL53L0X) (v4.0)
+5. Pi server logs to CSV with timestamp, Solo temperature, Arduino temp, and ToF
+6. CSV is backed up to Synology NAS via SCP after each new record
 
-### Tick Logger Server (Cloudwatcher Solo / Pi3)
+### Tick Logger & Event Server (Cloudwatcher Solo / Pi3)
 
 **Location on Pi (read-only root filesystem):**
 - Script: `/usr/local/bin/astroshell_ticklogger.py`
@@ -147,17 +207,27 @@ Measures motor runtime in ISR ticks for temperature correlation analysis. Purpos
 **Server Endpoints (port 88):**
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /log?m=1&d=1&t=5234` | Log valid full-run (m=motor, d=direction, t=ticks) |
-| `GET /interrupt?m=1&d=1&t=5234` | Log interrupted stop (timeout, manual, web stop) |
+| `GET /log?m=1&d=1&t=5234&temp=12.5&tof=7.3` | Log valid full-run with sensor data |
+| `GET /interrupt?m=1&d=1&t=5234&temp=12.5&tof=7.3` | Log interrupted stop with sensor data |
+| `GET /event?type=frozen_dome&detail=S1+attempt+1/3&temp=0.5&tof=7.3` | Event notification → Pushover (v4.0) |
 | `GET /env` | Get temperature and coefficient for Arduino |
 | `GET /status` | Health check |
 
-**CSV Format:**
+**CSV Format (v4.0):**
 ```
-timestamp_utc,motor,direction,ticks,temperature
-2026-02-04T09:33:28Z,1,closing,5800,3.0           # Valid full-run
-2026-02-04T09:35:00Z,2,INTERRUPTED-closing,6527,3.1  # Timeout/manual stop
+timestamp_utc,motor,direction,ticks,temperature,arduino_temp,tof_cm
+2026-02-04T09:33:28Z,1,closing,5800,3.0,3.1,7.3     # Valid full-run
+2026-02-04T09:35:00Z,2,INTERRUPTED-closing,6527,3.1,3.2,7.2  # Timeout/manual stop
 ```
+
+**Event Types (Pushover):**
+| Type | Priority | When |
+|------|----------|------|
+| `frozen_dome` | Normal | Frozen detected, auto-reversing (includes attempt #) |
+| `frozen_lockout` | High + siren | Dome locked after 3 failed attempts |
+| `frozen_clear` | Low | Dome opened successfully after frozen detection |
+| `sensor_fail` | Normal | DS18B20 or VL53L0X failure (10+ consecutive) |
+| `conflict` | Normal | Limit switch vs ToF disagreement (rate-limited 5min) |
 
 **Service Management:**
 ```bash
@@ -183,8 +253,10 @@ mount -o remount,ro /
 ## Development Notes
 
 ### Arduino IDE Setup
-Upload `domecontrol_JK3.ino` to Arduino MEGA. Built-in libraries only:
-- SPI.h, Ethernet.h, EEPROM.h, avr/wdt.h
+Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
+- SPI.h, Ethernet.h, EEPROM.h, avr/wdt.h (built-in)
+- OneWire.h, DallasTemperature.h (install via Library Manager) (v4.0)
+- Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) (v4.0)
 
 ### Debug Modes (USE WITH CAUTION)
 Serial debugging conflicts with limit switch pins 0/1. Only enable with limit switches disconnected:
@@ -335,3 +407,12 @@ This file has documented bugs (see file header for full list):
 ## Testing Safety
 
 **Always test with dome in intermediate position** (not fully open or closed) so manual intervention is possible if motor moves unexpectedly.
+
+### Sensor Testing (v4.0)
+
+1. **DS18B20**: Verify temperature on web UI. Unplug → confirm "Not connected" and static 6527 timeout fallback
+2. **VL53L0X**: Verify distance on web UI. Move hand → see distance change. Unplug → frozen detection auto-disabled
+3. **ToF calibration**: Close dome → click "Calibrate ToF Baseline" → verify baseline stored → reboot → verify persists
+4. **Frozen dome simulation**: Block ToF sensor during open → verify stop + reverse + 3 retries + lockout
+5. **Unlock**: After lockout → click "UNLOCK DOME" → verify open commands work again
+6. **Graceful degradation**: Disconnect both sensors → verify system behaves identically to v3.3
