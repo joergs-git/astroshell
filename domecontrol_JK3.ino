@@ -753,9 +753,29 @@ void setupDS18B20() {
  * Non-blocking temperature reading loop.
  * Call from loop() — requests conversion every 5 seconds,
  * reads result 800ms later.
+ * If sensor was lost, attempts re-detection every 30 seconds.
  */
 void readTemperatureAsync() {
   unsigned long now = millis();
+
+  // Step 0: Periodic re-detection if sensor is confirmed dead
+  // Re-scans OneWire bus every 30 seconds to detect hot-plug reconnection
+  static unsigned long lastRedetectAttempt = 0;
+  if (!ds18b20_connected && tempFailCount >= TEMP_FAIL_THRESHOLD) {
+    if (now - lastRedetectAttempt >= 30000UL) {
+      lastRedetectAttempt = now;
+      ds18b20.begin();  // Re-scan OneWire bus
+      if (ds18b20.getDeviceCount() > 0) {
+        // Sensor found again — reinitialize
+        ds18b20_connected = true;
+        ds18b20.setResolution(12);
+        ds18b20.setWaitForConversion(false);
+        tempFailCount = 0;
+        lastTempRead = 0;  // Force immediate read
+      }
+    }
+    return;  // Skip normal read cycle while disconnected
+  }
 
   // Step 1: Request new conversion if interval elapsed
   if (!tempConversionPending && (now - lastTempRead >= TEMP_READ_INTERVAL)) {
@@ -876,10 +896,24 @@ void setupVL53L0X() {
 /**
  * Read ToF distance in non-blocking continuous mode.
  * Call from loop() — reads at TOF_READ_INTERVAL pace.
+ * If sensor was lost, attempts re-initialization every 30 seconds.
  */
 void readToFDistance() {
+  // Periodic re-detection if sensor is confirmed dead
   if (!tof_connected && tofFailCount >= TEMP_FAIL_THRESHOLD) {
-    return;  // Sensor confirmed dead, stop trying
+    static unsigned long lastTofRedetect = 0;
+    unsigned long now = millis();
+    if (now - lastTofRedetect >= 30000UL) {
+      lastTofRedetect = now;
+      // Attempt full re-init (I2C requires init() call after reconnect)
+      if (tofSensor.init()) {
+        tof_connected = true;
+        tofSensor.setMeasurementTimingBudget(200000);
+        tofSensor.startContinuous();
+        tofFailCount = 0;
+      }
+    }
+    return;
   }
 
   unsigned long now = millis();
