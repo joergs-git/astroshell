@@ -2226,6 +2226,8 @@ void sendFullHtmlResponse(EthernetClient& client) {
       client.print(F("<tr><td>Frozen Detection</td><td>"));
       if (!tofCalibrated) {
         client.print(F("Disabled (not calibrated)"));
+      } else if (!tof_connected) {
+        client.print(F("Disabled (sensor disconnected)"));
       } else {
         switch (frozenDomeState) {
           case FD_IDLE: client.print(F("OK")); break;
