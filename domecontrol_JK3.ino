@@ -1000,12 +1000,20 @@ void loadToFCalibration() {
  *   7. RETRY_WAIT -> 5 seconds -> retry or LOCKOUT
  */
 void frozenDomeStateMachine() {
+  // Own direction tracking — independent of ISR's m1/m2_prev_dir to avoid race condition.
+  // The ISR updates m1_prev_dir at 61 Hz, always before loop() runs this function,
+  // so we'd never see the 0→CLOSE transition if we used the ISR's variables.
+  static byte fd_prev_mot1dir = 0;
+  static byte fd_prev_mot2dir = 0;
+
   // Skip if ToF not calibrated or not connected — frozen detection disabled
   if (!tofCalibrated || !tof_connected) {
     if (frozenDomeState != FD_IDLE && frozenDomeState != FD_LOCKOUT) {
       frozenDomeState = FD_IDLE;
       frozenCheckActive = false;
     }
+    fd_prev_mot1dir = mot1dir;
+    fd_prev_mot2dir = mot2dir;
     return;
   }
 
@@ -1015,14 +1023,14 @@ void frozenDomeStateMachine() {
 
     case FD_IDLE:
       // Watch for motor starting an OPEN command (physically opening = mot*dir==CLOSE)
-      // Only monitor Shutter 1 (East) for frozen detection since both halves meet at top
-      if (mot1dir == CLOSE && m1_prev_dir == 0) {
+      // Uses own fd_prev_mot*dir to detect transition (not ISR's m*_prev_dir)
+      if (mot1dir == CLOSE && fd_prev_mot1dir == 0) {
         // Motor 1 just started opening — begin monitoring
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
         frozenCheckActive = true;
         frozenMotorNum = 1;
-      } else if (mot2dir == CLOSE && m2_prev_dir == 0) {
+      } else if (mot2dir == CLOSE && fd_prev_mot2dir == 0) {
         // Motor 2 just started opening — begin monitoring
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
@@ -1138,6 +1146,10 @@ void frozenDomeStateMachine() {
       // State persists until explicitly cleared
       break;
   }
+
+  // Update own direction tracking at end of every call
+  fd_prev_mot1dir = mot1dir;
+  fd_prev_mot2dir = mot2dir;
 }
 
 //=============================================================================
