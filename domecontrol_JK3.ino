@@ -1213,18 +1213,6 @@ void checkConflictingSignals() {
  * @param type   Event type string (e.g., "frozen_dome", "sensor_fail")
  * @param detail Additional detail string
  */
-// Helper: print string to client with spaces URL-encoded as %20
-void printUrlEncoded(EthernetClient& client, const char* str) {
-  while (*str) {
-    if (*str == ' ') {
-      client.print(F("%20"));
-    } else {
-      client.write(*str);
-    }
-    str++;
-  }
-}
-
 void sendEventNotification(const char* type, const char* detail) {
   // Rate limiting
   unsigned long now = millis();
@@ -1232,6 +1220,19 @@ void sendEventNotification(const char* type, const char* detail) {
 
   // Skip if network not ready
   if (!ethernet_initialized || !networkMonitoringEnabled) return;
+
+  // URL-encode the detail string (replace spaces with %20) into a local buffer
+  // so it can be sent in a single print() call for reliable TCP transmission
+  char encoded[64];
+  byte j = 0;
+  for (byte i = 0; detail[i] && j < sizeof(encoded) - 4; i++) {
+    if (detail[i] == ' ') {
+      encoded[j++] = '%'; encoded[j++] = '2'; encoded[j++] = '0';
+    } else {
+      encoded[j++] = detail[i];
+    }
+  }
+  encoded[j] = '\0';
 
   wdt_reset();
   EthernetClient eventClient;
@@ -1241,7 +1242,7 @@ void sendEventNotification(const char* type, const char* detail) {
     eventClient.print(F("GET /event?type="));
     eventClient.print(type);
     eventClient.print(F("&detail="));
-    printUrlEncoded(eventClient, detail);
+    eventClient.print(encoded);
     eventClient.print(F("&temp="));
     if (currentTemp_x10 != -9990) {
       eventClient.print(currentTemp_x10 / 10);
