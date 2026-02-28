@@ -60,6 +60,8 @@ Telescope Protection Priority:
 | **Event Notifications** | Arduino pushes events to Solo:88, Solo sends Pushover alerts |
 | **Conflicting Signals** | Detects limit switch vs ToF disagreement (rate-limited alerts) |
 | **Graceful Degradation** | All new features auto-disable if sensors disconnected |
+| **Sensor Hot-Plug** | DS18B20 and VL53L0X auto-reconnect within 30 seconds after unplug/replug |
+| **Tick Logging Default ON** | Motor runtime logging enabled by default after reboot |
 
 ---
 
@@ -102,6 +104,8 @@ Arduino 5V ──────── DS18B20 Vcc (red wire)
 Arduino GND ─────── DS18B20 GND (black wire)
 ```
 - Use external Vcc power (not parasitic mode) for reliability
+- **4.7kΩ pullup resistor required** between Data and 5V (5.1kΩ also works)
+- Without the pullup, the OneWire open-drain bus cannot communicate
 - Pin 22 is MEGA-exclusive — guaranteed no conflict with existing wiring
 
 #### VL53L0X Time-of-Flight Sensor (I2C)
@@ -153,7 +157,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get plain text status: "OPEN" or "CLOSED" |
 | `/?$R` | Reset EEPROM counters |
-| `/?$L` | Toggle tick logging on/off |
+| `/?$L` | Toggle tick logging on/off (default: ON) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
 
@@ -261,6 +265,64 @@ In winter, dome halves can freeze together at the top. The motor opens the botto
 ### Calibration
 
 Close the dome fully, then navigate to the web UI and click "Calibrate ToF Baseline". This stores the current ToF distance as the reference for "closed". The calibration persists in EEPROM across reboots.
+
+---
+
+## Tested & Verified (v4.0)
+
+All v4.0 features were lab-tested on real hardware (Arduino MEGA + DS18B20 + VL53L0X) with a 13-step structured test workflow:
+
+| Test | Result |
+|------|--------|
+| DS18B20 temperature reading | Passed |
+| Dynamic timeout at -7.7°C and 19°C | Passed — all 8 values match regression model |
+| DS18B20 graceful degradation + hot-plug | Passed |
+| VL53L0X distance reading | Passed |
+| ToF calibration + EEPROM persistence | Passed |
+| VL53L0X graceful degradation + hot-plug | Passed |
+| Frozen dome simulation (full 3-retry cycle) | Passed |
+| Dome unlock from lockout | Passed |
+| Frozen dome success path (not frozen) | Passed |
+| Event notifications (Arduino → Solo → Pushover) | Passed |
+| Conflicting signal detection | Passed |
+| Tick data format (both temps + ToF in CSV) | Passed |
+| Watchdog stability (no resets during testing) | Passed |
+
+### Bugs Found and Fixed During Testing
+
+5 bugs were discovered and fixed during lab testing:
+
+1. **Sensor hot-plug failure** — Sensors stayed "Not connected" after unplug/replug. Fixed: 30-second periodic bus re-scan.
+2. **DS18B20 slow startup** — Sensor not detected at boot (~80s delay). Fixed: 100ms power-on delay before bus init.
+3. **Frozen detection display** — Web UI showed "OK" when ToF disconnected instead of "Disabled". Fixed: added sensor connection check.
+4. **ISR race condition** — Frozen dome state machine never detected motor starts. Fixed: independent direction tracking variables (not shared with ISR).
+5. **URL encoding** — Event detail strings with spaces caused HTTP 400 on Solo. Fixed: buffer-based URL encoding before send.
+
+---
+
+## Deploying to Cloudwatcher Solo
+
+The Solo Pi3 has a **read-only root filesystem**. To deploy updated files:
+
+```bash
+ssh root@192.168.1.151
+mount -o remount,rw /
+
+# Update tick logger + event server
+cp astroshell_ticklogger.py /usr/local/bin/
+chmod +x /usr/local/bin/astroshell_ticklogger.py
+
+# Update service file (important: -u flag for unbuffered stdout)
+cp astroshell_ticklogger.service /etc/systemd/system/
+systemctl daemon-reload
+
+mount -o remount,ro /
+systemctl restart astroshell_ticklogger
+```
+
+**Important:** The service file must use `python3 -u` (unbuffered output) or `print()` output won't appear in `journalctl`. This is already set in the provided service file.
+
+**Pushover setup:** Replace `JOHNDOE_API_TOKEN` and `JOHNDOE_USER_KEY` in the deployed `/usr/local/bin/astroshell_ticklogger.py` with your real Pushover credentials. Never commit real credentials to the git repo.
 
 ---
 
