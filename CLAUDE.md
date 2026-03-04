@@ -79,10 +79,11 @@ All real-time operations run in the interrupt service routine:
 - Disabled when ToF not calibrated or disconnected
 
 ### Network Monitoring
-- Checks Cloudwatcher IP every **1 minute** (`connectCheckInterval = 60000`)
-- After **5 failures within 5 minutes**, dome auto-closes
+- Checks Cloudwatcher IP every **90 seconds** (`connectCheckInterval = 90000`)
+- After **10 failures within 15 minutes**, dome auto-closes
 - Cable removal triggers **immediate** auto-close
 - Uses `netClient.setTimeout(3000)` to prevent watchdog timeout
+- No Pushover for IP auto-close (network is down when it triggers)
 
 ### Event Notifications (v4.0)
 - Arduino pushes events to Solo:88/event via HTTP GET
@@ -166,9 +167,9 @@ The **motor control logic is unchanged** from original. Only the **web display**
 #define FROZEN_GRAVITY_WAIT  20000          // ms: wait with motor off
 #define FROZEN_MAX_RETRIES       3          // Attempts before lockout
 
-const unsigned long connectCheckInterval = 60000UL;   // IP check every 1 min
-const byte maxConnectFails = 5;             // Failures to trigger close
-const unsigned long maxFailTimeWindow = 300000UL;     // 5-min failure window
+const unsigned long connectCheckInterval = 90000UL;   // IP check every 90 sec
+const byte maxConnectFails = 10;            // Failures to trigger close
+const unsigned long maxFailTimeWindow = 900000UL;     // 15-min failure window
 ```
 
 ### cloudwatcher-raincheckerV3.sh
