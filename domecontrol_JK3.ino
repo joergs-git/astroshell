@@ -290,16 +290,17 @@ const int remoteStationPort = 80;
 //=============================================================================
 // IP FAILURE DETECTION CONFIGURATION
 //=============================================================================
-// Auto-close triggers after 5 failed connection attempts within 5 minutes.
-// This ensures dome closes within 5 minutes of Cloudwatcher becoming unreachable.
-// Timing: 5 checks × 1 minute interval = 5 minutes maximum response time.
+// Auto-close triggers after 10 failed connection attempts within 15 minutes.
+// This ensures dome closes when Cloudwatcher is genuinely unreachable,
+// while tolerating brief network glitches (switch hiccups, Solo busy, etc.).
+// Timing: 10 checks × 90 second interval = 15 minutes maximum response time.
 
 byte connectFailCount = 0;                          // Current consecutive failures
 unsigned long lastConnectAttemptTimestamp = 0;      // Last connection check time
-const unsigned long connectCheckInterval = 60000UL; // Check every 1 minute
-const byte maxConnectFails = 5;                     // Failures needed to trigger
+const unsigned long connectCheckInterval = 90000UL; // Check every 90 seconds
+const byte maxConnectFails = 10;                    // Failures needed to trigger
 unsigned long firstFailTimestamp = 0;               // When failure window started
-const unsigned long maxFailTimeWindow = 300000UL;   // 5-minute window for counting
+const unsigned long maxFailTimeWindow = 900000UL;   // 15-minute window for counting
 
 // --- Persistent Statistics (saved to EEPROM) ---
 unsigned int totalIpFailures = 0;     // Lifetime IP failure count
