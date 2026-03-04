@@ -15,7 +15,7 @@
 | Feature | Description |
 |---------|-------------|
 | **Automatic Rain Protection** | Closes dome automatically when rain detected via Cloudwatcher Solo |
-| **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (5 failures in 5 min) |
+| **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (10 failures in 15 min) |
 | **Cable Removal Detection** | Instant dome closure if Ethernet cable is disconnected |
 | **Dynamic Motor Timeout** | Temperature-based timeout from 253-cycle regression analysis (v4.0) |
 | **Frozen Dome Detection** | VL53L0X ToF sensor detects frozen halves, auto-retries with lockout (v4.0) |
@@ -33,7 +33,7 @@ Telescope Protection Priority:
 
   Rain Detected          Cloudwatcher        Ethernet Cable       Dome Halves
        via                Unreachable           Removed            Frozen (v4.0)
-   Cloudwatcher           (5 min)             (Instant)           (Detected by ToF)
+   Cloudwatcher           (15 min)            (Instant)           (Detected by ToF)
        |                     |                    |                    |
        v                     v                    v                    v
    +-----------------------------------------------+   +--------------------+
@@ -432,8 +432,8 @@ The dome controller has smart network monitoring that adapts to different scenar
 
 | Condition | Action | Timing |
 |-----------|--------|--------|
-| Target IP unreachable | Count failures | Every 1 minute |
-| 5 failures within 5 minutes | Auto-close dome | After 5th failure |
+| Target IP unreachable | Count failures | Every 90 seconds |
+| 10 failures within 15 minutes | Auto-close dome | After 10th failure |
 | Target responds again | Reset fail counter | Immediate |
 | Connection restored during auto-close | Stop closing motors | Immediate |
 
@@ -460,7 +460,7 @@ The dome controller has smart network monitoring that adapts to different scenar
 
 Every 10 seconds status line:
 ```
-IP Status: Link=1 EthInit=1 NetMon=1 Fails=0/5 S1closed=1 S2closed=0
+IP Status: Link=1 EthInit=1 NetMon=1 Fails=0/10 S1closed=1 S2closed=0
 ```
 - Link: 0=cable disconnected, 1=cable connected
 - EthInit: 0=Ethernet not initialized, 1=initialized
