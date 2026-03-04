@@ -419,6 +419,29 @@ void checkConflictingSignals();                 // Limit switch vs ToF disagreem
 void sendEventNotification(const char* type, const char* detail);  // Push event to Solo
 
 //=============================================================================
+// ISR-SAFE MOTOR START HELPERS
+//=============================================================================
+// Timer must be set BEFORE direction inside a critical section.
+// Without this, the ISR could fire between the two writes and see
+// mot*dir=running with mot*timer=0, causing an immediate false timeout.
+// WARNING: Do NOT call these from inside the ISR — sei() would enable
+// nested interrupts on AVR, which is dangerous.
+
+inline void startMotor1(byte direction, word timeout) {
+  cli();
+  mot1timer = timeout;
+  mot1dir = direction;
+  sei();
+}
+
+inline void startMotor2(byte direction, word timeout) {
+  cli();
+  mot2timer = timeout;
+  mot2dir = direction;
+  sei();
+}
+
+//=============================================================================
 // EEPROM FUNCTIONS - Persistent Storage Management
 //=============================================================================
 
@@ -1093,9 +1116,9 @@ void frozenDomeStateMachine() {
       if (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE)) {
         // Gravity worked! Resume opening
         if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-          mot1dir = CLOSE; mot1timer = dynTimeout_M1_Open; stop1reason = 0;
+          startMotor1(CLOSE, dynTimeout_M1_Open); stop1reason = 0;
         } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-          mot2dir = CLOSE; mot2timer = dynTimeout_M2_Open; stop2reason = 0;
+          startMotor2(CLOSE, dynTimeout_M2_Open); stop2reason = 0;
         }
         frozenDomeState = FD_IDLE;
         frozenRetryCount = 0;
@@ -1103,9 +1126,9 @@ void frozenDomeStateMachine() {
       } else {
         // Still frozen — reverse motor to close
         if (frozenMotorNum == 1 && !digitalRead(lim1open)) {
-          mot1dir = OPEN; mot1timer = dynTimeout_M1_Close; stop1reason = 6;
+          startMotor1(OPEN, dynTimeout_M1_Close); stop1reason = 6;
         } else if (frozenMotorNum == 2 && !digitalRead(lim2open)) {
-          mot2dir = OPEN; mot2timer = dynTimeout_M2_Close; stop2reason = 6;
+          startMotor2(OPEN, dynTimeout_M2_Close); stop2reason = 6;
         }
         frozenDomeState = FD_CLOSING;
       }
@@ -1130,9 +1153,9 @@ void frozenDomeStateMachine() {
         } else {
           // Re-issue open command for next attempt
           if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-            mot1dir = CLOSE; mot1timer = dynTimeout_M1_Open; stop1reason = 0;
+            startMotor1(CLOSE, dynTimeout_M1_Open); stop1reason = 0;
           } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-            mot2dir = CLOSE; mot2timer = dynTimeout_M2_Open; stop2reason = 0;
+            startMotor2(CLOSE, dynTimeout_M2_Open); stop2reason = 0;
           }
           // Go back to monitoring
           frozenDomeState = FD_MONITORING;
@@ -1287,6 +1310,8 @@ void sendEventNotification(const char* type, const char* detail) {
  */
 void setupEthernet() {
   for (int attempt = 1; attempt <= 3; attempt++) {
+    wdt_reset();  // Reset watchdog before each attempt (delays can accumulate past 8s)
+
     // Hardware reset via Chip Select pin toggle
     // This recovers from stuck states in the W5100/W5500 chip
     pinMode(10, OUTPUT);
@@ -1298,7 +1323,9 @@ void setupEthernet() {
 
     // Initialize Ethernet with static IP (no DHCP for reliability)
     Ethernet.begin(mac, ip);
+    wdt_reset();  // Reset before long stabilization wait
     delay(5000);  // W5100 needs time to stabilize
+    wdt_reset();  // Reset after stabilization wait
 
     // Verify physical link is connected
     if (Ethernet.linkStatus() == LinkOFF) {
@@ -1503,6 +1530,9 @@ void setup() {
   // --- Enable hardware watchdog ---
   // System auto-resets if loop() blocks for more than 8 seconds.
   // This recovers from Ethernet library hangs or other lockups.
+  // NOTE: 8 seconds is the AVR hardware maximum (WDTO_8S). No longer
+  // timeout is available. setupEthernet() uses wdt_reset() between
+  // delays to prevent false watchdog triggers during network recovery.
   wdt_enable(WDTO_8S);
 }
 
@@ -1592,14 +1622,14 @@ void checkRemoteConnectionAndAutoClose() {
 
                 bool action_taken = false;
                 if (mot1dir != OPEN && !digitalRead(lim1open)) {
-                    mot1dir = OPEN; mot1timer = dynTimeout_M1_Close;
+                    startMotor1(OPEN, dynTimeout_M1_Close);
                     m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F(">>> AUTO-CLOSE: S1 motor started (cable removed)"));
                     #endif
                 }
                 if (mot2dir != OPEN && !digitalRead(lim2open)) {
-                    mot2dir = OPEN; mot2timer = dynTimeout_M2_Close;
+                    startMotor2(OPEN, dynTimeout_M2_Close);
                     m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F(">>> AUTO-CLOSE: S2 motor started (cable removed)"));
@@ -1774,14 +1804,14 @@ void checkRemoteConnectionAndAutoClose() {
             // - If motor already closing: no change needed
             bool action_taken = false;
             if (mot1dir != OPEN && !digitalRead(lim1open)) {
-                mot1dir = OPEN; mot1timer = dynTimeout_M1_Close;
+                startMotor1(OPEN, dynTimeout_M1_Close);
                 m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F(">>> AUTO-CLOSE: S1 motor started (5 failures)"));
                 #endif
             }
             if (mot2dir != OPEN && !digitalRead(lim2open)) {
-                mot2dir = OPEN; mot2timer = dynTimeout_M2_Close;
+                startMotor2(OPEN, dynTimeout_M2_Close);
                 m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F(">>> AUTO-CLOSE: S2 motor started (5 failures)"));
@@ -1907,7 +1937,7 @@ void handleWebClient() {
               mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
           }
           if (!digitalRead(lim1open)) {
-              mot1dir = OPEN; mot1timer = dynTimeout_M1_Close;
+              startMotor1(OPEN, dynTimeout_M1_Close);
               stop1reason = 0; m1AutoClosedByIP = false;
           }
         } else if (c == '2') {
@@ -1919,7 +1949,7 @@ void handleWebClient() {
                 mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
             }
             if (!digitalRead(lim1closed)) {
-                mot1dir = CLOSE; mot1timer = dynTimeout_M1_Open;
+                startMotor1(CLOSE, dynTimeout_M1_Open);
                 stop1reason = 0; m1AutoClosedByIP = false;
             }
           }
@@ -1929,7 +1959,7 @@ void handleWebClient() {
               mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
           }
           if (!digitalRead(lim2open)) {
-              mot2dir = OPEN; mot2timer = dynTimeout_M2_Close;
+              startMotor2(OPEN, dynTimeout_M2_Close);
               stop2reason = 0; m2AutoClosedByIP = false;
           }
         } else if (c == '4') {
@@ -1941,7 +1971,7 @@ void handleWebClient() {
                 mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
             }
             if (!digitalRead(lim2closed)) {
-                mot2dir = CLOSE; mot2timer = dynTimeout_M2_Open;
+                startMotor2(CLOSE, dynTimeout_M2_Open);
                 stop2reason = 0; m2AutoClosedByIP = false;
             }
           }
@@ -2046,7 +2076,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
   client.println(F("h1,h2{text-align:center;color:#333;margin-top:15px;margin-bottom:10px;} h1{margin-bottom:20px;}"));
   client.println(F("a.button{display:inline-block;width:45%;padding:12px;margin:5px 2%;border:none;border-radius:8px;color:white!important;cursor:pointer;font-size:1em;text-align:center;text-decoration:none;box-sizing:border-box;}"));
   client.println(F("a.button.fullwidth{width:90%;}")); // For STOP button
-  client.println(F(".b-open{background-color:#5cb85c;} .b-close{background-color:#337ab7;} .b-stop{background-color:#dc3545;}"));
+  client.println(F(".b-open{background-color:#337ab7;} .b-close{background-color:#5cb85c;} .b-stop{background-color:#dc3545;}"));
   client.println(F(".b-reset{background-color:#6c757d;font-size:0.8em;padding:8px;}"));
   client.println(F(".status{margin-top:5px;margin-bottom:15px;padding:8px;border:1px solid #ccc;border-radius:4px;text-align:center;font-size:0.95em;}"));
   client.println(F(".section{margin-bottom:15px;padding:10px;border:1px solid #eee;border-radius:5px;}")); 
@@ -2070,6 +2100,8 @@ void sendFullHtmlResponse(EthernetClient& client) {
       
       client.println(F("<div class='section' style='background-color:#fff0f0;'>")); 
       client.print(F("<a href='/?$5' class='button b-stop fullwidth'>STOP ALL MOTORS</a>"));
+      client.print(F("<a href='/?$1$3' class='button b-close fullwidth' style='margin-top:8px;'>CLOSE ALL SHUTTERS</a>"));
+      client.print(F("<a href='/?$2$4' class='button b-open fullwidth' style='margin-top:8px;'>OPEN ALL SHUTTERS</a>"));
       client.println(F("</div>"));
 
       // --- Shutter 1 (East) ---
@@ -2143,54 +2175,9 @@ void sendFullHtmlResponse(EthernetClient& client) {
           else client.print(F("Unknown"));
       }
       client.println(F("</div></div>"));
-                                                      
-      client.println(F("<div class='section'><h2>System Status</h2><table>"));
-      client.print(F("<tr><th>Sensor</th><th>State</th></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(lim1open);client.print(F(")</td><td>")); client.print(digitalRead(lim1open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(lim1closed);client.print(F(")</td><td>")); client.print(digitalRead(lim1closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(lim2open);client.print(F(")</td><td>")); client.print(digitalRead(lim2open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(lim2closed);client.print(F(")</td><td>")); client.print(digitalRead(lim2closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>VCC1 (Main Power)</td><td>")); client.print((float)analogRead(VCC1) * 24.0f / 1023.0f * (1023.0f / VCC_RAW_MAX), 1); client.println(F("V</td></tr>"));
-      client.print(F("<tr><td>SWSTOP Pressed</td><td>")); client.print(!digitalRead(SWSTOP) ? F("YES") : F("NO")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Network Status</td><td>")); client.print(ethernet_initialized ? F("OK") : F("ERROR")); client.println(F("</td></tr>"));
-      client.println(F("</table></div>"));
-      
-      // --- IP Monitoring Status ---
-      client.println(F("<div class='section'><h2>IP Monitoring</h2><table>"));
-      client.print(F("<tr><td>Current IP Fails</td><td>")); 
-      client.print(connectFailCount); 
-      client.print(F("/")); 
-      client.print(maxConnectFails);
-      if (firstFailTimestamp > 0) {
-        client.print(F(" ("));
-        client.print((millis() - firstFailTimestamp) / 60000);
-        client.print(F(" min)"));
-      }
-      client.println(F("</td></tr>"));
-      
-      client.print(F("<tr><td>Total IP Failures</td><td class='"));
-      if (totalIpFailures > 100) client.print(F("warning"));
-      client.print(F("'>")); 
-      client.print(totalIpFailures); 
-      client.println(F("</td></tr>"));
-      
-      client.print(F("<tr><td>Total Auto-Closes</td><td class='"));
-      if (totalAutoCloses > 10) client.print(F("warning"));
-      client.print(F("'>")); 
-      client.print(totalAutoCloses); 
-      client.println(F("</td></tr>"));
-      
-      client.print(F("<tr><td>Days Running</td><td>")); 
-      client.print(dayCounter); 
-      client.println(F("</td></tr>"));
-      
-      client.print(F("<tr><td>Last Activity</td><td>")); 
-      client.print((millis() - lastSuccessfulPing) / 1000); 
-      client.println(F("s ago</td></tr>"));
-      
-      client.println(F("</table>"));
-      client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
-      client.println(F("</div>"));
+
+      // Collapsible details section for system/diagnostic info (default: collapsed)
+      client.println(F("<details style='margin-bottom:15px;'><summary style='cursor:pointer;padding:10px;background:#f8f8f8;border:1px solid #ddd;border-radius:5px;font-size:0.95em;font-weight:bold;'>System Details (tap to expand)</summary>"));
 
       // --- Sensors Section (v4.0) ---
       client.println(F("<div class='section'><h2>Sensors</h2><table>"));
@@ -2305,6 +2292,55 @@ void sendFullHtmlResponse(EthernetClient& client) {
       }
       client.println(F("</div>"));
 
+      // --- IP Monitoring Status ---
+      client.println(F("<div class='section'><h2>IP Monitoring</h2><table>"));
+      client.print(F("<tr><td>Current IP Fails</td><td>"));
+      client.print(connectFailCount);
+      client.print(F("/"));
+      client.print(maxConnectFails);
+      if (firstFailTimestamp > 0) {
+        client.print(F(" ("));
+        client.print((millis() - firstFailTimestamp) / 60000);
+        client.print(F(" min)"));
+      }
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>Total IP Failures</td><td class='"));
+      if (totalIpFailures > 100) client.print(F("warning"));
+      client.print(F("'>"));
+      client.print(totalIpFailures);
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>Total Auto-Closes</td><td class='"));
+      if (totalAutoCloses > 10) client.print(F("warning"));
+      client.print(F("'>"));
+      client.print(totalAutoCloses);
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>Days Running</td><td>"));
+      client.print(dayCounter);
+      client.println(F("</td></tr>"));
+
+      client.print(F("<tr><td>Last Activity</td><td>"));
+      client.print((millis() - lastSuccessfulPing) / 1000);
+      client.println(F("s ago</td></tr>"));
+
+      client.println(F("</table>"));
+      client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
+      client.println(F("</div>"));
+
+      // --- System Status ---
+      client.println(F("<div class='section'><h2>System Status</h2><table>"));
+      client.print(F("<tr><th>Sensor</th><th>State</th></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(lim1open);client.print(F(")</td><td>")); client.print(digitalRead(lim1open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(lim1closed);client.print(F(")</td><td>")); client.print(digitalRead(lim1closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(lim2open);client.print(F(")</td><td>")); client.print(digitalRead(lim2open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(lim2closed);client.print(F(")</td><td>")); client.print(digitalRead(lim2closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>VCC1 (Main Power)</td><td>")); client.print((float)analogRead(VCC1) * 24.0f / 1023.0f * (1023.0f / VCC_RAW_MAX), 1); client.println(F("V</td></tr>"));
+      client.print(F("<tr><td>SWSTOP Pressed</td><td>")); client.print(!digitalRead(SWSTOP) ? F("YES") : F("NO")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Network Status</td><td>")); client.print(ethernet_initialized ? F("OK") : F("ERROR")); client.println(F("</td></tr>"));
+      client.println(F("</table></div>"));
+
       // --- Tick Logging Section ---
       client.println(F("<div class='section'><h2>Motor Runtime Logging</h2>"));
 
@@ -2395,7 +2431,10 @@ void sendFullHtmlResponse(EthernetClient& client) {
       client.print(F(":"));
       client.print(tickLogServerPort);
       client.println(F("</p></div>"));
+      client.println(F("</details>"));  // Close collapsible System Details
   }
+  // Persist collapsible section state across auto-refresh using localStorage
+  client.println(F("<script>var d=document.querySelector('details');if(d){if(localStorage.getItem('do')==='1')d.open=true;d.addEventListener('toggle',function(){localStorage.setItem('do',d.open?'1':'0');});}</script>"));
   client.println(F("</div></body></html>"));
 }
 
