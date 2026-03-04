@@ -86,11 +86,17 @@ Telescope Protection Priority:
 
 ### Required Components
 
-- **Controller:** Arduino MEGA 2560 (upgraded from UNO for more memory)
+- **Controller:** Arduino MEGA 2560 — **use original Arduino only** (see warning below)
 - **Network:** W5500 Ethernet Shield
 - **Weather:** Lunatico Cloudwatcher Solo (optional but recommended)
 - **Temperature:** DS18B20 waterproof probe (v4.0)
 - **Distance:** VL53L0X Time-of-Flight sensor breakout (v4.0)
+
+### Important: Arduino Board Compatibility
+
+The original AstroShell kit ships with an **Arduino UNO R3**. This project upgraded to the **Arduino MEGA 2560** because the UNO's 2KB SRAM and 32KB flash are insufficient for the Ethernet web server, HTML UI, and v4.0 sensor features (DS18B20, VL53L0X). The MEGA also provides dedicated I2C pins (20/21) and additional GPIO (pin 22+) that don't conflict with existing wiring.
+
+> **Warning: Always use an original Arduino MEGA 2560 R3.** Clone boards from manufacturers like AZ-Delivery (CH340 chip) or Keyestudio (CP2102 chip) can cause unpredictable failures. The Shutter 2 (West) limit switches use pins 0 and 1, which are shared with the USB-serial chip. The original Arduino MEGA has an ATmega16U2 with a series resistor that allows limit switches to function correctly on these pins. Clone boards often drive pins 0/1 directly from their USB-serial chip, overpowering the limit switch signals. This causes symptoms like: West shutter refusing to open (code thinks it's already at the open limit) while closing still works, or both shutters behaving erratically. This is a hardware-level issue — no code fix is possible.
 
 ### Sensor Wiring (v4.0)
 
