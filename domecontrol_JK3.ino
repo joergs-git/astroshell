@@ -290,17 +290,17 @@ const int remoteStationPort = 80;
 //=============================================================================
 // IP FAILURE DETECTION CONFIGURATION
 //=============================================================================
-// Auto-close triggers after 10 failed connection attempts within 15 minutes.
+// Auto-close triggers after 10 failed connection attempts within 30 minutes.
 // This ensures dome closes when Cloudwatcher is genuinely unreachable,
 // while tolerating brief network glitches (switch hiccups, Solo busy, etc.).
-// Timing: 10 checks × 90 second interval = 15 minutes maximum response time.
+// Timing: 10 checks × 90 second interval = 15 minutes minimum response time.
 
 byte connectFailCount = 0;                          // Current consecutive failures
 unsigned long lastConnectAttemptTimestamp = 0;      // Last connection check time
 const unsigned long connectCheckInterval = 90000UL; // Check every 90 seconds
 const byte maxConnectFails = 10;                    // Failures needed to trigger
 unsigned long firstFailTimestamp = 0;               // When failure window started
-const unsigned long maxFailTimeWindow = 900000UL;   // 15-minute window for counting
+const unsigned long maxFailTimeWindow = 1800000UL;  // 30-minute window for counting
 
 // --- Persistent Statistics (saved to EEPROM) ---
 unsigned int totalIpFailures = 0;     // Lifetime IP failure count
@@ -312,6 +312,7 @@ bool eepromDirty = false;             // True if counters need saving
 bool m1AutoClosedByIP = false;        // True if M1 was auto-closed due to IP fail
 bool m2AutoClosedByIP = false;        // True if M2 was auto-closed due to IP fail
 bool cableRemovalAutoCloseTriggered = false;  // Prevents repeated auto-close on cable removal
+bool skipNextIpCheck = false;                 // Skip one IP check after Ethernet stack reset
 
 // --- Network Monitoring Activation ---
 // IP monitoring only activates once an Ethernet cable has been detected.
@@ -327,7 +328,7 @@ unsigned long lastNetworkCheck = 0;
 const unsigned long NETWORK_CHECK_INTERVAL = 600000;   // Check every 10 minutes
 bool ethernet_initialized = false;                     // True if Ethernet is working
 unsigned long lastEthernetReset = 0;
-const unsigned long ETHERNET_RESET_INTERVAL = 3600000; // Preventive reset every hour
+const unsigned long ETHERNET_RESET_INTERVAL = 28800000UL; // Preventive reset every 8 hours
 unsigned long lastSuccessfulPing = 0;                  // Last successful activity
 
 //=============================================================================
@@ -1340,6 +1341,11 @@ void setupEthernet() {
       ethernet_initialized = true;
       lastEthernetReset = millis();
       lastSuccessfulPing = millis();
+      // Reset IP fail counters - prior failures are irrelevant after stack rebuild
+      connectFailCount = 0;
+      firstFailTimestamp = 0;
+      // Skip the next IP check to let the W5100/W5500 fully stabilize
+      skipNextIpCheck = true;
       return;  // Success
     }
     delay(2000);
@@ -1358,7 +1364,7 @@ void setupEthernet() {
  * Monitors network health and performs recovery actions.
  * - Checks link and IP status every 10 minutes
  * - Reinitializes Ethernet if problems detected
- * - Performs preventive reset every hour for long-term stability
+ * - Performs preventive reset every 8 hours for long-term stability
  */
 void networkWatchdog() {
   unsigned long currentTime = millis();
@@ -1429,7 +1435,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.0 - Safety Sensors"));
+    Serial.println(F("Dome Control v4.0.2 - Safety Sensors"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -1544,7 +1550,7 @@ void setup() {
  *
  * Safety Logic:
  * - Checks connection every 1 minute when dome is not fully closed
- * - Counts failures within a sliding 5-minute window
+ * - Counts failures within a sliding 30-minute window
  * - After 5 consecutive failures, auto-closes dome immediately
  * - Works regardless of dome state: fully open, intermediate, or moving
  * - If dome is opening, it will stop and reverse to close
@@ -1691,6 +1697,16 @@ void checkRemoteConnectionAndAutoClose() {
         
         // Check connection with longer intervals
         if (millis() - lastConnectAttemptTimestamp >= connectCheckInterval) {
+            // Skip one check after Ethernet stack reset to let W5100/W5500 stabilize
+            if (skipNextIpCheck) {
+                skipNextIpCheck = false;
+                lastConnectAttemptTimestamp = millis();
+                #if defined(SERIAL_DEBUG_IP)
+                Serial.println(F("IP Check: Skipped (post-reset stabilization)"));
+                #endif
+                return;
+            }
+
             bool connectionOK = false;
 
             // If network has problems, count as failed attempt
@@ -1763,7 +1779,7 @@ void checkRemoteConnectionAndAutoClose() {
                 if (millis() - firstFailTimestamp > maxFailTimeWindow) {
                     // Time window expired - reset counters
                     #if defined(SERIAL_DEBUG_IP)
-                    Serial.println(F("IP Check: 5-minute window expired - resetting fail count"));
+                    Serial.println(F("IP Check: 30-minute window expired - resetting fail count"));
                     #endif
                     connectFailCount = 1; // Start fresh with this failure
                     firstFailTimestamp = millis();
@@ -1788,7 +1804,7 @@ void checkRemoteConnectionAndAutoClose() {
         if (connectFailCount >= maxConnectFails &&
             (millis() - firstFailTimestamp <= maxFailTimeWindow)) {
             #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Max fails within 5 minutes. Triggering auto-close."));
+            Serial.println(F("IP Check: Max fails within 30 minutes. Triggering auto-close."));
             if (networkProblem) {
                 if (!ethernet_initialized) Serial.println(F("Reason: Ethernet stack problem"));
                 else if (linkDown) Serial.println(F("Reason: Cable disconnected"));

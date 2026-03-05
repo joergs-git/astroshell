@@ -80,7 +80,9 @@ All real-time operations run in the interrupt service routine:
 
 ### Network Monitoring
 - Checks Cloudwatcher IP every **90 seconds** (`connectCheckInterval = 90000`)
-- After **10 failures within 15 minutes**, dome auto-closes
+- After **10 failures within 30 minutes**, dome auto-closes
+- Fail counters reset after successful Ethernet stack rebuild (prevents carryover)
+- First IP check skipped after stack reset (W5100/W5500 stabilization)
 - Cable removal triggers **immediate** auto-close
 - Uses `netClient.setTimeout(3000)` to prevent watchdog timeout
 - No Pushover for IP auto-close (network is down when it triggers)
@@ -169,7 +171,7 @@ The **motor control logic is unchanged** from original. Only the **web display**
 
 const unsigned long connectCheckInterval = 90000UL;   // IP check every 90 sec
 const byte maxConnectFails = 10;            // Failures to trigger close
-const unsigned long maxFailTimeWindow = 900000UL;     // 15-min failure window
+const unsigned long maxFailTimeWindow = 1800000UL;    // 30-min failure window
 ```
 
 ### cloudwatcher-raincheckerV3.sh

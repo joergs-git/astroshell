@@ -15,7 +15,7 @@
 | Feature | Description |
 |---------|-------------|
 | **Automatic Rain Protection** | Closes dome automatically when rain detected via Cloudwatcher Solo |
-| **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (10 failures in 15 min) |
+| **Network Failsafe** | Auto-closes if Cloudwatcher becomes unreachable (10 failures in 30 min) |
 | **Cable Removal Detection** | Instant dome closure if Ethernet cable is disconnected |
 | **Dynamic Motor Timeout** | Temperature-based timeout from 253-cycle regression analysis (v4.0) |
 | **Frozen Dome Detection** | VL53L0X ToF sensor detects frozen halves, auto-retries with lockout (v4.0) |
@@ -33,7 +33,7 @@ Telescope Protection Priority:
 
   Rain Detected          Cloudwatcher        Ethernet Cable       Dome Halves
        via                Unreachable           Removed            Frozen (v4.0)
-   Cloudwatcher           (15 min)            (Instant)           (Detected by ToF)
+   Cloudwatcher           (30 min)            (Instant)           (Detected by ToF)
        |                     |                    |                    |
        v                     v                    v                    v
    +-----------------------------------------------+   +--------------------+
@@ -439,7 +439,7 @@ The dome controller has smart network monitoring that adapts to different scenar
 | Condition | Action | Timing |
 |-----------|--------|--------|
 | Target IP unreachable | Count failures | Every 90 seconds |
-| 10 failures within 15 minutes | Auto-close dome | After 10th failure |
+| 10 failures within 30 minutes | Auto-close dome | After 10th failure |
 | Target responds again | Reset fail counter | Immediate |
 | Connection restored during auto-close | Stop closing motors | Immediate |
 
