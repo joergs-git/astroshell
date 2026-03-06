@@ -1,6 +1,20 @@
 # AstroShell — Task Tracking
 
-No active tasks.
+## Active
+
+### ASCOM COM Driver (v1.0.0) — feature/ascom-driver
+- [x] Create branch `feature/ascom-driver`
+- [x] ArduinoClient.cs — HTTP client using $A endpoint
+- [x] Dome.cs — IDomeV2 implementation
+- [x] SetupDialogForm — WinForms setup dialog with test connection
+- [x] AssemblyInfo.cs — COM visibility, GUID
+- [x] AstroShellDome.csproj + .sln — .NET Framework 4.8
+- [x] install.bat / uninstall.bat — regasm registration scripts
+- [x] GitHub Actions CI — build-ascom-driver.yml
+- [x] Arduino firmware: add $A ASCOM status endpoint (v4.0.3)
+- [x] Update CLAUDE.md, README.md, ascom-driver/README.md
+- [ ] Verify GitHub Actions build succeeds
+- [ ] Test on Windows with NINA
 
 ## Completed
 

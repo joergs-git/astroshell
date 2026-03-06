@@ -29,6 +29,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `open_astroshell.bat` | **NINA script** - Opens dome via sequence instruction, Pushover notification |
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
+| `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.0.0) |
 | `README.md` | User documentation with wiring notes |
 
 ## Hardware Configuration
@@ -107,6 +108,7 @@ All real-time operations run in the interrupt service routine:
 | `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get status: "OPEN" or "CLOSE" |
+| `/?$A` | ASCOM status: `S1_STATE\|S1_MOTOR\|S2_STATE\|S2_MOTOR` (pipe-delimited, v4.0.3) |
 | `/?$R` | Reset EEPROM counters |
 | `/?$L` | Toggle tick logging on/off (default: ON after reboot) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |

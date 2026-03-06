@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.0)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.0.3)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -20,6 +20,12 @@
 // - VL53L0X frozen dome detection with auto-retry and lockout (v4.0)
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
+//
+// v4.0.3 Changes:
+// - Added $A ASCOM status endpoint: compact pipe-delimited response for native ASCOM driver
+//   Format: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR (e.g. "CLOSED|STOPPED|CLOSED|STOPPED")
+//   States: OPEN, CLOSED, INTERMEDIATE — Motors: STOPPED, OPENING, CLOSING
+//   Read-only endpoint, works even during system init
 //
 // v4.0 Changes:
 // - DS18B20 temperature probe on pin 22 for ambient temperature reading
@@ -1870,6 +1876,7 @@ void checkRemoteConnectionAndAutoClose() {
  *   /?$4  - Open Shutter 2 (physically)
  *   /?$5  - STOP all motors
  *   /?$S  - Return plain text status (OPEN/CLOSED)
+ *   /?$A  - ASCOM status: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR (pipe-delimited)
  *   /?$R  - Reset persistent counters
  *   /?$L  - Toggle tick logging on/off
  *
@@ -1892,6 +1899,7 @@ void handleWebClient() {
   unsigned long clientRequestStart = millis();
   bool action_parameter_in_url = false;
   bool plain_text_status_request = false;
+  bool ascom_status_request = false;
   bool reset_counters_request = false;
 
   while (client.connected()) {
@@ -1997,16 +2005,26 @@ void handleWebClient() {
           m1AutoClosedByIP = false; m2AutoClosedByIP = false;
         }
         else if (c == 'S' || c == 's') {
-          plain_text_status_request = true; 
-          action_parameter_in_url = false;  
+          plain_text_status_request = true;
+          action_parameter_in_url = false;
+        }
+        // $A = ASCOM status endpoint — compact pipe-delimited response
+        // Format: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR
+        // States: OPEN, CLOSED, INTERMEDIATE
+        // Motors: STOPPED, OPENING, CLOSING
+        else if (c == 'A' || c == 'a') {
+          ascom_status_request = true;
+          action_parameter_in_url = false;
         }
         
         if (c != '$') { newInfo = false; }
       } else if (newInfo && !system_fully_ready) { 
           if (c != '$') newInfo = false; 
-          if ((c >= '1' && c <= '5') || c == 'S' || c == 's' || c == 'R' || c == 'r') {
-               action_parameter_in_url = true; 
-               if (c == 'S' || c == 's') plain_text_status_request = false; 
+          if ((c >= '1' && c <= '5') || c == 'S' || c == 's' || c == 'R' || c == 'r' || c == 'A' || c == 'a') {
+               action_parameter_in_url = true;
+               if (c == 'S' || c == 's') plain_text_status_request = false;
+               // $A (ASCOM status) is read-only, allow even during init
+               if (c == 'A' || c == 'a') { ascom_status_request = true; action_parameter_in_url = false; }
           }
       }
 
@@ -2036,7 +2054,40 @@ void handleWebClient() {
           } else {
             client.println(F("OPEN")); 
           }
-        } else if (action_parameter_in_url) { 
+        } else if (ascom_status_request) {
+          // ASCOM driver endpoint — compact pipe-delimited status
+          // Format: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR
+          // Physical reality (inverted from code variable names)
+          client.println(F("HTTP/1.1 200 OK"));
+          client.println(F("Content-Type: text/plain"));
+          client.println(F("Connection: close"));
+          client.println();
+
+          // Shutter 1 (East) physical state
+          if (digitalRead(lim1closed))      client.print(F("OPEN"));       // lim1closed = physically open
+          else if (digitalRead(lim1open))   client.print(F("CLOSED"));     // lim1open = physically closed
+          else                              client.print(F("INTERMEDIATE"));
+          client.print('|');
+
+          // Shutter 1 motor direction (physical)
+          if (mot1dir == CLOSE)             client.print(F("OPENING"));    // CLOSE direction = physically opening
+          else if (mot1dir == OPEN)         client.print(F("CLOSING"));    // OPEN direction = physically closing
+          else                              client.print(F("STOPPED"));
+          client.print('|');
+
+          // Shutter 2 (West) physical state
+          if (digitalRead(lim2closed))      client.print(F("OPEN"));
+          else if (digitalRead(lim2open))   client.print(F("CLOSED"));
+          else                              client.print(F("INTERMEDIATE"));
+          client.print('|');
+
+          // Shutter 2 motor direction (physical)
+          if (mot2dir == CLOSE)             client.print(F("OPENING"));
+          else if (mot2dir == OPEN)         client.print(F("CLOSING"));
+          else                              client.print(F("STOPPED"));
+          client.println();
+
+        } else if (action_parameter_in_url) {
           // FASTEST possible response for motor commands
           client.println(F("HTTP/1.1 303 See Other")); 
           client.println(F("Location: /")); 

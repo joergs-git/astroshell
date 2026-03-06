@@ -1,0 +1,59 @@
+name: Build ASCOM Driver
+
+on:
+  push:
+    branches: [feature/ascom-driver, main]
+    paths:
+      - 'ascom-driver/**'
+      - '.github/workflows/build-ascom-driver.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'ascom-driver/**'
+      - '.github/workflows/build-ascom-driver.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ascom-driver
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release
+        run: msbuild AstroShellDome.sln /p:Configuration=Release /p:Platform="Any CPU" /restore
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $outDir = "artifact"
+          New-Item -ItemType Directory -Force -Path $outDir
+          # Try expected path first, then fall back to recursive search
+          $dll = Get-ChildItem -Path "AstroShellDome\bin\Release" -Filter "ASCOM.AstroShellDome.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path "AstroShellDome" -Recurse -Filter "ASCOM.AstroShellDome.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($dll) {
+            Copy-Item $dll.FullName $outDir
+            Write-Host "DLL found: $($dll.FullName)"
+          } else {
+            Write-Host "ERROR: Built DLL not found. Build output:"
+            Get-ChildItem -Path "AstroShellDome\bin" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+          Copy-Item "install.bat" $outDir
+          Copy-Item "uninstall.bat" $outDir
+          Copy-Item "README.md" $outDir
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstroShellDome-ASCOM-Driver
+          path: ascom-driver/artifact/
+          retention-days: 90

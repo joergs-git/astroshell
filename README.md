@@ -3,7 +3,7 @@
 **Enhanced Arduino fail-safe firmware for AstroShell telescope domes with automatic rain protection, temperature-based dynamic motor timeout, and frozen dome detection**
 
 [![Platform](https://img.shields.io/badge/Platform-Arduino%20MEGA-blue)]()
-[![Version](https://img.shields.io/badge/Version-4.0-green)]()
+[![Version](https://img.shields.io/badge/Version-4.0.3-green)]()
 [![License](https://img.shields.io/badge/License-Free%20to%20Use-green)]()
 
 > Also check out the [Wiki](https://github.com/joergs-git/astroshell/wiki) for additional documentation.
@@ -147,6 +147,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `open_astroshell.bat` | Windows batch script for NINA - opens dome with Pushover notification |
 | `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
 | `motortick-statistic-batchrun.sh` | Automated dome open/close cycles for motor tick statistics collection |
+| `ascom-driver/` | Native ASCOM COM driver for NINA dome integration (v1.0.0) |
 | `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
 | `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
 
@@ -162,10 +163,25 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
 | `/?$5` | Emergency STOP all motors |
 | `/?$S` | Get plain text status: "OPEN" or "CLOSED" |
+| `/?$A` | ASCOM status: `S1_STATE\|S1_MOTOR\|S2_STATE\|S2_MOTOR` (v4.0.3) |
 | `/?$R` | Reset EEPROM counters |
 | `/?$L` | Toggle tick logging on/off (default: ON) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
+
+---
+
+## ASCOM Driver for NINA
+
+A native ASCOM COM driver (`IDomeV2`) that lets NINA control the AstroShell dome directly — no extra server process needed. The driver communicates with the Arduino over HTTP using the `$A` status endpoint.
+
+**Quick Setup:**
+1. Install [ASCOM Platform 7](https://github.com/ASCOMInitiative/ASCOMPlatform/releases)
+2. Download the driver from [GitHub Actions artifacts](../../actions)
+3. Run `install.bat` as Administrator
+4. In NINA: Equipment > Dome > select **AstroShell Dome** > Setup > configure IP > Connect
+
+See [`ascom-driver/README.md`](ascom-driver/README.md) for full documentation, build instructions, and configuration options.
 
 ---
 
