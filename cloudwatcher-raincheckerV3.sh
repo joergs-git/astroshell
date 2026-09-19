@@ -500,6 +500,17 @@ while true; do
                     log_message "Dry (Value: $RAIN_VALUE) but in cooldown, ${remaining}min remaining"
                 fi
             fi
+        elif [[ -f "$CLOSE_PENDING" ]]; then
+            # FIX: the close command was never delivered during the last rain episode, so
+            # RAIN_TRIGGERED was never set and the cleanup above does not run. Drop the pending
+            # marker after the dry cooldown, otherwise the next rain episode would neither send
+            # the "Closing Dome" alert nor a new command-failure alert.
+            if is_dry_cooldown_passed; then
+                log_message "Dry for $DRY_COOLDOWN_MINUTES+ minutes (Value: $RAIN_VALUE) - dropping undelivered close from previous rain"
+                send_pushover "Weather Clear" "Dry for $DRY_COOLDOWN_MINUTES+ minutes. Note: the rain close command was never delivered to the dome. Rain value: $RAIN_VALUE" 0
+                rm -f "$CLOSE_PENDING"
+                rm -f "$LAST_RAIN_TIME"
+            fi
         fi
         # If never rained (no RAIN_TRIGGERED), just continue silently
     fi
