@@ -196,6 +196,7 @@ PUSHOVER_PRIORITIES = {
     "frozen_lockout": 1,   # High priority — dome is locked, needs attention!
     "frozen_clear":   -1,  # Low priority — good news, resolved
     "sensor_fail":    0,   # Normal priority — degraded but functioning
+    "sensor_ok":     -1,   # Low priority — sensor back (P2)
     "conflict":       0,   # Normal priority — informational
 }
 
@@ -360,6 +361,7 @@ def send_pushover_event(event_type, detail, temp=None, tof=None):
             "frozen_lockout": "DOME LOCKED - Frozen!",
             "frozen_clear":   "Dome Unfrozen",
             "sensor_fail":    "Sensor Failure",
+            "sensor_ok":      "Sensor Restored",
             "conflict":       "Signal Conflict",
         }
         title = f"AstroShell: {title_map.get(event_type, event_type)}"

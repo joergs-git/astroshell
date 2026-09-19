@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.0.3)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.1.0)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -20,6 +20,17 @@
 // - VL53L0X frozen dome detection with auto-retry and lockout (v4.0)
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
+//
+// v4.1.0 Changes (network/robustness review):
+// - Ethernet: single chip reset per stack rebuild, health check flags dead stack (LinkOFF / 0.0.0.0),
+//   rebuild only with motors idle and rate-limited (60 s), 8-h preventive reset only with dome closed
+// - socketHygiene(): reclaims idle/dead W5500 sockets, keeps two LISTEN sockets (rain-checker close no longer dropped)
+// - HTTP: '$' commands parsed from the request line only; page writes bounded (PageWriter), no unbounded flush()
+// - I2C: Wire timeout 25 ms + bus recovery, VL53L0X init bracketed by wdt_reset()
+// - Watchdog enabled first in setup(); motor pins LOW before anything else
+// - Frozen dome: per-motor external-command mask, attempt counted at detection, lockout survives cancel,
+//   urgent events bypass rate limiter, 30-min attempt memory
+// - Atomic writes of dynamic timeouts; soft-start on direction change; sensor_fail/sensor_ok events
 //
 // v4.0.3 Changes:
 // - Added $A ASCOM status endpoint: compact pipe-delimited response for native ASCOM driver
@@ -75,6 +86,7 @@
 // --- Libraries ---
 #include <SPI.h>          // SPI communication for Ethernet Shield
 #include <Ethernet.h>     // W5100/W5500 Ethernet library
+#include <utility/w5100.h> // W5100 mode register (chip reset) and SnSR socket states (P1)
 #include <EEPROM.h>       // Persistent storage for counters
 #include <avr/wdt.h>      // Hardware watchdog for automatic recovery
 #include <OneWire.h>      // OneWire protocol for DS18B20 temperature probe
@@ -181,6 +193,7 @@
 #define FROZEN_GRAVITY_WAIT  20000   // ms: gravity wait with motor off
 #define FROZEN_RETRY_WAIT     5000   // ms: wait between retry attempts
 #define FROZEN_MAX_RETRIES       3   // Max open attempts before lockout
+#define FROZEN_ATTEMPT_MEMORY 1800000UL // ms: attempt counter forgets after 30 min without a frozen verdict (P1)
 
 //=============================================================================
 // GLOBAL VARIABLES
@@ -236,6 +249,16 @@ volatile word dynTimeout_M2_Close = MAX_MOT2_OPEN;   // mot2dir==OPEN = physical
 volatile word dynTimeout_M2_Open  = MAX_MOT2_CLOSE;  // mot2dir==CLOSE = physically opening
 bool dynamicTimeoutActive = false;        // True when DS18B20 is providing valid temps
 
+// FIX (P1): the four 16-bit timeout values are read by the ISR when a button starts a motor;
+// 16-bit stores are NOT atomic on the 8-bit AVR (the old comment claimed the opposite), so
+// every writer goes through this helper.
+static void setDynamicTimeouts(word m1c, word m1o, word m2c, word m2o) {
+  uint8_t sreg = SREG; cli();
+  dynTimeout_M1_Close = m1c; dynTimeout_M1_Open = m1o;
+  dynTimeout_M2_Close = m2c; dynTimeout_M2_Open = m2o;
+  SREG = sreg;
+}
+
 //=============================================================================
 // VL53L0X TIME-OF-FLIGHT SENSOR
 //=============================================================================
@@ -273,6 +296,16 @@ volatile bool frozenCheckActive = false;  // True when ISR should count frozenCh
 byte frozenRetryCount = 0;               // Current retry attempt (0-based)
 unsigned long frozenStateTimer = 0;       // Timer for gravity wait, retry wait etc.
 byte frozenMotorNum = 0;                 // Which motor triggered frozen check (1 or 2)
+unsigned long lastFrozenDetect = 0;      // millis() of the last frozen verdict (P1)
+// FIX (P1): bitmask of motor commands issued OUTSIDE the frozen-dome cycle since the state
+// machine last looked. bit0 = shutter 1 (web $1/$2, S1 buttons), bit1 = shutter 2 ($3/$4,
+// S2 buttons); $5, SWSTOP and the IP/cable auto-close set both. The state machine hands
+// control back when a command addresses the shutter it is working on, so it can never
+// re-open a dome that somebody else just stopped or closed on purpose.
+volatile byte fdExternalCommand = 0;
+#define FD_CMD_M1  1
+#define FD_CMD_M2  2
+#define FD_CMD_ALL 3
 
 //=============================================================================
 // EVENT NOTIFICATION
@@ -334,6 +367,7 @@ unsigned long lastNetworkCheck = 0;
 const unsigned long NETWORK_CHECK_INTERVAL = 600000;   // Check every 10 minutes
 bool ethernet_initialized = false;                     // True if Ethernet is working
 unsigned long lastEthernetReset = 0;
+unsigned long lastEthernetAttempt = 0;                 // FIX (P1): last setupEthernet() start (rate limit)
 const unsigned long ETHERNET_RESET_INTERVAL = 28800000UL; // Preventive reset every 8 hours
 unsigned long lastSuccessfulPing = 0;                  // Last successful activity
 
@@ -403,8 +437,9 @@ volatile byte m2_interrupt_direction = 0;
 //=============================================================================
 void setupEthernet();                           // Initialize Ethernet with retry
 void networkWatchdog();                         // Monitor and recover network
+void socketHygiene();                           // Drop idle clients, keep two listeners (P1)
 void handleWebClient();                         // Process HTTP requests
-void sendFullHtmlResponse(EthernetClient& client); // Generate web UI HTML
+void sendFullHtmlResponse(Print& client);          // Generate web UI HTML (P1: through PageWriter)
 void checkRemoteConnectionAndAutoClose();       // IP monitoring logic
 void initializeEEPROM();                        // Load/init persistent storage
 void saveCountersToEEPROM();                    // Save counters if changed
@@ -423,7 +458,7 @@ void calibrateToF();                            // Store current ToF as baseline
 void loadToFCalibration();                      // Load baseline from EEPROM
 void frozenDomeStateMachine();                  // Main frozen dome detection logic
 void checkConflictingSignals();                 // Limit switch vs ToF disagreement
-void sendEventNotification(const char* type, const char* detail);  // Push event to Solo
+void sendEventNotification(const char* type, const char* detail, bool urgent = false);  // Push event to Solo (P1: urgent = no rate limit)
 
 //=============================================================================
 // ISR-SAFE MOTOR START HELPERS
@@ -434,8 +469,12 @@ void sendEventNotification(const char* type, const char* detail);  // Push event
 // WARNING: Do NOT call these from inside the ISR — sei() would enable
 // nested interrupts on AVR, which is dangerous.
 
+// FIX (P2): a direction change from loop() (web command, IP auto-close while opening) never
+// passes through a tick with mot*dir==0, so the ISR never zeroed mot*speed and the motor
+// was reversed at full PWM. Restart the soft-start ramp whenever the direction changes.
 inline void startMotor1(byte direction, word timeout) {
   cli();
+  if (mot1dir != direction) mot1speed = 0;
   mot1timer = timeout;
   mot1dir = direction;
   sei();
@@ -443,9 +482,49 @@ inline void startMotor1(byte direction, word timeout) {
 
 inline void startMotor2(byte direction, word timeout) {
   cli();
+  if (mot2dir != direction) mot2speed = 0;
   mot2timer = timeout;
   mot2dir = direction;
   sei();
+}
+
+// FIX (P1): motor start used by the frozen-dome cycle: only if the motor is still idle and no
+// external command for it arrived meanwhile - checked atomically against the ISR, so a STOP
+// button pressed in the same instant can never be overridden by the cycle's own start.
+static bool fdStartMotor(byte motor, byte direction, word timeout) {
+  bool started = false;
+  const byte bit = (motor == 2) ? FD_CMD_M2 : FD_CMD_M1;
+  uint8_t sreg = SREG; cli();
+  if (motor == 1) {
+    if (mot1dir == 0 && !(fdExternalCommand & bit)) { mot1timer = timeout; mot1dir = direction; started = true; }
+  } else {
+    if (mot2dir == 0 && !(fdExternalCommand & bit)) { mot2timer = timeout; mot2dir = direction; started = true; }
+  }
+  SREG = sreg;
+  return started;
+}
+
+// FIX (P1): loop-side "|=" on the mask is a load/or/store sequence that an ISR write could
+// slip into; only the ISR may use a plain |= (interrupts are off there).
+static inline void fdNoteCommand(byte bits) {
+  uint8_t sreg = SREG; cli();
+  fdExternalCommand |= bits;
+  SREG = sreg;
+}
+
+// FIX (P1): after the third frozen verdict an OPEN is refused at once (the state machine
+// would only stop it on its next call, i.e. after up to a few seconds of pulling).
+static inline bool fdOpenBlocked() {
+  return frozenDomeState == FD_LOCKOUT ||
+         (frozenRetryCount >= FROZEN_MAX_RETRIES && frozenDomeState != FD_IDLE);
+}
+
+// FIX (P1): stop the monitored motor if it is opening, on the live value, atomically
+static void fdLockoutStop() {
+  uint8_t sreg = SREG; cli();
+  if (frozenMotorNum == 1) { if (mot1dir == CLOSE) { mot1dir = 0; stop1reason = 6; } }
+  else                     { if (mot2dir == CLOSE) { mot2dir = 0; stop2reason = 6; } }
+  SREG = sreg;
 }
 
 //=============================================================================
@@ -491,7 +570,7 @@ void saveCountersToEEPROM() {
   if (eepromDirty && (millis() - lastSave > 300000UL)) {  // 5 minutes
     EEPROM.put(EEPROM_ADDR_TOTAL_IP_FAILS, totalIpFailures);
     EEPROM.put(EEPROM_ADDR_AUTO_CLOSES, totalAutoCloses);
-    EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);
+    EEPROM.update(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);   // P2: only write if changed
     lastSave = millis();
     eepromDirty = false;
     #if defined(SERIAL_DEBUG_EEPROM)
@@ -513,8 +592,20 @@ void incrementDayCounter() {
     if (dayCounter > 250) dayCounter = 0;  // Wrap before overflow
     lastDayIncrement = millis();
     eepromDirty = true;
-    EEPROM.write(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);  // Immediate save
+    EEPROM.update(EEPROM_ADDR_LAST_FAIL_DAY, dayCounter);  // Immediate save (P2: update, not write)
   }
+}
+
+//=============================================================================
+// TEMPERATURE PRINT HELPER (P2)
+//=============================================================================
+// FIX (P2): "-5" / 10 == 0 on the integer side, so -0.1..-0.9 C printed as 0.1..0.9 C in the
+// CSV push, the events and the web page (exactly the band that matters for ice).
+static void printTempX10(Print& p, int t) {
+  if (t < 0) { p.print('-'); t = -t; }
+  p.print(t / 10);
+  p.print('.');
+  p.print(t % 10);
 }
 
 //=============================================================================
@@ -546,7 +637,7 @@ void pushTickDataIfReady() {
 
     wdt_reset();  // Reset watchdog before potentially blocking call
     EthernetClient logClient;
-    logClient.setTimeout(2000);  // 2 second timeout
+    logClient.setConnectionTimeout(1500);  // 1.5 s bound for connect()/stop() (P2: setTimeout() only affected Stream reads; effective was 1 s)
 
     if (logClient.connect(remoteStationIp, tickLogServerPort)) {
       // Build HTTP GET request with temp and ToF data
@@ -557,11 +648,7 @@ void pushTickDataIfReady() {
       // Include temperature
       logClient.print(F("&temp="));
       if (currentTemp_x10 != -9990) {
-        logClient.print(currentTemp_x10 / 10);
-        logClient.print(F("."));
-        int frac = currentTemp_x10 % 10;
-        if (frac < 0) frac = -frac;
-        logClient.print(frac);
+        printTempX10(logClient, currentTemp_x10);
       } else {
         logClient.print(F("-999"));
       }
@@ -595,7 +682,7 @@ void pushTickDataIfReady() {
 
     wdt_reset();
     EthernetClient logClient;
-    logClient.setTimeout(2000);
+    logClient.setConnectionTimeout(1500);
 
     if (logClient.connect(remoteStationIp, tickLogServerPort)) {
       logClient.print(F("GET /log?m=2&d="));
@@ -604,11 +691,7 @@ void pushTickDataIfReady() {
       logClient.print(ticks);
       logClient.print(F("&temp="));
       if (currentTemp_x10 != -9990) {
-        logClient.print(currentTemp_x10 / 10);
-        logClient.print(F("."));
-        int frac = currentTemp_x10 % 10;
-        if (frac < 0) frac = -frac;
-        logClient.print(frac);
+        printTempX10(logClient, currentTemp_x10);
       } else {
         logClient.print(F("-999"));
       }
@@ -660,7 +743,7 @@ void pushInterruptDataIfReady() {
   if (m1_interrupt_ready) {
     wdt_reset();
     EthernetClient logClient;
-    logClient.setTimeout(2000);
+    logClient.setConnectionTimeout(1500);
 
     if (logClient.connect(remoteStationIp, tickLogServerPort)) {
       logClient.print(F("GET /interrupt?m=1&d="));
@@ -669,11 +752,7 @@ void pushInterruptDataIfReady() {
       logClient.print(m1_interrupt_ticks);
       logClient.print(F("&temp="));
       if (currentTemp_x10 != -9990) {
-        logClient.print(currentTemp_x10 / 10);
-        logClient.print(F("."));
-        int frac = currentTemp_x10 % 10;
-        if (frac < 0) frac = -frac;
-        logClient.print(frac);
+        printTempX10(logClient, currentTemp_x10);
       } else {
         logClient.print(F("-999"));
       }
@@ -703,7 +782,7 @@ void pushInterruptDataIfReady() {
   if (m2_interrupt_ready) {
     wdt_reset();
     EthernetClient logClient;
-    logClient.setTimeout(2000);
+    logClient.setConnectionTimeout(1500);
 
     if (logClient.connect(remoteStationIp, tickLogServerPort)) {
       logClient.print(F("GET /interrupt?m=2&d="));
@@ -712,11 +791,7 @@ void pushInterruptDataIfReady() {
       logClient.print(m2_interrupt_ticks);
       logClient.print(F("&temp="));
       if (currentTemp_x10 != -9990) {
-        logClient.print(currentTemp_x10 / 10);
-        logClient.print(F("."));
-        int frac = currentTemp_x10 % 10;
-        if (frac < 0) frac = -frac;
-        logClient.print(frac);
+        printTempX10(logClient, currentTemp_x10);
       } else {
         logClient.print(F("-999"));
       }
@@ -800,6 +875,7 @@ void readTemperatureAsync() {
       if (ds18b20.getDeviceCount() > 0) {
         // Sensor found again — reinitialize
         ds18b20_connected = true;
+        sendEventNotification("sensor_ok", "DS18B20 back - dynamic timeout");   // P2
         ds18b20.setResolution(12);
         ds18b20.setWaitForConversion(false);
         tempFailCount = 0;
@@ -840,12 +916,10 @@ void readTemperatureAsync() {
       tempFailCount++;
       if (tempFailCount >= TEMP_FAIL_THRESHOLD) {
         // Too many failures — fall back to static timeout
+        if (ds18b20_connected) sendEventNotification("sensor_fail", "DS18B20 lost - static timeout");   // P2
         ds18b20_connected = false;
         dynamicTimeoutActive = false;
-        dynTimeout_M1_Close = MAX_MOT1_OPEN;
-        dynTimeout_M1_Open  = MAX_MOT1_CLOSE;
-        dynTimeout_M2_Close = MAX_MOT2_OPEN;
-        dynTimeout_M2_Open  = MAX_MOT2_CLOSE;
+        setDynamicTimeouts(MAX_MOT1_OPEN, MAX_MOT1_CLOSE, MAX_MOT2_OPEN, MAX_MOT2_CLOSE);
       }
     }
   }
@@ -875,24 +949,28 @@ word computeDynamicTimeout(word base, word slope100, word margin, int temp_x10) 
 
 /**
  * Recompute all 4 dynamic timeout values from current temperature.
- * Called whenever temperature changes. Values are read atomically by ISR
- * (16-bit reads are atomic on AVR).
+ * Called whenever temperature changes. Written under cli/sei because the ISR
+ * reads them and 16-bit accesses are not atomic on AVR.
  */
 void updateDynamicTimeouts() {
   if (currentTemp_x10 == -9990) {
     // Invalid temperature — use static fallback
     dynamicTimeoutActive = false;
-    dynTimeout_M1_Close = MAX_MOT1_OPEN;
-    dynTimeout_M1_Open  = MAX_MOT1_CLOSE;
-    dynTimeout_M2_Close = MAX_MOT2_OPEN;
-    dynTimeout_M2_Open  = MAX_MOT2_CLOSE;
+    setDynamicTimeouts(MAX_MOT1_OPEN, MAX_MOT1_CLOSE, MAX_MOT2_OPEN, MAX_MOT2_CLOSE);
     return;
   }
 
-  dynTimeout_M1_Close = computeDynamicTimeout(DYN_M1_CLOSE_BASE, DYN_M1_CLOSE_SLOPE, DYN_M1_CLOSE_MARGIN, currentTemp_x10);
-  dynTimeout_M1_Open  = computeDynamicTimeout(DYN_M1_OPEN_BASE, DYN_M1_OPEN_SLOPE, DYN_M1_OPEN_MARGIN, currentTemp_x10);
-  dynTimeout_M2_Close = computeDynamicTimeout(DYN_M2_CLOSE_BASE, DYN_M2_CLOSE_SLOPE, DYN_M2_CLOSE_MARGIN, currentTemp_x10);
-  dynTimeout_M2_Open  = computeDynamicTimeout(DYN_M2_OPEN_BASE, DYN_M2_OPEN_SLOPE, DYN_M2_OPEN_MARGIN, currentTemp_x10);
+  // FIX (P2): the regression was fitted on -1.6..22.6 C; clamp the input UPWARD so a single
+  // implausibly hot sample (probe in the sun, corrupted scratchpad) cannot shorten a run to
+  // a false TIMEOUT mid-travel. Cold values only lengthen the timeout, which DYN_TIMEOUT_MAX
+  // caps anyway, so no lower clamp (it would eat the margin exactly in the icing band).
+  int t = currentTemp_x10;
+  if (t > 300) t = 300;
+  setDynamicTimeouts(
+    computeDynamicTimeout(DYN_M1_CLOSE_BASE, DYN_M1_CLOSE_SLOPE, DYN_M1_CLOSE_MARGIN, t),
+    computeDynamicTimeout(DYN_M1_OPEN_BASE, DYN_M1_OPEN_SLOPE, DYN_M1_OPEN_MARGIN, t),
+    computeDynamicTimeout(DYN_M2_CLOSE_BASE, DYN_M2_CLOSE_SLOPE, DYN_M2_CLOSE_MARGIN, t),
+    computeDynamicTimeout(DYN_M2_OPEN_BASE, DYN_M2_OPEN_SLOPE, DYN_M2_OPEN_MARGIN, t));
   dynamicTimeoutActive = true;
 }
 
@@ -904,14 +982,52 @@ void updateDynamicTimeouts() {
  * Initialize VL53L0X ToF sensor on I2C (pins 20/21).
  * Sets continuous reading mode for fast non-blocking reads.
  */
-void setupVL53L0X() {
+// FIX (P1): I2C bus recovery. A slave interrupted mid-transfer (EMI from the motors, sensor
+// brown-out, cable glitch) can hold SDA low forever. Clock out up to 9 SCL pulses and a
+// STOP so it releases the bus. Open-drain emulation: LOW = PORT bit cleared first, then the
+// pin becomes an output (never a push-pull HIGH); HIGH = release to the breakout's pull-ups.
+// Wire.end() first so the TWI unit lets go of the pins.
+static void i2cBusRecover() {
+  const byte SDA_PIN = 20, SCL_PIN = 21;   // MEGA hardware I2C pins
+  Wire.end();
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
+  if (digitalRead(SDA_PIN) == HIGH) return;   // bus idle, nothing to do
+  for (byte i = 0; i < 9 && digitalRead(SDA_PIN) == LOW; i++) {
+    digitalWrite(SCL_PIN, LOW); pinMode(SCL_PIN, OUTPUT); delayMicroseconds(5);   // drive SCL low
+    pinMode(SCL_PIN, INPUT_PULLUP);                        delayMicroseconds(5);   // release SCL
+  }
+  digitalWrite(SDA_PIN, LOW); pinMode(SDA_PIN, OUTPUT); delayMicroseconds(5);   // STOP condition:
+  pinMode(SCL_PIN, INPUT_PULLUP);                        delayMicroseconds(5);   // SDA low->high
+  pinMode(SDA_PIN, INPUT_PULLUP);                        delayMicroseconds(5);   // while SCL high
+}
+
+// FIX (P1): (re)start the I2C master WITH a timeout. The AVR Wire library has none by default:
+// a stuck bus blocks Wire.endTransmission()/requestFrom() forever - also inside the TWI
+// interrupt with all interrupts off, i.e. no limit switches, no timeout, no STOP button -
+// then loop() or setup() hangs, the watchdog reboots, setup() hangs again: permanent freeze.
+// 25 ms per transfer, TWI hardware reset on timeout. Requires Arduino AVR core >= 1.8.3.
+// Do not raise the value: VL53L0X::init() issues ~180 transfers, so a bus that answers the
+// ID read and then stalls costs up to ~5 s between the wdt_reset() calls around init().
+static void i2cBegin() {
+  i2cBusRecover();
   Wire.begin();
+  Wire.setWireTimeout(25000, true);
+}
+
+void setupVL53L0X() {
+  i2cBegin();
   tofSensor.setTimeout(500);
 
-  if (tofSensor.init()) {
+  wdt_reset();   // FIX (P1): init() on a half-dead bus can take ~5 s (25 ms per timed-out transfer)
+  bool tofInitOk = tofSensor.init();
+  wdt_reset();   // also on the failure path
+  if (tofInitOk) {
     tof_connected = true;
     tofSensor.setMeasurementTimingBudget(200000);  // 200ms for accuracy
     tofSensor.startContinuous();
+    wdt_reset();   // FIX (P1): ~30 more I2C transfers, each bounded by the 25 ms Wire timeout
     tofFailCount = 0;
 
     // Take initial reading
@@ -938,10 +1054,16 @@ void readToFDistance() {
     if (now - lastTofRedetect >= 30000UL) {
       lastTofRedetect = now;
       // Attempt full re-init (I2C requires init() call after reconnect)
-      if (tofSensor.init()) {
+      i2cBegin();    // FIX (P1): recover a stuck bus before talking to the sensor again
+      wdt_reset();   // FIX (P1): init() on a half-dead bus can take ~5 s
+      bool tofInitOk = tofSensor.init();
+      wdt_reset();   // also on the failure path
+      if (tofInitOk) {
         tof_connected = true;
+        sendEventNotification("sensor_ok", "VL53L0X back - frozen detection on");   // P2
         tofSensor.setMeasurementTimingBudget(200000);
         tofSensor.startContinuous();
+        wdt_reset();   // FIX (P1): see setupVL53L0X()
         tofFailCount = 0;
       }
     }
@@ -961,6 +1083,7 @@ void readToFDistance() {
   } else {
     tofFailCount++;
     if (tofFailCount >= TEMP_FAIL_THRESHOLD) {
+      if (tof_connected) sendEventNotification("sensor_fail", "VL53L0X lost - frozen detection off");   // P2
       tof_connected = false;
       tofDistance_mm = -1;
       // Frozen dome detection auto-disables when sensor disconnected
@@ -1033,7 +1156,7 @@ void loadToFCalibration() {
 void frozenDomeStateMachine() {
   // Own direction tracking — independent of ISR's m1/m2_prev_dir to avoid race condition.
   // The ISR updates m1_prev_dir at 61 Hz, always before loop() runs this function,
-  // so we'd never see the 0→CLOSE transition if we used the ISR's variables.
+  // so we'd never see the transition if we used the ISR's variables.
   static byte fd_prev_mot1dir = 0;
   static byte fd_prev_mot2dir = 0;
 
@@ -1049,20 +1172,51 @@ void frozenDomeStateMachine() {
   }
 
   unsigned long now = millis();
+  const byte myBit = (frozenMotorNum == 2) ? FD_CMD_M2 : FD_CMD_M1;
+
+  // FIX (P1): consume the external-command mask and snapshot the motor direction in ONE
+  // critical section (the ISR sets a bit and starts the motor in the same tick)
+  byte cmd, curDir;
+  { uint8_t sreg = SREG; cli();
+    cmd = fdExternalCommand; fdExternalCommand = 0;
+    curDir = (frozenMotorNum == 2) ? mot2dir : mot1dir;
+    SREG = sreg; }
+
+  // FIX (P1): a command addressed to the shutter we are working on ends the automatic cycle
+  // in the waiting/reversing states: the operator or another safety function is in control
+  // now, and continuing our own stop/close/retry sequence could re-open a dome that was just
+  // stopped or closed on purpose. (In MONITORING/FIRST_CHECK the direction check below
+  // handles stop and reversal, and a repeated OPEN must not disarm the check.)
+  // After the third frozen verdict the dome is locked out instead, so repeated OPEN
+  // commands cannot keep pulling on the ice.
+  if ((cmd & myBit) &&
+      (frozenDomeState == FD_GRAVITY_WAIT || frozenDomeState == FD_SECOND_CHECK ||
+       frozenDomeState == FD_CLOSING || frozenDomeState == FD_RETRY_WAIT)) {
+    frozenCheckActive = false;
+    if (frozenRetryCount >= FROZEN_MAX_RETRIES) {
+      fdLockoutStop();   // somebody re-issued OPEN: stop it, the lockout applies
+      frozenDomeState = FD_LOCKOUT;
+      sendEventNotification("frozen_lockout", "3 attempts failed - dome locked", true);
+    } else {
+      frozenDomeState = FD_IDLE;
+    }
+  }
 
   switch (frozenDomeState) {
 
     case FD_IDLE:
-      // Watch for motor starting an OPEN command (physically opening = mot*dir==CLOSE)
-      // Uses own fd_prev_mot*dir to detect transition (not ISR's m*_prev_dir)
-      if (mot1dir == CLOSE && fd_prev_mot1dir == 0) {
-        // Motor 1 just started opening — begin monitoring
+      // FIX (P1): the attempt counter ages out 30 min after the last frozen verdict, so an
+      // opening hours later gets its three attempts again (a cancelled cycle keeps the count).
+      if (frozenRetryCount > 0 && now - lastFrozenDetect > FROZEN_ATTEMPT_MEMORY) frozenRetryCount = 0;
+      // Watch for a motor ENTERING the opening direction (physically opening = mot*dir==CLOSE).
+      // FIX (P1): "!= CLOSE" instead of "== 0", so an open that reverses a running close
+      // (web $2 while closing) is monitored as well.
+      if (mot1dir == CLOSE && fd_prev_mot1dir != CLOSE) {
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
         frozenCheckActive = true;
         frozenMotorNum = 1;
-      } else if (mot2dir == CLOSE && fd_prev_mot2dir == 0) {
-        // Motor 2 just started opening — begin monitoring
+      } else if (mot2dir == CLOSE && fd_prev_mot2dir != CLOSE) {
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
         frozenCheckActive = true;
@@ -1071,27 +1225,28 @@ void frozenDomeStateMachine() {
       break;
 
     case FD_MONITORING:
+      // Abort if the motor is no longer OPENING (manual stop, limit switch, reversal).
+      // FIX (P1): checked only ==0 before, so a close command within the first 4 s of an
+      // open was judged "frozen" and the dome re-opened itself after the retry wait.
+      if (curDir != CLOSE) {
+        frozenDomeState = FD_IDLE;
+        frozenCheckActive = false;
+        break;
+      }
       // Wait for ~4 seconds of motor running (ISR counts ticks)
       if (frozenCheckTicks >= TOF_CHECK_TICKS) {
         frozenDomeState = FD_FIRST_CHECK;
         frozenCheckActive = false;
       }
-      // Abort if motor stopped prematurely (manual stop, limit switch, etc.)
-      if ((frozenMotorNum == 1 && mot1dir == 0) || (frozenMotorNum == 2 && mot2dir == 0)) {
-        frozenDomeState = FD_IDLE;
-        frozenCheckActive = false;
-      }
       break;
 
     case FD_FIRST_CHECK:
+      if (curDir != CLOSE) { frozenDomeState = FD_IDLE; break; }   // stopped since the last call
       // Check if dome gap is increasing (opening detected)
       if (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE)) {
         // Opening detected — dome is NOT frozen, all good
         frozenDomeState = FD_IDLE;
         frozenRetryCount = 0;
-
-        // Send clear event if we previously detected a frozen condition
-        // (handled elsewhere via event system)
       } else {
         // Dome appears frozen — STOP motor immediately
         if (frozenMotorNum == 1) {
@@ -1099,6 +1254,9 @@ void frozenDomeStateMachine() {
         } else {
           mot2dir = 0; stop2reason = 6;
         }
+        // FIX (P1): count the attempt where it is detected, not only after the retry wait
+        frozenRetryCount++;
+        lastFrozenDetect = now;
 
         // Enter gravity wait phase
         frozenDomeState = FD_GRAVITY_WAIT;
@@ -1106,68 +1264,99 @@ void frozenDomeStateMachine() {
 
         // Send event notification
         char detail[32];
-        snprintf(detail, sizeof(detail), "S%d attempt %d/%d", frozenMotorNum, frozenRetryCount + 1, FROZEN_MAX_RETRIES);
+        snprintf(detail, sizeof(detail), "S%d attempt %d/%d", frozenMotorNum, frozenRetryCount, FROZEN_MAX_RETRIES);
         sendEventNotification("frozen_dome", detail);
       }
       break;
 
     case FD_GRAVITY_WAIT:
+      if (curDir != 0) { frozenDomeState = FD_IDLE; break; }   // somebody started the motor
       // Motor is off — wait 20 seconds for gravity to separate frozen halves
       if (now - frozenStateTimer >= FROZEN_GRAVITY_WAIT) {
         frozenDomeState = FD_SECOND_CHECK;
       }
       break;
 
-    case FD_SECOND_CHECK:
+    case FD_SECOND_CHECK: {
       // Re-read ToF — did gravity separate the halves?
+      // FIX (P1): motors are started atomically and only if still idle and not overridden
+      bool ok = true;
       if (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE)) {
         // Gravity worked! Resume opening
         if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-          startMotor1(CLOSE, dynTimeout_M1_Open); stop1reason = 0;
+          ok = fdStartMotor(1, CLOSE, dynTimeout_M1_Open); if (ok) stop1reason = 0;
         } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-          startMotor2(CLOSE, dynTimeout_M2_Open); stop2reason = 0;
+          ok = fdStartMotor(2, CLOSE, dynTimeout_M2_Open); if (ok) stop2reason = 0;
         }
-        frozenDomeState = FD_IDLE;
-        frozenRetryCount = 0;
-        sendEventNotification("frozen_clear", "Gravity separated halves");
+        if (ok) {
+          // FIX (P1): the resumed opening is monitored again (a re-freeze mid-travel was
+          // not detected before); the counter restarts for this opening
+          frozenRetryCount = 0;
+          frozenDomeState = FD_MONITORING;
+          frozenCheckTicks = 0;
+          frozenCheckActive = true;
+          sendEventNotification("frozen_clear", "Gravity separated halves");
+        } else if (frozenRetryCount >= FROZEN_MAX_RETRIES) {
+          frozenDomeState = FD_LOCKOUT;
+          sendEventNotification("frozen_lockout", "3 attempts failed - dome locked", true);
+        } else {
+          frozenDomeState = FD_IDLE;
+        }
       } else {
         // Still frozen — reverse motor to close
         if (frozenMotorNum == 1 && !digitalRead(lim1open)) {
-          startMotor1(OPEN, dynTimeout_M1_Close); stop1reason = 6;
+          ok = fdStartMotor(1, OPEN, dynTimeout_M1_Close); if (ok) stop1reason = 6;
         } else if (frozenMotorNum == 2 && !digitalRead(lim2open)) {
-          startMotor2(OPEN, dynTimeout_M2_Close); stop2reason = 6;
+          ok = fdStartMotor(2, OPEN, dynTimeout_M2_Close); if (ok) stop2reason = 6;
         }
-        frozenDomeState = FD_CLOSING;
+        if (ok) frozenDomeState = FD_CLOSING;
+        else if (frozenRetryCount >= FROZEN_MAX_RETRIES) {
+          frozenDomeState = FD_LOCKOUT;
+          sendEventNotification("frozen_lockout", "3 attempts failed - dome locked", true);
+        } else frozenDomeState = FD_IDLE;
       }
       break;
+    }
 
     case FD_CLOSING:
       // Wait for close to complete (motor reaches limit or stops)
-      if ((frozenMotorNum == 1 && mot1dir == 0) || (frozenMotorNum == 2 && mot2dir == 0)) {
+      if (curDir == 0) {
+        // FIX (P1): only a close that ran to the limit (stop reason 0/6) may retry; a stop by
+        // button/SWSTOP (1), web (2), auto-close (3/4) or timeout (5) ends the cycle.
+        byte r = (frozenMotorNum == 1) ? stop1reason : stop2reason;
+        if (r != 0 && r != 6) {
+          if (r == 5) sendEventNotification("frozen_dome", "auto-close TIMEOUT - cycle abandoned");
+          frozenDomeState = FD_IDLE;
+          break;
+        }
         frozenDomeState = FD_RETRY_WAIT;
         frozenStateTimer = millis();
       }
       break;
 
     case FD_RETRY_WAIT:
+      if (curDir != 0) { frozenDomeState = FD_IDLE; break; }   // somebody started the motor
       // Wait 5 seconds before next retry
       if (now - frozenStateTimer >= FROZEN_RETRY_WAIT) {
-        frozenRetryCount++;
         if (frozenRetryCount >= FROZEN_MAX_RETRIES) {
           // All retries exhausted — LOCKOUT
           frozenDomeState = FD_LOCKOUT;
-          sendEventNotification("frozen_lockout", "3 attempts failed - dome locked");
+          sendEventNotification("frozen_lockout", "3 attempts failed - dome locked", true);   // urgent: bypasses the 10 s limiter
         } else {
           // Re-issue open command for next attempt
+          bool ok = false;
           if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-            startMotor1(CLOSE, dynTimeout_M1_Open); stop1reason = 0;
+            ok = fdStartMotor(1, CLOSE, dynTimeout_M1_Open); if (ok) stop1reason = 0;
           } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-            startMotor2(CLOSE, dynTimeout_M2_Open); stop2reason = 0;
+            ok = fdStartMotor(2, CLOSE, dynTimeout_M2_Open); if (ok) stop2reason = 0;
           }
-          // Go back to monitoring
-          frozenDomeState = FD_MONITORING;
-          frozenCheckTicks = 0;
-          frozenCheckActive = true;
+          if (ok) {
+            frozenDomeState = FD_MONITORING;
+            frozenCheckTicks = 0;
+            frozenCheckActive = true;
+          } else {
+            frozenDomeState = FD_IDLE;   // somebody else took the motor (count < max here)
+          }
         }
       }
       break;
@@ -1244,10 +1433,10 @@ void checkConflictingSignals() {
  * @param type   Event type string (e.g., "frozen_dome", "sensor_fail")
  * @param detail Additional detail string
  */
-void sendEventNotification(const char* type, const char* detail) {
-  // Rate limiting
+void sendEventNotification(const char* type, const char* detail, bool urgent) {
+  // Rate limiting (FIX (P1): a lockout follows its verdict within seconds and must not be dropped)
   unsigned long now = millis();
-  if (now - lastEventSentTime < EVENT_MIN_INTERVAL) return;
+  if (!urgent && now - lastEventSentTime < EVENT_MIN_INTERVAL) return;
 
   // Skip if network not ready
   if (!ethernet_initialized || !networkMonitoringEnabled) return;
@@ -1267,7 +1456,7 @@ void sendEventNotification(const char* type, const char* detail) {
 
   wdt_reset();
   EthernetClient eventClient;
-  eventClient.setTimeout(2000);
+  eventClient.setConnectionTimeout(1500);
 
   if (eventClient.connect(remoteStationIp, tickLogServerPort)) {
     eventClient.print(F("GET /event?type="));
@@ -1276,11 +1465,7 @@ void sendEventNotification(const char* type, const char* detail) {
     eventClient.print(encoded);
     eventClient.print(F("&temp="));
     if (currentTemp_x10 != -9990) {
-      eventClient.print(currentTemp_x10 / 10);
-      eventClient.print(F("."));
-      int frac = currentTemp_x10 % 10;
-      if (frac < 0) frac = -frac;
-      eventClient.print(frac);
+      printTempX10(eventClient, currentTemp_x10);
     } else {
       eventClient.print(F("-999"));
     }
@@ -1316,28 +1501,43 @@ void sendEventNotification(const char* type, const char* detail) {
  * Sets ethernet_initialized flag on success.
  */
 void setupEthernet() {
+  // FIX (P1): a REAL chip reset, ONCE per call. The chip-select toggle that was here does not
+  // reset the W5500, and after the first W5100Class::init() every Ethernet.begin() only
+  // rewrites MAC/IP - so a wedged chip and leaked sockets survived every "reset", and each
+  // call added another LISTEN socket via server.begin() until all 8 were used up (outbound
+  // connect() then fails -> false IP auto-close). A software reset (MR = 0x80) closes all
+  // sockets and restores the chip defaults the library relies on (2 KB socket buffers).
+  // The reset restarts the PHY; the three attempts below give it up to 15 s to re-link
+  // without resetting it again in between.
+  lastEthernetAttempt = millis();
+  const bool linkWasOff = (Ethernet.linkStatus() == LinkOFF);   // cable out at entry: one short attempt only
+  wdt_reset();
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+  SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
+  W5100.writeMR(0x80);                                        // MR RST bit = software reset
+  for (byte k = 0; k < 20 && W5100.readMR() != 0; k++) delay(1);   // the library's softReset(), which is private
+  SPI.endTransaction();
+  delay(50);
+
   for (int attempt = 1; attempt <= 3; attempt++) {
     wdt_reset();  // Reset watchdog before each attempt (delays can accumulate past 8s)
 
-    // Hardware reset via Chip Select pin toggle
-    // This recovers from stuck states in the W5100/W5500 chip
-    pinMode(10, OUTPUT);
-    digitalWrite(10, HIGH);
-    delay(100);
-    digitalWrite(10, LOW);
-    delay(100);
-    digitalWrite(10, HIGH);
-
     // Initialize Ethernet with static IP (no DHCP for reliability)
     Ethernet.begin(mac, ip);
-    wdt_reset();  // Reset before long stabilization wait
-    delay(5000);  // W5100 needs time to stabilize
-    wdt_reset();  // Reset after stabilization wait
+    wdt_reset();
+    // FIX (P1): wait for the PHY to come up (up to 5 s per attempt, was a fixed 5 s) so a
+    // rebuild costs ~1-2 s instead of 5.5 s; a W5100 (link state Unknown) waits the full 5 s.
+    for (byte w = 0; w < (linkWasOff ? 20 : 50) && Ethernet.linkStatus() != LinkON; w++) delay(100);
+    wdt_reset();
 
-    // Verify physical link is connected
+    // Verify physical link is connected. FIX (P1): with the cable out there is nothing to
+    // retry - give up now (networkWatchdog() tries again a minute later) instead of
+    // blocking loop() for 3 x 7 s. If the link was up at entry it is only the PHY
+    // re-negotiating after the reset: keep waiting in the next attempt.
     if (Ethernet.linkStatus() == LinkOFF) {
-      delay(2000);
-      continue;  // Retry
+      if (linkWasOff) break;
+      continue;
     }
 
     // Verify IP was assigned correctly
@@ -1401,34 +1601,97 @@ void networkWatchdog() {
     return;  // Skip all other network checks in standalone mode
   }
 
-  // Periodic health check (network mode only)
+  // Periodic health check (network mode only): flags the stack as dead
   if (currentTime - lastNetworkCheck > NETWORK_CHECK_INTERVAL) {
     lastNetworkCheck = currentTime;
-
-    // --- Network mode: monitor health ---
-    // Check if Ethernet cable is still connected
     if (Ethernet.linkStatus() == LinkOFF) {
-      ethernet_initialized = false;
-      // DON'T try to recover here - let auto-close handle cable removal
-      // Calling setupEthernet() would block for ~22 seconds and interfere
-      // with the auto-close timing in checkRemoteConnectionAndAutoClose()
-      return;
-    }
-
-    // Check if IP stack is functional (only if link is up)
-    IPAddress currentIP = Ethernet.localIP();
-    if (currentIP == IPAddress(0,0,0,0)) {
-      // Link is up but IP lost - software issue, try to recover
-      ethernet_initialized = false;
-      setupEthernet();
+      ethernet_initialized = false;   // cable out: the auto-close logic handles it
+    } else if (Ethernet.localIP() == IPAddress(0,0,0,0)) {
+      ethernet_initialized = false;   // link up but IP lost: software issue
     }
   }
 
-  // Preventive hourly reset for long-term stability (only when everything is working)
-  if (networkMonitoringEnabled && ethernet_initialized &&
+  // FIX (P1): rebuild the stack whenever it is flagged dead and the link is back. Before,
+  // nothing ever set ethernet_initialized back to true once a health check had seen the
+  // link down (the W5500 keeps its static IP, so the old "IP lost" test never fired):
+  // every IP check then counted as a failure and each dome opening ended in a false
+  // "IP Fail Auto-Close" after ~15 min - until reboot. Rate-limited to one attempt per
+  // minute, deferred while a motor runs (setupEthernet() blocks loop() for up to ~16 s).
+  if (!ethernet_initialized && mot1dir == 0 && mot2dir == 0 &&
+      currentTime - lastEthernetAttempt > 60000UL && Ethernet.linkStatus() != LinkOFF) {
+    setupEthernet();
+    return;   // lastEthernetReset just moved past currentTime: skip the 8 h test this pass
+  }
+
+  // Preventive reset every 8 h for long-term stability (only when everything is working).
+  // FIX (P1): it is a real chip reset now, so only with the dome fully CLOSED and the motors
+  // idle: a PHY that takes long to re-link must never trigger the cable auto-close on an
+  // open dome, and a STOP/CLOSE must not be delayed by the block.
+  if (networkMonitoringEnabled && ethernet_initialized && mot1dir == 0 && mot2dir == 0 &&
+      digitalRead(lim1open) && digitalRead(lim2open) &&
       (currentTime - lastEthernetReset > ETHERNET_RESET_INTERVAL)) {
     setupEthernet();
   }
+}
+
+//=============================================================================
+// W5500 SOCKET HYGIENE (P1)
+//=============================================================================
+// (1) A peer that connects and never sends a byte (browser pre-connect from a phone that
+//     then leaves Wi-Fi, port scan, dead peer) keeps a hardware socket ESTABLISHED forever:
+//     EthernetServer::available() only returns sockets that have data, so the sketch never
+//     closes it. After 7 such sockets every outbound connect() (IP check, tick log, events)
+//     fails and the dome is auto-closed for no reason - until reboot. Drop idle clients.
+// (2) One LISTEN socket accepts one connection; while it is busy a second SYN is refused,
+//     which is how a rain-checker close command gets lost when a browser tab and NINA are
+//     polling at the same moment. Keep two listeners armed.
+#define WEB_PORT            80
+#define SOCKET_IDLE_LIMIT   30  // s without a request byte before an idle client is dropped
+#define SOCKET_LISTENERS     2  // listening sockets kept ready on port 80
+#define SOCKET_DROP_TIMEOUT 100 // ms to wait for the FIN handshake of a presumably dead peer
+
+void socketHygiene() {
+  static unsigned long lastSweep = 0;
+  static byte idleSecs[MAX_SOCK_NUM];
+  unsigned long now = millis();
+  if (now - lastSweep < 1000) return;
+  lastSweep = now;
+  if (!ethernet_initialized) return;
+
+  byte listening = 0, oldest = MAX_SOCK_NUM, oldestIdle = 0;
+  bool dropped = false;
+  for (byte i = 0; i < MAX_SOCK_NUM; i++) {
+    if (EthernetServer::server_port[i] != WEB_PORT) { idleSecs[i] = 0; continue; }
+    EthernetClient c(i);
+    byte st = c.status();
+    if (st == SnSR::LISTEN) {
+      listening++;
+      idleSecs[i] = 0;
+    } else if (st == SnSR::ESTABLISHED && c.available() == 0) {
+      if (idleSecs[i] < 255) idleSecs[i]++;
+      if (idleSecs[i] > oldestIdle) { oldestIdle = idleSecs[i]; oldest = i; }
+      // at most ONE drop per sweep with a short FIN wait: a dead peer never answers the
+      // FIN, and several stop() calls in one loop() pass would add up towards the watchdog
+      if (idleSecs[i] >= SOCKET_IDLE_LIMIT && !dropped) {
+        c.setConnectionTimeout(SOCKET_DROP_TIMEOUT);
+        c.stop();
+        idleSecs[i] = 0;
+        dropped = true;
+      }
+    } else {
+      idleSecs[i] = 0;
+    }
+  }
+  // no listener left and every socket is held by an idle client (pre-connect burst from a
+  // phone): reclaim the longest-idle one now instead of 30 s later, so an incoming close
+  // command is not refused for half a minute
+  if (listening == 0 && !dropped && oldest < MAX_SOCK_NUM && oldestIdle >= 2) {
+    EthernetClient c(oldest);
+    c.setConnectionTimeout(SOCKET_DROP_TIMEOUT);
+    c.stop();
+    idleSecs[oldest] = 0;
+  }
+  while (listening < SOCKET_LISTENERS) { server.begin(); listening++; }   // no-op when no socket is free
 }
 
 //=============================================================================
@@ -1448,16 +1711,22 @@ void setup() {
     }
   #endif
 
+  // --- Motor outputs LOW as the very first thing (FIX (P1): the H-bridge inputs float from
+  // reset until pinMode; keep that window as short as possible; the bootloader window before
+  // it can only be covered by pull-downs on the driver inputs) ---
+  pinMode(motor1a, OUTPUT); digitalWrite(motor1a, LOW);
+  pinMode(motor1b, OUTPUT); digitalWrite(motor1b, LOW);
+  pinMode(motor2a, OUTPUT); digitalWrite(motor2a, LOW);
+  pinMode(motor2b, OUTPUT); digitalWrite(motor2b, LOW);
+
+  // --- Enable hardware watchdog FIRST ---
+  // FIX (P1): was enabled at the very end of setup(). Any hang before that point (sensor
+  // init, Ethernet init) froze the controller permanently with no reset. Every blocking
+  // step in setup() is < 8 s or calls wdt_reset() in between.
+  wdt_enable(WDTO_8S);
+
   // --- Load persistent counters from EEPROM ---
   initializeEEPROM();
-
-  // --- Initialize sensors BEFORE Ethernet (sensors are fast, Ethernet is slow) ---
-  // DS18B20: ~10ms init + 800ms first read — temperature ready for first motor command
-  setupDS18B20();
-
-  // VL53L0X: ~10ms I2C init — starts continuous measurement mode
-  setupVL53L0X();
-  loadToFCalibration();
 
   // --- Initialize motor control state ---
   mot1dir = 0; mot2dir = 0;           // Motors off
@@ -1509,6 +1778,18 @@ void setup() {
   Serial.println(F("Setup: Timer ISR configured - buttons now active."));
   #endif
 
+  // --- Initialize sensors AFTER pins/ISR (FIX (P1): buttons and motors work even if a sensor
+  // init misbehaves) and BEFORE Ethernet (sensors are fast, Ethernet is slow) ---
+  // DS18B20: ~10ms init + 800ms first read — temperature ready for first motor command
+  wdt_reset();
+  setupDS18B20();
+
+  // VL53L0X: I2C init — starts continuous measurement mode (up to ~5 s on a half-dead bus)
+  wdt_reset();
+  setupVL53L0X();
+  loadToFCalibration();
+  wdt_reset();
+
   // --- Quick cable detection before full Ethernet init ---
   // Minimal SPI init to check if cable is present
   delay(100);
@@ -1539,13 +1820,9 @@ void setup() {
     #endif
   }
 
-  // --- Enable hardware watchdog ---
-  // System auto-resets if loop() blocks for more than 8 seconds.
-  // This recovers from Ethernet library hangs or other lockups.
-  // NOTE: 8 seconds is the AVR hardware maximum (WDTO_8S). No longer
-  // timeout is available. setupEthernet() uses wdt_reset() between
-  // delays to prevent false watchdog triggers during network recovery.
-  wdt_enable(WDTO_8S);
+  // Hardware watchdog (8 s, AVR maximum) has been running since the top of setup().
+  // setupEthernet() uses wdt_reset() between delays to prevent false triggers.
+  wdt_reset();
 }
 
 //=============================================================================
@@ -1621,8 +1898,20 @@ void checkRemoteConnectionAndAutoClose() {
         // *** Check for network problems ***
         bool linkDown = false;
         bool needsRecovery = false;
-        
-        if (Ethernet.linkStatus() == LinkOFF) {
+
+        // FIX (P2): the link state is one 1-byte SPI read per loop() pass next to two PWM motor
+        // drivers; a single corrupted read must not start the cable-removal auto-close. LinkOFF
+        // has to persist for 200 ms before the cable logic acts.
+        static unsigned long linkOffSince = 0;
+        EthernetLinkStatus linkNow = Ethernet.linkStatus();
+        if (linkNow == LinkOFF) {
+            if (linkOffSince == 0) linkOffSince = millis() | 1UL;
+            if (millis() - linkOffSince < 200UL) return;
+        } else {
+            linkOffSince = 0;
+        }
+
+        if (linkNow == LinkOFF) {
             linkDown = true;
             networkProblem = true;
 
@@ -1656,10 +1945,13 @@ void checkRemoteConnectionAndAutoClose() {
                     Serial.println(totalAutoCloses);
                     #endif
                 }
+                // FIX (P1): the safety event itself (not only a started motor) cancels a running
+                // frozen-dome cycle, so its retry can never re-open the dome with the network gone.
+                fdNoteCommand(FD_CMD_ALL);
                 cableRemovalAutoCloseTriggered = true;  // Prevent repeated triggering
             }
             return;  // Skip further checks while cable is out
-        } else if (Ethernet.linkStatus() == LinkON) {
+        } else if (linkNow == LinkON) {
             // Cable is back - reset the trigger flag
             if (cableRemovalAutoCloseTriggered) {
                 cableRemovalAutoCloseTriggered = false;
@@ -1678,28 +1970,10 @@ void checkRemoteConnectionAndAutoClose() {
             }
         }
         
-        // *** Auto-Recovery: Ethernet reinitialisieren wenn Link wieder da ist ***
-        static bool wasLinkDown = false;
-        if (wasLinkDown && !linkDown && !needsRecovery && ethernet_initialized) {
-            #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Network restored - reinitializing Ethernet"));
-            #endif
-            setupEthernet(); // Ethernet neu initialisieren
-            wasLinkDown = false;
-            // Reset fail counters on recovery
-            connectFailCount = 0;
-            firstFailTimestamp = 0;
-        } else if (linkDown || !ethernet_initialized) {
-            wasLinkDown = true;
-        }
-        
-        // IP-Recovery falls nötig
-        if (needsRecovery && ethernet_initialized) {
-            #if defined(SERIAL_DEBUG_IP)
-            Serial.println(F("IP Check: Attempting IP recovery"));
-            #endif
-            setupEthernet();
-        }
+        // FIX (P1): the "Auto-Recovery" block that used to be here was dead code (its flag was
+        // never set on a real link loss and it required ethernet_initialized==true). All
+        // rebuilds now happen in networkWatchdog(): rate-limited, deferred while a motor runs.
+        if (needsRecovery) ethernet_initialized = false;
         
         // Check connection with longer intervals
         if (millis() - lastConnectAttemptTimestamp >= connectCheckInterval) {
@@ -1725,7 +1999,7 @@ void checkRemoteConnectionAndAutoClose() {
             // Only try to connect if network is OK
             else if (!linkDown && !needsRecovery && ethernet_initialized) {
                 EthernetClient netClient;
-                netClient.setTimeout(3000);  // 3 second timeout (must be < 8s watchdog)
+                netClient.setConnectionTimeout(2000);  // 2 s bound for connect()/stop() (P2; was effectively 1 s), well below the 8 s watchdog
 
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.print(F("IP Check: Connecting to "));Serial.print(remoteStationIp);Serial.println(F("..."));
@@ -1751,6 +2025,7 @@ void checkRemoteConnectionAndAutoClose() {
                         netClient.stop();
                     }
                 }
+                wdt_reset();   // P2: connect()+stop() can take 4 s together
             }
             
             if (connectionOK) {
@@ -1760,13 +2035,13 @@ void checkRemoteConnectionAndAutoClose() {
                 
                 // STOPPE AUTO-CLOSE BEI ERFOLGREICHER VERBINDUNG
                 if (m1AutoClosedByIP && mot1dir == OPEN) {
-                    mot1dir = 0; stop1reason = 0; m1AutoClosedByIP = false;
+                    mot1dir = 0; stop1reason = 0; m1AutoClosedByIP = false; fdNoteCommand(FD_CMD_M1);
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F("IP Check: M1 Auto-Close STOPPED - Connection restored"));
                     #endif
                 }
                 if (m2AutoClosedByIP && mot2dir == OPEN) {
-                    mot2dir = 0; stop2reason = 0; m2AutoClosedByIP = false;
+                    mot2dir = 0; stop2reason = 0; m2AutoClosedByIP = false; fdNoteCommand(FD_CMD_M2);
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F("IP Check: M2 Auto-Close STOPPED - Connection restored"));
                     #endif
@@ -1840,6 +2115,7 @@ void checkRemoteConnectionAndAutoClose() {
                 #endif
             }
 
+            fdNoteCommand(FD_CMD_ALL);   // FIX (P1): the auto-close event cancels a frozen-dome cycle
             if (action_taken) {
                 totalAutoCloses++;
                 eepromDirty = true;
@@ -1862,6 +2138,52 @@ void checkRemoteConnectionAndAutoClose() {
         if (m2AutoClosedByIP) m2AutoClosedByIP = false;
     }
 }
+
+//=============================================================================
+// BOUNDED, BUFFERED PAGE WRITER (P1)
+//=============================================================================
+// EthernetClient::write() -> socketSend() waits WITHOUT a time bound for TX buffer space
+// while the socket stays ESTABLISHED. A browser that stops reading mid-page (phone put to
+// sleep: zero TCP window) blocked loop() until the 8 s watchdog rebooted the board with
+// the shutter stuck mid-travel and no auto-close (the network itself is healthy).
+// This wrapper waits at most PAGE_WRITE_TIMEOUT ms for buffer space and drops the client
+// otherwise, and batches the byte-wise print(F()) output into 64-byte TCP segments
+// instead of one segment per character (~5400 per page before).
+// Residual: the chip-level wait for the SEND acknowledge inside socketSend() is not
+// controllable from the sketch; the watchdog remains the backstop for that case.
+// handleWebClient() no longer calls client.flush() (unbounded in Ethernet 2.0.x): the
+// chip transmits buffered data before the FIN that stop() sends.
+#define PAGE_WRITE_TIMEOUT 500   // ms to wait for TX buffer space before dropping the client
+#define PAGE_TOTAL_TIMEOUT 3000  // ms for the whole page (a peer draining slowly must not add up to the watchdog)
+
+class PageWriter : public Print {
+ public:
+  explicit PageWriter(EthernetClient& c) : client(c), pageStart(millis()) {}
+  size_t write(uint8_t b) override {
+    if (failed) return 0;
+    buf[len++] = b;
+    if (len == sizeof(buf)) flushBuf();
+    return 1;
+  }
+  void flushBuf() {
+    if (failed || len == 0) return;
+    unsigned long t0 = millis();
+    while (client.availableForWrite() < (int)len) {
+      if (!client.connected() || millis() - t0 > PAGE_WRITE_TIMEOUT || millis() - pageStart > PAGE_TOTAL_TIMEOUT) {
+        failed = true; len = 0; client.setConnectionTimeout(200); client.stop(); return;
+      }
+      delay(1);
+    }
+    client.write(buf, len);
+    len = 0;
+  }
+ private:
+  EthernetClient& client;
+  unsigned long pageStart;
+  uint8_t buf[64];
+  byte len = 0;
+  bool failed = false;
+};
 
 //=============================================================================
 // WEB CLIENT HANDLER
@@ -1896,6 +2218,8 @@ void handleWebClient() {
   #endif
 
   boolean currentLineIsBlank = true;
+  bool inRequestLine = true;      // FIX (P1): '$' commands only count in "GET /?$x HTTP/1.1", never in headers
+  newInfo = false;                // FIX (P1): parser state must not leak from a truncated request
   unsigned long clientRequestStart = millis();
   bool action_parameter_in_url = false;
   bool plain_text_status_request = false;
@@ -1913,11 +2237,14 @@ void handleWebClient() {
     if (client.available()) {
       char c = client.read();
       if (newInfo && c == ' ') { newInfo = false; }
-      if (c == '$') { newInfo = true; }
+      if (c == '\n') { inRequestLine = false; }
+      if (c == '$' && inRequestLine) { newInfo = true; }
 
       if (newInfo && system_fully_ready) { 
         if (c >= '1' && c <= '5') { 
           action_parameter_in_url = true; 
+          // FIX (P1): tell the frozen-dome cycle which shutter got an external command
+          fdNoteCommand((c == '5') ? FD_CMD_ALL : ((c == '1' || c == '2') ? FD_CMD_M1 : FD_CMD_M2));
            #if defined(SERIAL_DEBUG_GENERAL)
               Serial.print(F("Web: Action param: $")); Serial.println(c);
            #endif
@@ -1937,7 +2264,7 @@ void handleWebClient() {
 
         // $U = Unlock dome from frozen lockout
         if (c == 'U' || c == 'u') {
-          if (frozenDomeState == FD_LOCKOUT) {
+          if (fdOpenBlocked()) {   // FIX (P1): also while the lockout is pending after the 3rd verdict
             frozenDomeState = FD_IDLE;
             frozenRetryCount = 0;
             frozenCheckActive = false;
@@ -1961,19 +2288,19 @@ void handleWebClient() {
               mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
           }
           if (!digitalRead(lim1open)) {
-              startMotor1(OPEN, dynTimeout_M1_Close);
-              stop1reason = 0; m1AutoClosedByIP = false;
+              if (mot1dir != OPEN) startMotor1(OPEN, dynTimeout_M1_Close);   // P2: a repeated command must not reload the timeout
+              stop1reason = 0; m1AutoClosedByIP = false;                    // ... but it still takes ownership of the motion
           }
         } else if (c == '2') {
           // $2 = OPEN Shutter 1 (physically) — check frozen lockout
-          if (frozenDomeState == FD_LOCKOUT) {
+          if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
             if (mot1dir != 0 && mot1dir != CLOSE) {
                 mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
             }
             if (!digitalRead(lim1closed)) {
-                startMotor1(CLOSE, dynTimeout_M1_Open);
+                if (mot1dir != CLOSE) startMotor1(CLOSE, dynTimeout_M1_Open);
                 stop1reason = 0; m1AutoClosedByIP = false;
             }
           }
@@ -1983,19 +2310,19 @@ void handleWebClient() {
               mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
           }
           if (!digitalRead(lim2open)) {
-              startMotor2(OPEN, dynTimeout_M2_Close);
+              if (mot2dir != OPEN) startMotor2(OPEN, dynTimeout_M2_Close);
               stop2reason = 0; m2AutoClosedByIP = false;
           }
         } else if (c == '4') {
           // $4 = OPEN Shutter 2 (physically) — check frozen lockout
-          if (frozenDomeState == FD_LOCKOUT) {
+          if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
             if (mot2dir != 0 && mot2dir != CLOSE) {
                 mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
             }
             if (!digitalRead(lim2closed)) {
-                startMotor2(CLOSE, dynTimeout_M2_Open);
+                if (mot2dir != CLOSE) startMotor2(CLOSE, dynTimeout_M2_Open);
                 stop2reason = 0; m2AutoClosedByIP = false;
             }
           }
@@ -2094,7 +2421,9 @@ void handleWebClient() {
           client.println(F("Connection: close")); 
           client.println();
         } else { 
-          sendFullHtmlResponse(client);
+          PageWriter page(client);   // FIX (P1): bounded wait for TX space, 64-byte segments
+          sendFullHtmlResponse(page);
+          page.flushBuf();
         } 
         break; 
       } 
@@ -2127,7 +2456,7 @@ void handleWebClient() {
  *
  * All strings use F() macro to store in flash, saving ~3KB of RAM.
  */
-void sendFullHtmlResponse(EthernetClient& client) {
+void sendFullHtmlResponse(Print& client) {
   client.println(F("HTTP/1.1 200 OK"));
   client.println(F("Content-Type: text/html; charset=utf-8"));
   client.println(F("Connection: close"));
@@ -2252,11 +2581,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
       // DS18B20 Temperature
       client.print(F("<tr><td>Temperature</td><td>"));
       if (ds18b20_connected && currentTemp_x10 != -9990) {
-        client.print(currentTemp_x10 / 10);
-        client.print(F("."));
-        int frac = currentTemp_x10 % 10;
-        if (frac < 0) frac = -frac;
-        client.print(frac);
+        printTempX10(client, currentTemp_x10);
         client.print(F(" C"));
       } else if (!ds18b20_connected) {
         client.print(F("Not connected"));
@@ -2283,11 +2608,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
       client.print(F("<tr><td>Timeout Mode</td><td>"));
       if (dynamicTimeoutActive) {
         client.print(F("Dynamic ("));
-        client.print(currentTemp_x10 / 10);
-        client.print(F("."));
-        int ft = currentTemp_x10 % 10;
-        if (ft < 0) ft = -ft;
-        client.print(ft);
+        printTempX10(client, currentTemp_x10);
         client.print(F("C)"));
       } else {
         client.print(F("Static fallback (6527 ticks)"));
@@ -2323,7 +2644,7 @@ void sendFullHtmlResponse(EthernetClient& client) {
         }
         if (frozenRetryCount > 0 && frozenDomeState != FD_IDLE) {
           client.print(F(" (attempt "));
-          client.print(frozenRetryCount + 1);
+          client.print(frozenRetryCount);
           client.print(F("/"));
           client.print(FROZEN_MAX_RETRIES);
           client.print(F(")"));
@@ -2530,6 +2851,7 @@ void loop() {
     pushInterruptDataIfReady(); // Push interrupted stop data if available
   }
 
+  if (networkMonitoringEnabled) socketHygiene();  // P1: drop dead clients, keep two listeners
   handleWebClient();  // Process any pending HTTP requests
 }
 
@@ -2560,6 +2882,7 @@ ISR(TIMER2_COMPA_vect) {
   // Highest priority - immediately stops all motors when pressed
   if (!digitalRead(SWSTOP)) {
     if (!swstop_pressed_flag) {
+      fdExternalCommand |= FD_CMD_ALL;   // FIX (P1): STOP cancels a frozen-dome cycle even if motors are already off
       if (mot1dir != 0 || mot2dir != 0) {
         mot1dir = 0; mot2dir = 0;
         stop1reason = 1; stop2reason = 1;
@@ -2655,9 +2978,9 @@ ISR(TIMER2_COMPA_vect) {
 
   // Apply PWM to motor pins based on direction
   if (mot1dir == OPEN)  { digitalWrite(motor1a, LOW); analogWrite(motor1b, mot1speed); }
-  if (mot1dir == CLOSE) { analogWrite(motor1a, mot1speed); digitalWrite(motor1b, LOW); }
+  if (mot1dir == CLOSE) { digitalWrite(motor1b, LOW); analogWrite(motor1a, mot1speed); }   // P2: release old side first
   if (mot2dir == OPEN)  { digitalWrite(motor2a, LOW); analogWrite(motor2b, mot2speed); }
-  if (mot2dir == CLOSE) { analogWrite(motor2a, mot2speed); digitalWrite(motor2b, LOW); }
+  if (mot2dir == CLOSE) { digitalWrite(motor2b, LOW); analogWrite(motor2a, mot2speed); }   // P2: release old side first
 
   //--- PHYSICAL BUTTON HANDLING ---
   // Debounced (cnt > 6 = ~100ms), toggle behavior:
@@ -2665,7 +2988,7 @@ ISR(TIMER2_COMPA_vect) {
   // - If motor stopped: start in button's direction (if not at limit)
   // - Open buttons (SW1down, SW2down) blocked during frozen lockout
   if (!digitalRead(SW1up) && cnt > 6 && !sw1up_pressed_flag) {
-    sw1up_pressed_flag = true; cnt = 0;
+    sw1up_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M1;
     if (mot1dir) { mot1dir = 0; stop1reason = 1; m1AutoClosedByIP = false; }
     else if (!digitalRead(lim1open)) {
         mot1dir = OPEN; mot1timer = dynTimeout_M1_Close; stop1reason = 0; m1AutoClosedByIP = false;
@@ -2675,9 +2998,9 @@ ISR(TIMER2_COMPA_vect) {
     #endif
   }
   if (!digitalRead(SW1down) && cnt > 6 && !sw1down_pressed_flag) {
-    sw1down_pressed_flag = true; cnt = 0;
+    sw1down_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M1;
     if (mot1dir) { mot1dir = 0; stop1reason = 1; m1AutoClosedByIP = false; }
-    else if (frozenDomeState != FD_LOCKOUT && !digitalRead(lim1closed)) {
+    else if (!fdOpenBlocked() && !digitalRead(lim1closed)) {
         mot1dir = CLOSE; mot1timer = dynTimeout_M1_Open; stop1reason = 0; m1AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)
@@ -2685,7 +3008,7 @@ ISR(TIMER2_COMPA_vect) {
     #endif
   }
   if (!digitalRead(SW2up) && cnt > 6 && !sw2up_pressed_flag) {
-    sw2up_pressed_flag = true; cnt = 0;
+    sw2up_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M2;
     if (mot2dir) { mot2dir = 0; stop2reason = 1; m2AutoClosedByIP = false; }
     else if (!digitalRead(lim2open)) {
         mot2dir = OPEN; mot2timer = dynTimeout_M2_Close; stop2reason = 0; m2AutoClosedByIP = false;
@@ -2695,9 +3018,9 @@ ISR(TIMER2_COMPA_vect) {
     #endif
   }
   if (!digitalRead(SW2down) && cnt > 6 && !sw2down_pressed_flag) {
-    sw2down_pressed_flag = true; cnt = 0;
+    sw2down_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M2;
     if (mot2dir) { mot2dir = 0; stop2reason = 1; m2AutoClosedByIP = false; }
-    else if (frozenDomeState != FD_LOCKOUT && !digitalRead(lim2closed)) {
+    else if (!fdOpenBlocked() && !digitalRead(lim2closed)) {
         mot2dir = CLOSE; mot2timer = dynTimeout_M2_Open; stop2reason = 0; m2AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)

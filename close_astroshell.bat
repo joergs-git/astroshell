@@ -22,12 +22,12 @@ REM Requirements: curl (included in Windows 10+)
 REM ============================================================================
 REM --- Close West half first ---
 echo [%date% %time%] Closing West...
-curl -s -X GET http://192.168.1.177/$3 >nul 2>&1
+curl -s --connect-timeout 5 --max-time 10 --retry 3 --retry-connrefused --retry-delay 2 -X GET http://192.168.1.177/$3 >nul 2>&1
 REM --- Wait for West to clear before closing East ---
 timeout /t 3 /nobreak >nul
 REM --- Close East half ---
 echo [%date% %time%] Closing East...
-curl -s -X GET http://192.168.1.177/$1 >nul 2>&1
+curl -s --connect-timeout 5 --max-time 10 --retry 3 --retry-connrefused --retry-delay 2 -X GET http://192.168.1.177/$1 >nul 2>&1
 REM --- Send Pushover notification ---
 echo [%date% %time%] Sending notification...
 curl -s ^

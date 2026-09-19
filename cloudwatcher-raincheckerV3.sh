@@ -122,6 +122,7 @@ LAST_SCHEDULED_CHECK="/home/aagsolo/LASTSCHEDULEDCHECK"
 CLOSE_VERIFY_DELAY=180          # Seconds to wait before verifying (3 min)
 CLOSE_VERIFY_TIME="/home/aagsolo/CLOSEVERIFYTIME"
 CLOSE_VERIFY_ALERTED="/home/aagsolo/CLOSEVERIFYALERTED"
+CLOSE_PENDING="/home/aagsolo/CLOSEPENDING"           # close command not yet delivered (P1)
 
 #==============================================================================
 # LOGGING FUNCTIONS
@@ -183,6 +184,22 @@ get_rain_value() {
 }
 
 # Check dome status via HTTP
+# Send a dome command ($1 = command letter, $2 = log text) with retries.
+# The Arduino serves one request at a time; while it does, the next connection is refused.
+# Retry a few times and report the result instead of ignoring curl's exit code.
+send_dome_cmd() {
+    local cmd="$1" text="$2" attempt
+    for attempt in 1 2 3 4 5; do
+        log_message "$text ($DOME_IP/?\$$cmd) attempt $attempt"
+        if curl -s --connect-timeout 3 --max-time 10 "http://$DOME_IP/?\$$cmd" > /dev/null 2>&1; then
+            return 0
+        fi
+        (( attempt < 5 )) && sleep 2
+    done
+    log_message "ERROR: dome command \$$cmd could not be delivered after 5 attempts"
+    return 1
+}
+
 check_dome_status() {
     local status
     status=$(curl -s --connect-timeout 5 --max-time 10 "http://$DOME_IP/?\$S" 2>/dev/null | tr -d '\r\n\t ' | tr '[:lower:]' '[:upper:]')
@@ -365,6 +382,11 @@ while true; do
                     if [[ "$DOME_STATUS" != "CLOSED" ]]; then
                         log_message "CLOSE VERIFICATION FAILED: Dome still $DOME_STATUS after $((CLOSE_VERIFY_DELAY / 60)) minutes!"
                         send_pushover "Dome Close Failed!" "Dome is still $DOME_STATUS after close command! Check manually. Rain value: $RAIN_VALUE" 1
+                        # FIX (P1): one more close attempt while it still rains and the controller
+                        # answers (an unreachable dome is not retried here; a dome re-opened in rain is closed again)
+                        if (( RAIN_VALUE < RAIN_THRESHOLD )) && [[ "$DOME_STATUS" != "ERROR" ]]; then
+                            send_dome_cmd 3 "Re-sending WEST close"; sleep 3; send_dome_cmd 1 "Re-sending EAST close"
+                        fi
                     else
                         log_message "Close verification: Dome successfully closed"
                         send_pushover "Dome Closed OK" "Dome successfully closed after rain alert. Rain value: $RAIN_VALUE" 0
@@ -401,25 +423,42 @@ while true; do
 
             if [[ "$DOME_STATUS" == "CLOSED" ]]; then
                 log_message "Dome already closed, sending notification only"
+                rm -f "$CLOSE_PENDING"
                 send_pushover "Rain Alert" "Rain detected (Value: $RAIN_VALUE). Dome already closed." 1
             else
-                # Send alert
-                send_pushover "RAIN! Closing Dome" "Rain value: $RAIN_VALUE - Closing dome now!" 1
+                # Send alert (not again while a failed close is being retried: that alert is already out)
+                if [[ ! -f "$CLOSE_PENDING" ]]; then
+                    send_pushover "RAIN! Closing Dome" "Rain value: $RAIN_VALUE - Closing dome now!" 1
+                fi
 
                 # Close dome (West first, then East)
-                log_message "Closing WEST shutter ($DOME_IP/?\$3)"
-                curl -s --max-time 10 "http://$DOME_IP/?\$3" > /dev/null 2>&1
+                # FIX (P1): send with retries and check the result. The controller refuses a
+                # connection for ~1 s while it serves another client (browser tab, NINA poll),
+                # and a silently lost close command means an open dome in rain.
+                delivered=1
+                send_dome_cmd 3 "Closing WEST shutter" || delivered=0
                 sleep 3
+                send_dome_cmd 1 "Closing EAST shutter" || delivered=0
 
-                log_message "Closing EAST shutter ($DOME_IP/?\$1)"
-                curl -s --max-time 10 "http://$DOME_IP/?\$1" > /dev/null 2>&1
-
-                log_message "Dome close commands sent"
-
-                # Start close verification timer
-                get_timestamp > "$CLOSE_VERIFY_TIME"
-                rm -f "$CLOSE_VERIFY_ALERTED"
-                log_message "Close verification scheduled in $((CLOSE_VERIFY_DELAY / 60)) minutes"
+                if (( delivered )); then
+                    log_message "Dome close commands delivered"
+                    rm -f "$CLOSE_PENDING"
+                    # Start close verification timer
+                    get_timestamp > "$CLOSE_VERIFY_TIME"
+                    rm -f "$CLOSE_VERIFY_ALERTED"
+                    log_message "Close verification scheduled in $((CLOSE_VERIFY_DELAY / 60)) minutes"
+                else
+                    # Not delivered (controller rebooting / unreachable): alert once, keep the
+                    # rain flag CLEAR so the whole close action is repeated after the cooldown
+                    # for as long as it rains.
+                    if [[ ! -f "$CLOSE_PENDING" ]]; then
+                        send_pushover "Dome Close Command FAILED" "Close command could not be delivered to $DOME_IP - will retry every $((RAIN_ACTION_COOLDOWN / 60)) min while it rains. Rain value: $RAIN_VALUE" 1
+                        touch "$CLOSE_PENDING"
+                    fi
+                    log_message "Dome close NOT delivered - retry after cooldown"
+                    sleep "$RAIN_ACTION_COOLDOWN"
+                    continue
+                fi
             fi
 
             # Set rain flag
@@ -448,6 +487,7 @@ while true; do
                 fi
 
                 # Clear rain flag
+                rm -f "$CLOSE_PENDING"   # P1: the rain episode is over
                 rm -f "$RAIN_TRIGGERED"
                 rm -f "$LAST_RAIN_TIME"
             else
@@ -459,6 +499,17 @@ while true; do
                     remaining=$(( DRY_COOLDOWN_MINUTES - ((now - last_rain) / 60) ))
                     log_message "Dry (Value: $RAIN_VALUE) but in cooldown, ${remaining}min remaining"
                 fi
+            fi
+        elif [[ -f "$CLOSE_PENDING" ]]; then
+            # FIX: the close command was never delivered during the last rain episode, so
+            # RAIN_TRIGGERED was never set and the cleanup above does not run. Drop the pending
+            # marker after the dry cooldown, otherwise the next rain episode would neither send
+            # the "Closing Dome" alert nor a new command-failure alert.
+            if is_dry_cooldown_passed; then
+                log_message "Dry for $DRY_COOLDOWN_MINUTES+ minutes (Value: $RAIN_VALUE) - dropping undelivered close from previous rain"
+                send_pushover "Weather Clear" "Dry for $DRY_COOLDOWN_MINUTES+ minutes. Note: the rain close command was never delivered to the dome. Rain value: $RAIN_VALUE" 0
+                rm -f "$CLOSE_PENDING"
+                rm -f "$LAST_RAIN_TIME"
             fi
         fi
         # If never rained (no RAIN_TRIGGERED), just continue silently
