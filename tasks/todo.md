@@ -1,6 +1,6 @@
 # AstroShell — Task Tracking
 
-## In Progress (2026-10-24) — Dual-site firmware v4.2.0, branch feature/dual-site-wiring
+## Completed (2026-10-24) — Dual-site firmware v4.2.0, PR #3 merged into main (c2c0350)
 
 Decisions taken with the user (2026-10-24):
 - D1 wiring switch: compile-time site profile (`SITE_GERMANY` default / `SITE_PORTUGAL`)
@@ -26,9 +26,12 @@ Done:
 - [x] Rosetta installed by the user; local arduino-cli build with the IDE toolchain: SITE=1 50514 B flash / 1181 B RAM, SITE=2 50514 B / 1180 B, no warnings
 - [x] User: no VL53L0X exists on either dome -> `ENABLE_TOF_FROZEN_DETECTION 0` (default, overridable). I2C/ToF layer compiled out, frozen logic inert; host suite now 4 binaries (site x ToF): 32 + 41 scenarios per site, all green. Sizes without ToF layer: 43650 B flash / 870 B RAM (SITE=1), 43652 B / 871 B (SITE=2); with ToF 50514 B / 1181 B
 
-Open:
-- [ ] Merge PR #3 after user approval (CI green, PR marked ready)
-- [ ] Portugal commissioning with the dome in intermediate position (checklist in README / CLAUDE.md)
+- [x] PR #3 merged into main by the user's instruction (merge commit c2c0350), branch deleted
+
+## Next
+- [ ] Portugal: flash with `#define SITE SITE_PORTUGAL`, commissioning with the dome in intermediate position (checklist in README / CLAUDE.md)
+- [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON
+- [ ] When a VL53L0X is mounted: `ENABLE_TOF_FROZEN_DETECTION 1` (per site if only one dome), calibrate with `$C`
 
 ## Results (2026-10-24)
 - One firmware source for both domes; Germany behaviour byte-identical except the intended `$W` additions and the rate-limiter fix (verified by an independent review that substituted the Germany macros and diffed against main).
