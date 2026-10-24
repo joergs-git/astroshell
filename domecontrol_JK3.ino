@@ -36,6 +36,9 @@
 // - Event rate limiters no longer swallow the first event after boot (their timestamps started at 0:
 //   normal events were dropped for 10 s, conflict events for 5 min after every reset).
 // - Web UI: "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row.
+// - ENABLE_TOF_FROZEN_DETECTION (default 0): no VL53L0X is mounted on either dome yet, so the I2C/ToF
+//   layer is compiled out (no Wire/VL53L0X libraries, no I2C traffic, pins 20/21 untouched). The
+//   frozen-dome state machine, $C/$U and the conflict check stay in the code but are inert.
 //
 // v4.1.0 Changes (network/robustness review):
 // - Ethernet: single chip reset per stack rebuild, health check flags dead stack (LinkOFF / 0.0.0.0),
@@ -99,6 +102,15 @@
   #error "SITE must be SITE_GERMANY or SITE_PORTUGAL"
 #endif
 
+// VL53L0X frozen-dome detection. No sensor is mounted on either dome yet (v4.2.0), so the whole
+// I2C/ToF layer is compiled out: no Wire/VL53L0X libraries, no I2C traffic, pins 20/21 untouched.
+// The frozen-dome state machine, $C/$U and the conflict check stay compiled but are inert because
+// the sensor is permanently "disconnected". Set to 1 once a sensor is installed (move it into the
+// site blocks above if only one dome gets one); -DENABLE_TOF_FROZEN_DETECTION=1 overrides (CI).
+#ifndef ENABLE_TOF_FROZEN_DETECTION
+#define ENABLE_TOF_FROZEN_DETECTION 0
+#endif
+
 // --- Motor Timing Configuration ---
 // Motor timeout in ISR ticks (~61 Hz). Safety limit if limit switches fail.
 // Calculation: 107 seconds * 61 Hz = 6527 ticks
@@ -128,8 +140,10 @@
 #include <avr/wdt.h>      // Hardware watchdog for automatic recovery
 #include <OneWire.h>      // OneWire protocol for DS18B20 temperature probe
 #include <DallasTemperature.h>  // DS18B20 high-level API
+#if ENABLE_TOF_FROZEN_DETECTION
 #include <Wire.h>         // I2C for VL53L0X (built-in)
 #include <VL53L0X.h>      // Pololu VL53L0X Time-of-Flight sensor
+#endif
 
 // --- Feature Toggles ---
 #define ENABLE_IP_AUTO_CLOSE        // Enable auto-close on Cloudwatcher IP failure
@@ -347,7 +361,9 @@ static void setDynamicTimeouts(word m1c, word m1o, word m2c, word m2o) {
 //=============================================================================
 // VL53L0X TIME-OF-FLIGHT SENSOR
 //=============================================================================
+#if ENABLE_TOF_FROZEN_DETECTION
 VL53L0X tofSensor;
+#endif
 
 // ToF reading state
 int tofDistance_mm = -1;                  // Current distance in mm (-1 = invalid/disconnected)
@@ -1116,6 +1132,7 @@ void updateDynamicTimeouts() {
 //=============================================================================
 // VL53L0X TIME-OF-FLIGHT SENSOR FUNCTIONS
 //=============================================================================
+#if ENABLE_TOF_FROZEN_DETECTION
 
 /**
  * Initialize VL53L0X ToF sensor on I2C (pins 20/21).
@@ -1233,6 +1250,18 @@ void readToFDistance() {
     }
   }
 }
+
+#else   // ENABLE_TOF_FROZEN_DETECTION == 0: no sensor mounted, I2C/ToF layer compiled out (v4.2.0)
+// The sensor stays "disconnected", which keeps every consumer inert: frozenDomeStateMachine()
+// and checkConflictingSignals() return early, calibrateToF() refuses, fdOpenBlocked() is never
+// true, the web page reports the state, and events / tick pushes carry tof=-1.
+void setupVL53L0X() {
+  tof_connected = false;
+  tofDistance_mm = -1;
+  tofFailCount = TEMP_FAIL_THRESHOLD;
+}
+void readToFDistance() {}
+#endif
 
 /**
  * Calibrate ToF baseline: store current reading as "closed" reference.
@@ -2762,7 +2791,9 @@ void sendFullHtmlResponse(Print& client) {
 
       // VL53L0X ToF Distance (always in cm)
       client.print(F("<tr><td>ToF Distance</td><td>"));
-      if (tof_connected && tofDistance_mm > 0) {
+      if (!ENABLE_TOF_FROZEN_DETECTION) {          // v4.2.0: layer compiled out (constant, folded)
+        client.print(F("Not installed"));
+      } else if (tof_connected && tofDistance_mm > 0) {
         client.print(tofDistance_mm / 10);
         client.print(F("."));
         client.print(tofDistance_mm % 10);
@@ -2795,7 +2826,9 @@ void sendFullHtmlResponse(Print& client) {
 
       // Frozen dome state
       client.print(F("<tr><td>Frozen Detection</td><td>"));
-      if (!tofCalibrated) {
+      if (!ENABLE_TOF_FROZEN_DETECTION) {          // v4.2.0: layer compiled out (constant, folded)
+        client.print(F("Disabled (not built in)"));
+      } else if (!tofCalibrated) {
         client.print(F("Disabled (not calibrated)"));
       } else if (!tof_connected) {
         client.print(F("Disabled (sensor disconnected)"));

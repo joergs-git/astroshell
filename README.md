@@ -74,7 +74,8 @@ Telescope Protection Priority:
 | **Cloudwatcher check switch** | `/?$W` (toggle), `/?$W1` (on), `/?$W0` (off) switch the Cloudwatcher link check at runtime, persisted in EEPROM byte 9 together with the site id — a site without a Solo is no longer auto-closed after every boot, and a board re-flashed with the other profile falls back to that profile's default |
 | **Web UI** | "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row |
 | **Rate limiter fix** | The first event after a reboot is no longer dropped (10 s / 5 min blackout after boot removed) |
-| **Logic test suite + CI** | `test/host/` simulates the dome on a PC and runs 35 scenarios per site; GitHub Actions also compiles both profiles with avr-gcc |
+| **ToF layer switchable** | `ENABLE_TOF_FROZEN_DETECTION` (default 0: no VL53L0X mounted on either dome yet) compiles the I2C/ToF layer out — no Wire/VL53L0X libraries needed, no I2C traffic; the frozen-dome logic, `$C` and `$U` stay inert until a sensor is installed |
+| **Logic test suite + CI** | `test/host/` simulates the dome on a PC and runs the scenario suite per site, with and without the ToF layer; GitHub Actions also compiles all four variants with avr-gcc |
 
 See [Important: Limit Switch Wiring (Site Profile)](#important-limit-switch-wiring-site-profile) for the details and the commissioning checklist.
 
@@ -290,6 +291,8 @@ Motor runtime varies with ambient temperature due to motor oil viscosity. The v4
 
 ## Frozen Dome Detection (v4.0)
 
+> **v4.2.0:** compiled out by default (`ENABLE_TOF_FROZEN_DETECTION 0`) because no VL53L0X is mounted on either dome yet. The web UI then shows "ToF Distance: Not installed" and "Frozen Detection: Disabled (not built in)". Set the define to 1 when a sensor is installed; everything below then applies unchanged.
+
 In winter, dome halves can freeze together at the top. The motor opens the bottom but the top stays stuck, creating a crash risk when frost releases later. The VL53L0X ToF sensor detects this by measuring the gap between dome halves.
 
 ### How It Works
@@ -330,7 +333,7 @@ All v4.0 features were lab-tested on real hardware (Arduino MEGA + DS18B20 + VL5
 
 ### Logic Tests (v4.2.0)
 
-`test/host/` compiles the unchanged firmware against small Arduino mocks and a dome physics model, then runs 35 scenarios per site profile, each in its own forked process (`make -C test/host test`). The physics decides which PWM pin physically opens and which input pin means "physically closed" for each site, independently of the firmware, so the suite checks what the dome *does*, not which constant the code uses.
+`test/host/` compiles the unchanged firmware against small Arduino mocks and a dome physics model, then runs the scenario suite per site profile, once with the ToF layer compiled out (the default build) and once built in, each scenario in its own forked process (`make -C test/host test`). The physics decides which PWM pin physically opens and which input pin means "physically closed" for each site, independently of the firmware, so the suite checks what the dome *does*, not which constant the code uses.
 
 Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles.
 

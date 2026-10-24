@@ -62,7 +62,7 @@ All real-time operations run in the interrupt service routine:
 
 ### Sensors (v4.0)
 - **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout
-- **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection
+- **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection. **Compiled out by default since v4.2.0** (`ENABLE_TOF_FROZEN_DETECTION 0`, no sensor mounted on either dome): no Wire/VL53L0X libraries, no I2C traffic; `tof_connected` stays false so the frozen state machine, `$C`/`$U` and the conflict check are inert. The host test suite runs each site with and without the layer.
 - Both sensors degrade gracefully: 10 consecutive failures → feature disabled
 
 ### Dynamic Motor Timeout (v4.0)
@@ -169,6 +169,7 @@ Rules:
 ### domecontrol_JK3.ino
 ```cpp
 #define SITE SITE_GERMANY                   // Site profile: SITE_GERMANY (mirrored) or SITE_PORTUGAL (standard), v4.2.0
+#define ENABLE_TOF_FROZEN_DETECTION 0       // v4.2.0: ToF/I2C layer compiled out until a VL53L0X is mounted
 #define SMOOTH 30                           // Soft-start smoothness
 #define MAX_MOT1_OPEN  6527                 // Motor timeout fallback (107 sec at 61Hz)
 
@@ -273,10 +274,10 @@ mount -o remount,ro /
 Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
 - SPI.h, Ethernet.h, EEPROM.h, avr/wdt.h (built-in)
 - OneWire.h, DallasTemperature.h (install via Library Manager) (v4.0)
-- Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) (v4.0)
+- Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) — only when `ENABLE_TOF_FROZEN_DETECTION` is 1 (default 0 since v4.2.0, then not needed)
 
 ### Host Logic Tests (v4.2.0)
-`make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs 35 scenarios for each site profile (one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
+`make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile, with the ToF layer compiled out and built in (four binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
 Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position.
 
 ### Toolchain Note (Apple Silicon Mac)

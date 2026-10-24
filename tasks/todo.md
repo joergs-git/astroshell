@@ -24,6 +24,7 @@ Done:
 - [x] Review findings incorporated: EEPROM byte 9 carries the SITE id (other-site value -> site default), `$W1`/`$W0` idempotent forms (UI button uses them), stale auto-close flag cleared while OFF, ISR comment corrected
 - [x] Test gaps from the review closed: S2 frozen cycle + lockout, closing during lockout (web + panel), cable and IP auto-close during the frozen cycle, M2 tick push, stop-reason display after auto-close, cable auto-close reversing an opening shutter -> 41 scenarios x 2 sites green
 - [x] Rosetta installed by the user; local arduino-cli build with the IDE toolchain: SITE=1 50514 B flash / 1181 B RAM, SITE=2 50514 B / 1180 B, no warnings
+- [x] User: no VL53L0X exists on either dome -> `ENABLE_TOF_FROZEN_DETECTION 0` (default, overridable). I2C/ToF layer compiled out, frozen logic inert; host suite now 4 binaries (site x ToF): 32 + 41 scenarios per site, all green. Sizes without ToF layer: 43650 B flash / 870 B RAM (SITE=1), 43652 B / 871 B (SITE=2); with ToF 50514 B / 1181 B
 
 Open:
 - [ ] Merge PR #3 after user approval (CI green, PR marked ready)
@@ -32,7 +33,7 @@ Open:
 ## Results (2026-10-24)
 - One firmware source for both domes; Germany behaviour byte-identical except the intended `$W` additions and the rate-limiter fix (verified by an independent review that substituted the Germany macros and diffed against main).
 - Baseline evidence: v4.1.0 under Portugal physics fails 20/26 scenarios incl. "Cloudwatcher unreachable closes the dome" (it would have opened the dome).
-- Cost: +864 B flash, +2 B RAM vs v4.1.0 on a 256 KB / 8 KB MEGA.
+- Cost: +864 B flash, +2 B RAM vs v4.1.0 with the ToF layer built in; the default build without the ToF layer is 6 KB flash and 309 B RAM SMALLER than v4.1.0.
 - Side observation (pre-existing, not changed): the frozen check compares one ToF distance against the baseline; if the other half is already open and the sensor sees that gap, a frozen second half is not detected. Depends on the sensor geometry.
 
 ## Completed

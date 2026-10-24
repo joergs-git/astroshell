@@ -445,8 +445,9 @@ SCENARIO(interrupt_push_direction, "an interrupted close is logged on /interrupt
 }
 
 //=============================================================================
-// SCENARIOS - frozen dome detection (VL53L0X)
+// SCENARIOS - frozen dome detection (VL53L0X) - only in the ToF-enabled build
 //=============================================================================
+#if ENABLE_TOF_FROZEN_DETECTION
 SCENARIO(frozen_detection_normal_opening, "opening with a growing gap is never judged frozen") {
   tofFromPhysics(); seedTofCalibration(100);
   setPos(0, 0); boot(); ensureRemoteCheck(true);
@@ -616,6 +617,26 @@ SCENARIO(conflict_event, "limits say closed but the ToF sees a gap: conflict eve
   CHECK(outboundHas("type=conflict&detail=Limits=CLOSED"));   // within 5 min of boot: needs the v4.2.0 rate-limiter fix
 }
 
+#else
+SCENARIO(tof_layer_compiled_out, "ToF layer compiled out: a present sensor is never used, UI says so, $C/$U inert, frozen logic idle") {
+  sim::g_tofPresent = true; sim::g_tofMm = 100;      // the mock would answer, the firmware must not ask
+  setPos(0, 0); boot(); ensureRemoteCheck(true);
+  CHECK(!tof_connected); CHECK_EQ(tofDistance_mm, -1); CHECK(!tofCalibrated);
+  std::string p = page();
+  CHECK_CONTAINS(p, "ToF Distance</td><td>Not installed");
+  CHECK_CONTAINS(p, "Frozen Detection</td><td>Disabled (not built in)");
+  CHECK_NOT_CONTAINS(p, "Calibrate ToF Baseline");
+  http("/?$C"); CHECK(!tofCalibrated); CHECK_EQ(sim::g_eeprom[8], 0xFF);
+  S[0].stuckOpening = true;                          // ice, but nobody can see it
+  http("/?$2"); runMs(30000);
+  CHECK_EQ(frozenDomeState, FD_IDLE); CHECK(movingToOpen(0)); CHECK(stop1reason != 6);
+  CHECK(!outboundHas("frozen")); CHECK(!outboundHas("conflict"));
+  http("/?$U"); CHECK_EQ(frozenDomeState, FD_IDLE);
+  runMs(120000);
+  CHECK(motorOff(0)); CHECK_EQ(m1_interrupt_ticks, 6527);   // only the motor timeout ends the pull (reason 5 is normalised at the limit)
+}
+#endif
+
 //=============================================================================
 // SCENARIOS - long-term behaviour
 //=============================================================================
@@ -725,9 +746,11 @@ SCENARIO(remote_check_off_no_pushes, "check off: no tick, interrupt or event tra
   setPos(g_travel, 0); boot(); ensureRemoteCheck(false);
   http("/?$1"); runMs(120000); CHECK(physClosed(0));
   http("/?$2"); runTicks(100); http("/?$5"); runMs(3000);
+#if ENABLE_TOF_FROZEN_DETECTION
   S[0].stuckOpening = true; sim::g_tofFn = [] { return 100; };
   http("/?$1"); runMs(60000); CHECK(physClosed(0));
   http("/?$2"); runMs(6000); CHECK_EQ(frozenDomeState, FD_GRAVITY_WAIT);   // frozen verdict reached (reason 6 is cleared at the limit)
+#endif
   CHECK_EQ(connects(88), 0);
   CHECK(sim::g_outbound.empty());
 }
@@ -764,7 +787,8 @@ SCENARIO(remote_check_off_leaves_running_close_alone, "switching the check off d
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   const char* filter = argc > 1 ? argv[1] : nullptr;
-  printf("=== AstroShell logic tests - SITE %d: %s - firmware %s ===\n", SITE, T.name, FIRMWARE_PATH);
+  printf("=== AstroShell logic tests - SITE %d: %s - ToF layer %s - firmware %s ===\n", SITE, T.name,
+         ENABLE_TOF_FROZEN_DETECTION ? "built in" : "compiled out", FIRMWARE_PATH);
   int passed = 0, failed = 0;
   for (auto& sc : registry()) {
     if (filter && !strstr(sc.name, filter)) continue;
