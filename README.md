@@ -65,6 +65,21 @@ Telescope Protection Priority:
 
 ---
 
+## What's New in v4.2.0 — Dual-Site Firmware
+
+| Feature | Description |
+|---------|-------------|
+| **Site profile** | `#define SITE SITE_GERMANY` (mirrored wiring) or `SITE_PORTUGAL` (standard AstroShell wiring) at the top of the sketch — one source for both domes |
+| **Physical semantics layer** | Every physical decision (commands, `$S`/`$A`, auto-close, frozen dome, tick logging, UI) uses `DIR_PHYS_*` / `LIM*_PHYS_*`, resolved at compile time at zero cost |
+| **Cloudwatcher check switch** | `/?$W` turns the Cloudwatcher link check on/off at runtime, persisted in EEPROM byte 9 — a site without a Solo is no longer auto-closed after every boot |
+| **Web UI** | "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row |
+| **Rate limiter fix** | The first event after a reboot is no longer dropped (10 s / 5 min blackout after boot removed) |
+| **Logic test suite + CI** | `test/host/` simulates the dome on a PC and runs 35 scenarios per site; GitHub Actions also compiles both profiles with avr-gcc |
+
+See [Important: Limit Switch Wiring (Site Profile)](#important-limit-switch-wiring-site-profile) for the details and the commissioning checklist.
+
+---
+
 ## Quick Start
 
 1. **Install Libraries** in Arduino IDE Library Manager:
@@ -139,7 +154,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 
 | File | Description |
 |------|-------------|
-| `domecontrol_JK3.ino` | Main Arduino firmware (v4.0) with safety sensors, dynamic timeout, frozen dome detection |
+| `domecontrol_JK3.ino` | Main Arduino firmware (v4.2.0, dual-site) with safety sensors, dynamic timeout, frozen dome detection |
 | `cloudwatcher-raincheckerV3.sh` | Rain checker script for Cloudwatcher Solo - auto-closes dome on rain |
 | `cloudwatcher-rainchecker.service` | Systemd service for rain checker autostart |
 | `astroshell_ticklogger.py` | Motor runtime & event server - receives tick data + events, logs CSV, sends Pushover |
@@ -147,7 +162,9 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `open_astroshell.bat` | Windows batch script for NINA - opens dome with Pushover notification |
 | `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
 | `motortick-statistic-batchrun.sh` | Automated dome open/close cycles for motor tick statistics collection |
-| `ascom-driver/` | Native ASCOM COM driver for NINA dome integration (v1.0.0) |
+| `ascom-driver/` | Native ASCOM COM driver for NINA dome integration (v1.1.0) |
+| `test/host/` | Host-side logic tests: Arduino mocks + dome physics model, 35 scenarios per site profile (v4.2.0) |
+| `.github/workflows/firmware-ci.yml` | CI: runs the logic tests and compiles both site profiles for the MEGA 2560 (v4.2.0) |
 | `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
 | `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
 
@@ -168,6 +185,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `/?$L` | Toggle tick logging on/off (default: ON) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
+| `/?$W` | Toggle Cloudwatcher link check on/off — persisted in EEPROM; OFF also disables the cable-removal auto-close and all pushes to the Solo (v4.2.0) |
 
 ---
 
@@ -310,6 +328,14 @@ All v4.0 features were lab-tested on real hardware (Arduino MEGA + DS18B20 + VL5
 | Tick data format (both temps + ToF in CSV) | Passed |
 | Watchdog stability (no resets during testing) | Passed |
 
+### Logic Tests (v4.2.0)
+
+`test/host/` compiles the unchanged firmware against small Arduino mocks and a dome physics model, then runs 35 scenarios per site profile, each in its own forked process (`make -C test/host test`). The physics decides which PWM pin physically opens and which input pin means "physically closed" for each site, independently of the firmware, so the suite checks what the dome *does*, not which constant the code uses.
+
+Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles.
+
+Running the suite with the Portugal physics against the old v4.1.0 firmware fails 20 of 26 scenarios, including "Cloudwatcher unreachable closes the dome" — that is the hazard the site profile removes.
+
 ### Bugs Found and Fixed During Testing
 
 5 bugs were discovered and fixed during lab testing:
@@ -348,9 +374,35 @@ systemctl restart astroshell_ticklogger
 
 ---
 
-## Important: Limit Switch Wiring
+## Important: Limit Switch Wiring (Site Profile)
 
-My dome had limit switches accidentally swapped during installation. The code compensates for this in the web display only. **If your switches are wired correctly**, see the section below for how to revert the display logic.
+My German dome was installed mirrored: the motor polarity **and** the limit switches are inverted compared to the original AstroShell design. My second dome in Portugal follows the original design. Since v4.2.0 one firmware serves both through a **site profile** at the top of `domecontrol_JK3.ino`:
+
+```cpp
+#define SITE SITE_GERMANY      // mirrored installation (default)
+// #define SITE SITE_PORTUGAL  // standard AstroShell wiring
+```
+
+| | Germany (mirrored) | Portugal (standard) |
+|---|---|---|
+| Direction `OPEN` (PWM on motor*b, ends at `lim*open`) physically | closes | opens |
+| `lim1open` (pin 7) / `lim2open` (pin 1) HIGH means | physically CLOSED | physically OPEN |
+| Panel button "up" | closes | opens |
+| Cloudwatcher check default (`$W`) | ON | OFF |
+
+The hardware pairing in the ISR never changes (direction `OPEN` always ends at `lim*open`). Everything that needs to know what is *physically* open or closed goes through `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM*_PHYS_CLOSED` / `LIM*_PHYS_OPEN`, which the profile resolves at compile time. The web API stays physical on both sites: `$1`/`$3` always close, `$2`/`$4` always open, and the ASCOM driver needs no site setting.
+
+**Why this matters:** before v4.2.0 the mirrored interpretation was hard-coded in 109 places, not only in the web display. Flashed unchanged on a standard-wired dome, the IP-fail auto-close drove the shutters to the physically *open* end stop. The earlier instructions in this README ("revert three display lines") were incomplete for the same reason and have been removed.
+
+**If your dome is wired like the original AstroShell**, build with `SITE_PORTUGAL`. If only the limit switches are mirrored but the motor is not (or vice versa), neither profile fits and the pairing in the ISR itself would have to change — do not just relabel.
+
+### Commissioning a Site (do this with the dome in an intermediate position)
+
+1. Flash the right profile. The web UI must show the expected **Limit Wiring** row (System Details → System Status) and the expected **Cloudwatcher Check** default.
+2. Click **OPEN S1**: the shutter must physically open, the page must say "Opening (physically)" and `/?$A` must report `INTERMEDIATE|OPENING|...`. Stop, then **CLOSE S1**.
+3. Let one shutter reach each end stop: the state line must read "Physically OPEN" / "Physically CLOSED" and the pin rows must show HIGH on the matching input.
+4. ASCOM: leave "Swap Open/Close" unchecked; NINA must show the shutter state that matches reality.
+5. Keep **Cloudwatcher Check** disabled until a Solo exists on the site; enabled without one, the dome closes about 16 minutes after every opening.
 
 ---
 
@@ -358,80 +410,11 @@ My dome had limit switches accidentally swapped during installation. The code co
 
 *Cheers, Joerg*
 
-## If Your Limit Switches Are Wired Correctly
-
-My code has **inverted web display logic** because my limit switches were accidentally swapped during installation. The underlying motor control logic and pin definitions are **identical to the original AstroShell code** - only the web interface displays the inverted physical state.
-
-### What Was Changed (My Swapped Wiring)
-
-The pin definitions and motor constants are **unchanged** from the original. Only the **web display** was modified to show the correct physical state despite the swapped wiring:
-
-| Element | Original Display | My Modified Display |
-|---------|------------------|---------------------|
-| `lim1open` HIGH | "Opened" | "Physically CLOSED" |
-| `lim1closed` HIGH | "Closed" | "Physically OPEN" |
-| `mot1dir==OPEN` | "Opening" | "Closing (physically)" |
-| `mot1dir==CLOSE` | "Closing" | "Opening (physically)" |
-| Button $1 | "Open" | "CLOSE S1" |
-| Button $2 | "Close" | "OPEN S1" |
-
-### If Your Wiring Is Correct
-
-If your AstroShell dome has **correctly wired limit switches**, you need to revert the web display logic in `domecontrol_JK3.ino`:
-
-#### 1. Update Status Display
-
-**Current (for my swapped wiring):**
-```cpp
-bool s1_is_physically_closed_state = digitalRead(lim1open);
-bool s1_is_physically_open_state = digitalRead(lim1closed);
-```
-
-**Change to (correct wiring):**
-```cpp
-bool s1_is_physically_closed_state = digitalRead(lim1closed);
-bool s1_is_physically_open_state = digitalRead(lim1open);
-```
-
-#### 2. Update Movement Display
-
-**Current (for my swapped wiring):**
-```cpp
-if (mot1dir == OPEN) { client.print(F("Closing (physically)")); ... }
-else if (mot1dir == CLOSE) { client.print(F("Opening (physically)")); }
-```
-
-**Change to (correct wiring):**
-```cpp
-if (mot1dir == OPEN) { client.print(F("Opening (physically)")); ... }
-else if (mot1dir == CLOSE) { client.print(F("Closing (physically)")); }
-```
-
-#### 3. Update Button Labels
-
-**Current (for my swapped wiring):**
-```cpp
-client.print(F("<a href='/?$2' class='button b-open'>OPEN S1</a>"));
-client.print(F("<a href='/?$1' class='button b-close'>CLOSE S1</a>"));
-```
-
-**Change to (correct wiring):**
-```cpp
-client.print(F("<a href='/?$1' class='button b-open'>OPEN S1</a>"));
-client.print(F("<a href='/?$2' class='button b-close'>CLOSE S1</a>"));
-```
-
-#### 4. Update Comments
-
-Search for comments mentioning "inverted", "swapped", or "physically" and update them to reflect your correct wiring.
-
-### Testing
-
-After making changes, test carefully with the dome in an intermediate position so you can intervene if something moves in the wrong direction!
-
 ## Network Monitoring Behavior - Test Cases
 
 The dome controller has smart network monitoring that adapts to different scenarios. Below are all possible combinations and expected behaviors:
+
+**v4.2.0:** this whole section only applies while the Cloudwatcher check is enabled (`/?$W`, shown as "Cloudwatcher Check" in the web UI). With the check disabled the controller neither polls the Cloudwatcher nor closes the dome on IP failure or cable removal, and it sends no tick or event data to the Solo. The German profile defaults to enabled, the Portuguese profile to disabled; the setting survives reboots and firmware updates (EEPROM byte 9).
 
 ### Startup Scenarios
 

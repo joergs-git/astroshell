@@ -1,0 +1,60 @@
+# Firmware CI for domecontrol_JK3.ino
+#
+# 1. host-logic-tests: compiles the firmware unchanged against the Arduino mocks in
+#    test/host/mock and runs the scenario suite for BOTH site profiles (Germany =
+#    mirrored wiring, Portugal = standard wiring). The dome physics in the test
+#    decides what "physically closed" means, independently of the firmware.
+# 2. arduino-build: real avr-gcc build for the MEGA 2560 with the same libraries the
+#    Arduino IDE uses, once per site profile (-DSITE=1 / -DSITE=2). Any compiler
+#    warning inside the sketch fails the job.
+name: Firmware CI
+
+on:
+  push:
+    paths:
+      - 'domecontrol_JK3.ino'
+      - 'test/host/**'
+      - '.github/workflows/firmware-ci.yml'
+  pull_request:
+    paths:
+      - 'domecontrol_JK3.ino'
+      - 'test/host/**'
+      - '.github/workflows/firmware-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  host-logic-tests:
+    name: Logic tests (host simulation, both sites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run scenario suite
+        run: make -C test/host test
+
+  arduino-build:
+    name: Arduino build (MEGA 2560, SITE=${{ matrix.site }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        site: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install core and libraries
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr@1.8.7
+          arduino-cli lib install "Ethernet@2.0.2" "OneWire" "DallasTemperature" "VL53L0X"
+      - name: Compile sketch
+        run: |
+          mkdir -p build/domecontrol_JK3
+          cp domecontrol_JK3.ino build/domecontrol_JK3/
+          arduino-cli compile --fqbn arduino:avr:mega:cpu=atmega2560 --warnings all \
+            --build-property "build.extra_flags=-DSITE=${{ matrix.site }}" \
+            build/domecontrol_JK3 2>&1 | tee build.log
+          # the sketch itself must be warning-free (library warnings are not ours)
+          if grep -E 'domecontrol_JK3\.ino.*warning:' build.log; then
+            echo "::error::compiler warnings in domecontrol_JK3.ino"; exit 1; fi
+      - name: Report size
+        run: grep -E 'Sketch uses|Global variables' build.log

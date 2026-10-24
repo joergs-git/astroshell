@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.1.0)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.2.0)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -20,6 +20,20 @@
 // - VL53L0X frozen dome detection with auto-retry and lockout (v4.0)
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
+// - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.2.0 Changes (dual-site firmware):
+// - SITE profile (SITE_GERMANY / SITE_PORTUGAL) decides how the hardware signals are interpreted. The
+//   German dome is a mirrored installation (motor polarity AND limit switches inverted vs. the original
+//   AstroShell design), the Portuguese dome follows the original design. One source, one line to switch.
+// - Every physical decision (web commands, $S/$A status, IP and cable auto-close, frozen-dome cycle,
+//   tick-logging direction, timeout selection, UI texts) goes through DIR_PHYS_* / LIM*_PHYS_* only.
+//   The ISR pairing (direction OPEN ends at lim*open, CLOSE at lim*closed) is hardware and unchanged.
+// - $W toggles the Cloudwatcher link check at runtime, persisted in EEPROM byte 9. OFF also disables the
+//   cable-removal auto-close and all tick/interrupt/event traffic to the Solo (no Solo on site).
+// - Event rate limiters no longer swallow the first event after boot (their timestamps started at 0:
+//   normal events were dropped for 10 s, conflict events for 5 min after every reset).
+// - Web UI: "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row.
 //
 // v4.1.0 Changes (network/robustness review):
 // - Ethernet: single chip reset per stack rebuild, health check flags dead stack (LinkOFF / 0.0.0.0),
@@ -58,19 +72,40 @@
 // - HTTP GET push to Cloudwatcher Solo:88 for CSV logging
 // - Web UI shows live tick counter and last valid measurements
 //
-// Safety Note: Limit switch names are swapped due to installation wiring.
-// "lim1open" actually detects physically CLOSED state, etc.
+// Safety Note: the direction constants and limit switch names describe the HARDWARE pairing.
+// Their physical meaning is resolved once by the site profile below (see PHYSICAL SEMANTICS).
 //=============================================================================
+
+//=============================================================================
+// SITE PROFILE - which dome is this firmware built for? (v4.2.0)
+//=============================================================================
+// Both domes run this same source. Select the site here (or override from the
+// command line with -DSITE=2, which the CI build matrix does for both profiles).
+#define SITE_GERMANY   1   // Mirrored installation: motor polarity AND limit switches inverted
+#define SITE_PORTUGAL  2   // Standard AstroShell wiring, no Cloudwatcher Solo on site
+#ifndef SITE
+#define SITE SITE_GERMANY
+#endif
+
+#if SITE == SITE_GERMANY
+  #define LIMIT_WIRING_SWAPPED  1   // direction OPEN / lim*open mean physically CLOSED
+  #define DEFAULT_REMOTE_CHECK  1   // Cloudwatcher link check ON until toggled with $W
+#elif SITE == SITE_PORTUGAL
+  #define LIMIT_WIRING_SWAPPED  0   // direction OPEN / lim*open mean physically OPEN (original design)
+  #define DEFAULT_REMOTE_CHECK  0   // no Cloudwatcher yet: link check OFF until toggled with $W
+#else
+  #error "SITE must be SITE_GERMANY or SITE_PORTUGAL"
+#endif
 
 // --- Motor Timing Configuration ---
 // Motor timeout in ISR ticks (~61 Hz). Safety limit if limit switches fail.
 // Calculation: 107 seconds * 61 Hz = 6527 ticks
 #define SMOOTH 30           // Soft-start smoothness (0=instant, 254=very slow)
-#define MAX_MOT1_OPEN  6527 // Shutter 1 close timeout (107 sec)
-#define MAX_MOT1_CLOSE 6527 // Shutter 1 open timeout (107 sec)
+#define MAX_MOT1_OPEN  6527 // Shutter 1 timeout, direction OPEN (107 sec)
+#define MAX_MOT1_CLOSE 6527 // Shutter 1 timeout, direction CLOSE (107 sec)
 #define MAX_MOT1_VCC_CLOSE_ACTION MAX_MOT1_OPEN
-#define MAX_MOT2_OPEN  6527 // Shutter 2 close timeout (107 sec)
-#define MAX_MOT2_CLOSE 6527 // Shutter 2 open timeout (107 sec)
+#define MAX_MOT2_OPEN  6527 // Shutter 2 timeout, direction OPEN (107 sec)
+#define MAX_MOT2_CLOSE 6527 // Shutter 2 timeout, direction CLOSE (107 sec)
 #define MAX_MOT2_VCC_CLOSE_ACTION MAX_MOT2_OPEN
 
 // --- Network Configuration ---
@@ -98,10 +133,12 @@
 #define ENABLE_IP_AUTO_CLOSE        // Enable auto-close on Cloudwatcher IP failure
 // #define ENABLE_VCC_FAIL_AUTO_CLOSE  // Disabled: VCC monitoring caused Ethernet issues
 
-// --- Motor Direction Constants ---
-// NOTE: Names are inverted due to hardware wiring swap!
-#define OPEN        1     // Sends motor command that PHYSICALLY CLOSES the shutter
-#define CLOSE       2     // Sends motor command that PHYSICALLY OPENS the shutter
+// --- Motor Direction Constants (HARDWARE pairing, identical for every site) ---
+// OPEN  = PWM on motor*b, the ISR stops it when lim*open   is HIGH
+// CLOSE = PWM on motor*a, the ISR stops it when lim*closed is HIGH
+// Whether that physically opens or closes the shutter depends on the site, see PHYSICAL SEMANTICS.
+#define OPEN        1
+#define CLOSE       2
                           // 0 = motor off
 
 //=============================================================================
@@ -114,23 +151,64 @@
 #define motor2a     5     // Shutter 2 motor pin A (PWM capable)
 #define motor2b     3     // Shutter 2 motor pin B (PWM capable)
 
-// Limit switches (active HIGH when endpoint reached)
-// WARNING: Names are swapped due to installation wiring error!
-#define lim1open    7     // Actually detects S1 PHYSICALLY CLOSED
-#define lim1closed  2     // Actually detects S1 PHYSICALLY OPEN
-#define lim2open    1     // Actually detects S2 PHYSICALLY CLOSED (shares TX pin!)
-#define lim2closed  0     // Actually detects S2 PHYSICALLY OPEN (shares RX pin!)
+// Limit switches (active HIGH when endpoint reached) - board connector names.
+// Germany (mirrored): lim*open = physically CLOSED. Portugal (standard): lim*open = physically OPEN.
+#define lim1open    7     // S1 end stop of direction OPEN
+#define lim1closed  2     // S1 end stop of direction CLOSE
+#define lim2open    1     // S2 end stop of direction OPEN  (shares TX pin!)
+#define lim2closed  0     // S2 end stop of direction CLOSE (shares RX pin!)
 
 // Manual control buttons (active LOW with internal pullup)
-#define SW1up       A3    // Shutter 1 close button
-#define SW1down     A2    // Shutter 1 open button
-#define SW2up       A5    // Shutter 2 close button
-#define SW2down     A4    // Shutter 2 open button
+// The buttons keep their hardware direction on both sites: "up" = direction OPEN, "down" = direction
+// CLOSE. On the mirrored German dome "up" therefore closes, on the standard Portuguese dome it opens.
+#define SW1up       A3    // Shutter 1 button, direction OPEN
+#define SW1down     A2    // Shutter 1 button, direction CLOSE
+#define SW2up       A5    // Shutter 2 button, direction OPEN
+#define SW2down     A4    // Shutter 2 button, direction CLOSE
 #define SWSTOP      8     // Emergency STOP button (stops all motors)
 
 // Voltage monitoring (analog inputs)
 #define VCC1        A1    // Main power supply voltage
 #define VCC2        A0    // Secondary/backup voltage (currently unused)
+
+//=============================================================================
+// PHYSICAL SEMANTICS - resolved once from the site profile (v4.2.0)
+//=============================================================================
+// Everything that cares about "physically open/closed" uses ONLY these names.
+// Raw lim*open / lim*closed / OPEN / CLOSE appear only where the hardware pairing
+// itself is meant: the ISR limit-switch stops and the panel buttons.
+#if LIMIT_WIRING_SWAPPED
+  #define DIR_PHYS_CLOSE        OPEN         // mirrored: direction OPEN physically closes
+  #define DIR_PHYS_OPEN         CLOSE
+  #define LIM1_PHYS_CLOSED      lim1open     // pin 7 HIGH = S1 physically closed
+  #define LIM1_PHYS_OPEN        lim1closed   // pin 2 HIGH = S1 physically open
+  #define LIM2_PHYS_CLOSED      lim2open     // pin 1 HIGH = S2 physically closed
+  #define LIM2_PHYS_OPEN        lim2closed   // pin 0 HIGH = S2 physically open
+  #define LIM1_PHYS_CLOSED_NAME "lim1open"   // connector names shown in the web UI stop reason
+  #define LIM1_PHYS_OPEN_NAME   "lim1closed"
+  #define LIM2_PHYS_CLOSED_NAME "lim2open"
+  #define LIM2_PHYS_OPEN_NAME   "lim2closed"
+  #define WIRING_LABEL          "Swapped (mirrored installation)"
+#else
+  #define DIR_PHYS_CLOSE        CLOSE        // standard: direction CLOSE physically closes
+  #define DIR_PHYS_OPEN         OPEN
+  #define LIM1_PHYS_CLOSED      lim1closed   // pin 2 HIGH = S1 physically closed
+  #define LIM1_PHYS_OPEN        lim1open     // pin 7 HIGH = S1 physically open
+  #define LIM2_PHYS_CLOSED      lim2closed   // pin 0 HIGH = S2 physically closed
+  #define LIM2_PHYS_OPEN        lim2open     // pin 1 HIGH = S2 physically open
+  #define LIM1_PHYS_CLOSED_NAME "lim1closed"
+  #define LIM1_PHYS_OPEN_NAME   "lim1open"
+  #define LIM2_PHYS_CLOSED_NAME "lim2closed"
+  #define LIM2_PHYS_OPEN_NAME   "lim2open"
+  #define WIRING_LABEL          "Standard (original AstroShell)"
+#endif
+
+// Helpers for code that works with a RAW hardware direction (the panel buttons in the ISR):
+// the motor timeout belongs to the physical direction, and only the physically OPENING
+// direction is subject to the frozen-dome lockout. Both fold to constants at compile time.
+#define TIMEOUT_M1_FOR(dir)   ((dir) == DIR_PHYS_CLOSE ? dynTimeout_M1_Close : dynTimeout_M1_Open)
+#define TIMEOUT_M2_FOR(dir)   ((dir) == DIR_PHYS_CLOSE ? dynTimeout_M2_Close : dynTimeout_M2_Open)
+#define BUTTON_MAY_START(dir) ((dir) != DIR_PHYS_OPEN || !fdOpenBlocked())
 
 // --- DS18B20 Temperature Probe ---
 // Pin 22 is MEGA-exclusive (not on UNO), guarantees no conflict with existing wiring
@@ -151,6 +229,8 @@
 #define EEPROM_ADDR_TOF_BASELINE 6    // Bytes 6-7: ToF baseline distance in mm (uint16)
 #define EEPROM_ADDR_TOF_CALIB_MAGIC 8 // Byte 8: ToF calibration magic (0xA5 = calibrated)
 #define TOF_CALIB_MAGIC_BYTE 0xA5     // Identifies valid ToF calibration
+#define EEPROM_ADDR_CONFIG_FLAGS 9    // Byte 9: config flags (v4.2.0); bit 7 set (0xFF) = never written
+#define CFG_REMOTE_CHECK 0x01         // Bit 0: Cloudwatcher link check enabled ($W)
 
 //=============================================================================
 // DYNAMIC TIMEOUT CONFIGURATION — Linear Regression Coefficients
@@ -159,11 +239,12 @@
 // Formula: timeout = base - (slope100 * temp_C) / 100 + margin
 // All values in ISR ticks (~61 Hz). Integer math to avoid float in ISR.
 //
-// Direction mapping (code names are inverted due to wiring!):
-//   mot1dir==OPEN  = physically closing -> M1 Closing regression
-//   mot1dir==CLOSE = physically opening -> M1 Opening regression
-//   mot2dir==OPEN  = physically closing -> M2 Closing regression
-//   mot2dir==CLOSE = physically opening -> M2 Opening regression
+// Direction mapping (physical, see PHYSICAL SEMANTICS):
+//   mot1dir==DIR_PHYS_CLOSE -> M1 Closing regression (dynTimeout_M1_Close)
+//   mot1dir==DIR_PHYS_OPEN  -> M1 Opening regression (dynTimeout_M1_Open)
+//   mot2dir==DIR_PHYS_CLOSE -> M2 Closing regression (dynTimeout_M2_Close)
+//   mot2dir==DIR_PHYS_OPEN  -> M2 Opening regression (dynTimeout_M2_Open)
+// The coefficients were fitted on the German dome; without a DS18B20 the static 6527 applies.
 
 #define DYN_M1_CLOSE_BASE    6096   // M1 closing: base ticks at 0C
 #define DYN_M1_CLOSE_SLOPE   1945   // M1 closing: slope * 100 (19.45 ticks/C)
@@ -243,10 +324,10 @@ const unsigned long TEMP_READ_INTERVAL = 5000;  // Request every 5 seconds
 const unsigned long TEMP_CONV_TIME = 800;       // 750ms conversion + 50ms margin
 
 // Dynamic timeout values — precomputed from temperature, read atomically by ISR
-volatile word dynTimeout_M1_Close = MAX_MOT1_OPEN;   // mot1dir==OPEN = physically closing
-volatile word dynTimeout_M1_Open  = MAX_MOT1_CLOSE;  // mot1dir==CLOSE = physically opening
-volatile word dynTimeout_M2_Close = MAX_MOT2_OPEN;   // mot2dir==OPEN = physically closing
-volatile word dynTimeout_M2_Open  = MAX_MOT2_CLOSE;  // mot2dir==CLOSE = physically opening
+volatile word dynTimeout_M1_Close = MAX_MOT1_OPEN;   // used for mot1dir==DIR_PHYS_CLOSE
+volatile word dynTimeout_M1_Open  = MAX_MOT1_CLOSE;  // used for mot1dir==DIR_PHYS_OPEN
+volatile word dynTimeout_M2_Close = MAX_MOT2_OPEN;   // used for mot2dir==DIR_PHYS_CLOSE
+volatile word dynTimeout_M2_Open  = MAX_MOT2_CLOSE;  // used for mot2dir==DIR_PHYS_OPEN
 bool dynamicTimeoutActive = false;        // True when DS18B20 is providing valid temps
 
 // FIX (P1): the four 16-bit timeout values are read by the ISR when a button starts a motor;
@@ -358,6 +439,12 @@ bool skipNextIpCheck = false;                 // Skip one IP check after Etherne
 // This allows non-networked setups to operate without false auto-closes.
 bool networkMonitoringEnabled = false; // True once cable detected (stays true)
 
+// --- Cloudwatcher Link Check ($W, v4.2.0) ---
+// Runtime switch for the whole Solo-bound supervision: IP checks, fail counting, IP and
+// cable-removal auto-close, tick/interrupt/event pushes. Persisted in EEPROM byte 9 so a
+// site without a Cloudwatcher is not auto-closed on every boot. Default comes from SITE.
+bool remoteCheckEnabled = DEFAULT_REMOTE_CHECK;
+
 //=============================================================================
 // NETWORK WATCHDOG CONFIGURATION
 //=============================================================================
@@ -444,6 +531,8 @@ void checkRemoteConnectionAndAutoClose();       // IP monitoring logic
 void initializeEEPROM();                        // Load/init persistent storage
 void saveCountersToEEPROM();                    // Save counters if changed
 void incrementDayCounter();                     // Track uptime days
+void loadConfigFlags();                         // Load $W flag from EEPROM byte 9 (v4.2.0)
+void saveConfigFlags();                         // Persist $W flag to EEPROM byte 9 (v4.2.0)
 void pushTickDataIfReady();                     // Push tick data to logging server
 void pushInterruptDataIfReady();                // Push interrupted stop data
 
@@ -522,8 +611,8 @@ static inline bool fdOpenBlocked() {
 // FIX (P1): stop the monitored motor if it is opening, on the live value, atomically
 static void fdLockoutStop() {
   uint8_t sreg = SREG; cli();
-  if (frozenMotorNum == 1) { if (mot1dir == CLOSE) { mot1dir = 0; stop1reason = 6; } }
-  else                     { if (mot2dir == CLOSE) { mot2dir = 0; stop2reason = 6; } }
+  if (frozenMotorNum == 1) { if (mot1dir == DIR_PHYS_OPEN) { mot1dir = 0; stop1reason = 6; } }
+  else                     { if (mot2dir == DIR_PHYS_OPEN) { mot2dir = 0; stop2reason = 6; } }
   SREG = sreg;
 }
 
@@ -557,6 +646,27 @@ void initializeEEPROM() {
     Serial.print(F(", Day: ")); Serial.println(dayCounter);
     #endif
   }
+  loadConfigFlags();   // v4.2.0: byte 9 is independent of the magic byte (a v4.1.0 EEPROM has it at 0xFF)
+}
+
+/**
+ * Load the config flags (byte 9). A byte that was never written reads 0xFF (bit 7 set):
+ * apply the site default and persist it, so the choice is visible and stable from then on.
+ */
+void loadConfigFlags() {
+  byte flags = EEPROM.read(EEPROM_ADDR_CONFIG_FLAGS);
+  if (flags & 0x80) {
+    remoteCheckEnabled = DEFAULT_REMOTE_CHECK;
+    saveConfigFlags();
+  } else {
+    remoteCheckEnabled = (flags & CFG_REMOTE_CHECK) != 0;
+  }
+}
+
+/** Persist the config flags (byte 9). update() only writes when the value changed. */
+void saveConfigFlags() {
+  byte flags = remoteCheckEnabled ? CFG_REMOTE_CHECK : 0;
+  EEPROM.update(EEPROM_ADDR_CONFIG_FLAGS, flags);
 }
 
 /**
@@ -626,6 +736,12 @@ static void printTempX10(Print& p, int t) {
  *   t = Tick count
  */
 void pushTickDataIfReady() {
+  // v4.2.0: no Solo on site ($W off) - drop the data instead of queueing it for later
+  if (!remoteCheckEnabled) {
+    m1_data_ready = false;
+    m2_data_ready = false;
+    return;
+  }
   // Skip if logging disabled or network not ready
   if (!tickLoggingEnabled || !ethernet_initialized || !networkMonitoringEnabled) {
     return;
@@ -731,8 +847,8 @@ void pushTickDataIfReady() {
  *   t = Tick count at interruption
  */
 void pushInterruptDataIfReady() {
-  // Skip if logging disabled or network not ready
-  if (!tickLoggingEnabled || !ethernet_initialized || !networkMonitoringEnabled) {
+  // Skip if logging disabled, network not ready or no Solo on site ($W off, v4.2.0)
+  if (!tickLoggingEnabled || !ethernet_initialized || !networkMonitoringEnabled || !remoteCheckEnabled) {
     // Still clear flags to prevent buildup
     m1_interrupt_ready = false;
     m2_interrupt_ready = false;
@@ -1208,15 +1324,15 @@ void frozenDomeStateMachine() {
       // FIX (P1): the attempt counter ages out 30 min after the last frozen verdict, so an
       // opening hours later gets its three attempts again (a cancelled cycle keeps the count).
       if (frozenRetryCount > 0 && now - lastFrozenDetect > FROZEN_ATTEMPT_MEMORY) frozenRetryCount = 0;
-      // Watch for a motor ENTERING the opening direction (physically opening = mot*dir==CLOSE).
+      // Watch for a motor ENTERING the opening direction (physically opening = mot*dir==DIR_PHYS_OPEN).
       // FIX (P1): "!= CLOSE" instead of "== 0", so an open that reverses a running close
       // (web $2 while closing) is monitored as well.
-      if (mot1dir == CLOSE && fd_prev_mot1dir != CLOSE) {
+      if (mot1dir == DIR_PHYS_OPEN && fd_prev_mot1dir != DIR_PHYS_OPEN) {
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
         frozenCheckActive = true;
         frozenMotorNum = 1;
-      } else if (mot2dir == CLOSE && fd_prev_mot2dir != CLOSE) {
+      } else if (mot2dir == DIR_PHYS_OPEN && fd_prev_mot2dir != DIR_PHYS_OPEN) {
         frozenDomeState = FD_MONITORING;
         frozenCheckTicks = 0;
         frozenCheckActive = true;
@@ -1228,7 +1344,7 @@ void frozenDomeStateMachine() {
       // Abort if the motor is no longer OPENING (manual stop, limit switch, reversal).
       // FIX (P1): checked only ==0 before, so a close command within the first 4 s of an
       // open was judged "frozen" and the dome re-opened itself after the retry wait.
-      if (curDir != CLOSE) {
+      if (curDir != DIR_PHYS_OPEN) {
         frozenDomeState = FD_IDLE;
         frozenCheckActive = false;
         break;
@@ -1241,7 +1357,7 @@ void frozenDomeStateMachine() {
       break;
 
     case FD_FIRST_CHECK:
-      if (curDir != CLOSE) { frozenDomeState = FD_IDLE; break; }   // stopped since the last call
+      if (curDir != DIR_PHYS_OPEN) { frozenDomeState = FD_IDLE; break; }   // stopped since the last call
       // Check if dome gap is increasing (opening detected)
       if (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE)) {
         // Opening detected — dome is NOT frozen, all good
@@ -1283,10 +1399,10 @@ void frozenDomeStateMachine() {
       bool ok = true;
       if (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE)) {
         // Gravity worked! Resume opening
-        if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-          ok = fdStartMotor(1, CLOSE, dynTimeout_M1_Open); if (ok) stop1reason = 0;
-        } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-          ok = fdStartMotor(2, CLOSE, dynTimeout_M2_Open); if (ok) stop2reason = 0;
+        if (frozenMotorNum == 1 && !digitalRead(LIM1_PHYS_OPEN)) {
+          ok = fdStartMotor(1, DIR_PHYS_OPEN, dynTimeout_M1_Open); if (ok) stop1reason = 0;
+        } else if (frozenMotorNum == 2 && !digitalRead(LIM2_PHYS_OPEN)) {
+          ok = fdStartMotor(2, DIR_PHYS_OPEN, dynTimeout_M2_Open); if (ok) stop2reason = 0;
         }
         if (ok) {
           // FIX (P1): the resumed opening is monitored again (a re-freeze mid-travel was
@@ -1304,10 +1420,10 @@ void frozenDomeStateMachine() {
         }
       } else {
         // Still frozen — reverse motor to close
-        if (frozenMotorNum == 1 && !digitalRead(lim1open)) {
-          ok = fdStartMotor(1, OPEN, dynTimeout_M1_Close); if (ok) stop1reason = 6;
-        } else if (frozenMotorNum == 2 && !digitalRead(lim2open)) {
-          ok = fdStartMotor(2, OPEN, dynTimeout_M2_Close); if (ok) stop2reason = 6;
+        if (frozenMotorNum == 1 && !digitalRead(LIM1_PHYS_CLOSED)) {
+          ok = fdStartMotor(1, DIR_PHYS_CLOSE, dynTimeout_M1_Close); if (ok) stop1reason = 6;
+        } else if (frozenMotorNum == 2 && !digitalRead(LIM2_PHYS_CLOSED)) {
+          ok = fdStartMotor(2, DIR_PHYS_CLOSE, dynTimeout_M2_Close); if (ok) stop2reason = 6;
         }
         if (ok) frozenDomeState = FD_CLOSING;
         else if (frozenRetryCount >= FROZEN_MAX_RETRIES) {
@@ -1345,10 +1461,10 @@ void frozenDomeStateMachine() {
         } else {
           // Re-issue open command for next attempt
           bool ok = false;
-          if (frozenMotorNum == 1 && !digitalRead(lim1closed)) {
-            ok = fdStartMotor(1, CLOSE, dynTimeout_M1_Open); if (ok) stop1reason = 0;
-          } else if (frozenMotorNum == 2 && !digitalRead(lim2closed)) {
-            ok = fdStartMotor(2, CLOSE, dynTimeout_M2_Open); if (ok) stop2reason = 0;
+          if (frozenMotorNum == 1 && !digitalRead(LIM1_PHYS_OPEN)) {
+            ok = fdStartMotor(1, DIR_PHYS_OPEN, dynTimeout_M1_Open); if (ok) stop1reason = 0;
+          } else if (frozenMotorNum == 2 && !digitalRead(LIM2_PHYS_OPEN)) {
+            ok = fdStartMotor(2, DIR_PHYS_OPEN, dynTimeout_M2_Open); if (ok) stop2reason = 0;
           }
           if (ok) {
             frozenDomeState = FD_MONITORING;
@@ -1393,15 +1509,15 @@ void checkConflictingSignals() {
   if (!tofCalibrated || !tof_connected || tofDistance_mm <= 0) return;
   if (mot1dir != 0 || mot2dir != 0) return;  // Only check when motors stopped
 
-  bool s1_closed = digitalRead(lim1open);    // lim1open = physically CLOSED
-  bool s2_closed = digitalRead(lim2open);    // lim2open = physically CLOSED
+  bool s1_closed = digitalRead(LIM1_PHYS_CLOSED);
+  bool s2_closed = digitalRead(LIM2_PHYS_CLOSED);
   bool tof_says_open = (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE));
   bool tof_says_closed = (tofDistance_mm <= (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE));
 
   // Conflict: limits say closed but ToF says open
   if (s1_closed && s2_closed && tof_says_open) {
     // Rate limit conflict events to 1 per 5 minutes
-    if (now - lastConflictEventTime >= CONFLICT_EVENT_INTERVAL) {
+    if (lastConflictEventTime == 0 || now - lastConflictEventTime >= CONFLICT_EVENT_INTERVAL) {   // v4.2.0: 0 = never sent
       lastConflictEventTime = now;
       char detail[48];
       snprintf(detail, sizeof(detail), "Limits=CLOSED ToF=%dmm baseline=%dmm", tofDistance_mm, tofBaseline_mm);
@@ -1410,10 +1526,10 @@ void checkConflictingSignals() {
   }
 
   // Conflict: limits say open but ToF says closed (possible frozen top)
-  bool s1_open = digitalRead(lim1closed);
-  bool s2_open = digitalRead(lim2closed);
+  bool s1_open = digitalRead(LIM1_PHYS_OPEN);
+  bool s2_open = digitalRead(LIM2_PHYS_OPEN);
   if ((s1_open || s2_open) && tof_says_closed) {
-    if (now - lastConflictEventTime >= CONFLICT_EVENT_INTERVAL) {
+    if (lastConflictEventTime == 0 || now - lastConflictEventTime >= CONFLICT_EVENT_INTERVAL) {   // v4.2.0: 0 = never sent
       lastConflictEventTime = now;
       char detail[48];
       snprintf(detail, sizeof(detail), "Limits=OPEN ToF=%dmm baseline=%dmm", tofDistance_mm, tofBaseline_mm);
@@ -1435,11 +1551,12 @@ void checkConflictingSignals() {
  */
 void sendEventNotification(const char* type, const char* detail, bool urgent) {
   // Rate limiting (FIX (P1): a lockout follows its verdict within seconds and must not be dropped)
+  // v4.2.0: lastEventSentTime == 0 means "never sent" - the first event after boot is not dropped
   unsigned long now = millis();
-  if (!urgent && now - lastEventSentTime < EVENT_MIN_INTERVAL) return;
+  if (!urgent && lastEventSentTime != 0 && now - lastEventSentTime < EVENT_MIN_INTERVAL) return;
 
-  // Skip if network not ready
-  if (!ethernet_initialized || !networkMonitoringEnabled) return;
+  // Skip if network not ready or no Solo on site ($W off, v4.2.0)
+  if (!ethernet_initialized || !networkMonitoringEnabled || !remoteCheckEnabled) return;
 
   // URL-encode the detail string (replace spaces with %20) into a local buffer
   // so it can be sent in a single print() call for reliable TCP transmission
@@ -1628,7 +1745,7 @@ void networkWatchdog() {
   // idle: a PHY that takes long to re-link must never trigger the cable auto-close on an
   // open dome, and a STOP/CLOSE must not be delayed by the block.
   if (networkMonitoringEnabled && ethernet_initialized && mot1dir == 0 && mot2dir == 0 &&
-      digitalRead(lim1open) && digitalRead(lim2open) &&
+      digitalRead(LIM1_PHYS_CLOSED) && digitalRead(LIM2_PHYS_CLOSED) &&
       (currentTime - lastEthernetReset > ETHERNET_RESET_INTERVAL)) {
     setupEthernet();
   }
@@ -1704,7 +1821,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.0.2 - Safety Sensors"));
+    Serial.println(F("Dome Control v4.2.0 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -1849,6 +1966,18 @@ void checkRemoteConnectionAndAutoClose() {
       return;
     }
 
+    // v4.2.0: Cloudwatcher link check switched off ($W, persisted): no polling, no fail counting,
+    // no IP or cable-removal auto-close. A close that is already running is left alone (the ISR
+    // clears its auto-close flag at the limit switch). The timestamp is kept fresh so that
+    // re-enabling the check starts a clean 90 s interval instead of firing at once.
+    if (!remoteCheckEnabled) {
+      connectFailCount = 0;
+      firstFailTimestamp = 0;
+      lastConnectAttemptTimestamp = millis();
+      cableRemovalAutoCloseTriggered = false;
+      return;
+    }
+
     // --- Debug: Show current status ---
     #if defined(SERIAL_DEBUG_IP)
     static unsigned long lastDebugPrint = 0;
@@ -1865,9 +1994,9 @@ void checkRemoteConnectionAndAutoClose() {
       Serial.print(F("/"));
       Serial.print(maxConnectFails);
       Serial.print(F(" S1closed="));
-      Serial.print(digitalRead(lim1open) ? 1 : 0);
+      Serial.print(digitalRead(LIM1_PHYS_CLOSED) ? 1 : 0);
       Serial.print(F(" S2closed="));
-      Serial.println(digitalRead(lim2open) ? 1 : 0);
+      Serial.println(digitalRead(LIM2_PHYS_CLOSED) ? 1 : 0);
     }
     #endif
 
@@ -1883,10 +2012,10 @@ void checkRemoteConnectionAndAutoClose() {
     // Determine if dome needs protection (any state except fully closed)
     // Covers: fully open, intermediate position, currently opening, currently closing
     bool domeIsNotFullyClosed;
-    if (!digitalRead(lim1open) || !digitalRead(lim2open)) {
+    if (!digitalRead(LIM1_PHYS_CLOSED) || !digitalRead(LIM2_PHYS_CLOSED)) {
         // At least one shutter is not at closed position
         domeIsNotFullyClosed = true;
-    } else if (mot1dir == CLOSE || mot2dir == CLOSE) {
+    } else if (mot1dir == DIR_PHYS_OPEN || mot2dir == DIR_PHYS_OPEN) {
         // Motors actively opening (even if at closed limit, motor is trying to open)
         domeIsNotFullyClosed = true;
     } else {
@@ -1922,15 +2051,15 @@ void checkRemoteConnectionAndAutoClose() {
                 #endif
 
                 bool action_taken = false;
-                if (mot1dir != OPEN && !digitalRead(lim1open)) {
-                    startMotor1(OPEN, dynTimeout_M1_Close);
+                if (mot1dir != DIR_PHYS_CLOSE && !digitalRead(LIM1_PHYS_CLOSED)) {
+                    startMotor1(DIR_PHYS_CLOSE, dynTimeout_M1_Close);
                     m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F(">>> AUTO-CLOSE: S1 motor started (cable removed)"));
                     #endif
                 }
-                if (mot2dir != OPEN && !digitalRead(lim2open)) {
-                    startMotor2(OPEN, dynTimeout_M2_Close);
+                if (mot2dir != DIR_PHYS_CLOSE && !digitalRead(LIM2_PHYS_CLOSED)) {
+                    startMotor2(DIR_PHYS_CLOSE, dynTimeout_M2_Close);
                     m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F(">>> AUTO-CLOSE: S2 motor started (cable removed)"));
@@ -2034,13 +2163,13 @@ void checkRemoteConnectionAndAutoClose() {
                 firstFailTimestamp = 0; // Reset time window
                 
                 // STOPPE AUTO-CLOSE BEI ERFOLGREICHER VERBINDUNG
-                if (m1AutoClosedByIP && mot1dir == OPEN) {
+                if (m1AutoClosedByIP && mot1dir == DIR_PHYS_CLOSE) {
                     mot1dir = 0; stop1reason = 0; m1AutoClosedByIP = false; fdNoteCommand(FD_CMD_M1);
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F("IP Check: M1 Auto-Close STOPPED - Connection restored"));
                     #endif
                 }
-                if (m2AutoClosedByIP && mot2dir == OPEN) {
+                if (m2AutoClosedByIP && mot2dir == DIR_PHYS_CLOSE) {
                     mot2dir = 0; stop2reason = 0; m2AutoClosedByIP = false; fdNoteCommand(FD_CMD_M2);
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F("IP Check: M2 Auto-Close STOPPED - Connection restored"));
@@ -2100,15 +2229,15 @@ void checkRemoteConnectionAndAutoClose() {
             // - If motor is opening: reverse to close (soft-start handles transition)
             // - If motor already closing: no change needed
             bool action_taken = false;
-            if (mot1dir != OPEN && !digitalRead(lim1open)) {
-                startMotor1(OPEN, dynTimeout_M1_Close);
+            if (mot1dir != DIR_PHYS_CLOSE && !digitalRead(LIM1_PHYS_CLOSED)) {
+                startMotor1(DIR_PHYS_CLOSE, dynTimeout_M1_Close);
                 m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F(">>> AUTO-CLOSE: S1 motor started (5 failures)"));
                 #endif
             }
-            if (mot2dir != OPEN && !digitalRead(lim2open)) {
-                startMotor2(OPEN, dynTimeout_M2_Close);
+            if (mot2dir != DIR_PHYS_CLOSE && !digitalRead(LIM2_PHYS_CLOSED)) {
+                startMotor2(DIR_PHYS_CLOSE, dynTimeout_M2_Close);
                 m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F(">>> AUTO-CLOSE: S2 motor started (5 failures)"));
@@ -2201,6 +2330,9 @@ class PageWriter : public Print {
  *   /?$A  - ASCOM status: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR (pipe-delimited)
  *   /?$R  - Reset persistent counters
  *   /?$L  - Toggle tick logging on/off
+ *   /?$U  - Unlock dome after a frozen-dome lockout
+ *   /?$C  - Calibrate ToF baseline (dome must be closed)
+ *   /?$W  - Toggle the Cloudwatcher link check on/off (persisted in EEPROM, v4.2.0)
  *
  * Design notes:
  * - 1.5 second timeout prevents blocking on slow/broken connections
@@ -2262,6 +2394,17 @@ void handleWebClient() {
           action_parameter_in_url = true;
         }
 
+        // $W = Toggle Cloudwatcher link check (v4.2.0), persisted in EEPROM byte 9.
+        // Either way the failure window starts clean; a running auto-close is left alone.
+        if (c == 'W' || c == 'w') {
+          remoteCheckEnabled = !remoteCheckEnabled;
+          saveConfigFlags();
+          connectFailCount = 0;
+          firstFailTimestamp = 0;
+          lastConnectAttemptTimestamp = millis();
+          action_parameter_in_url = true;
+        }
+
         // $U = Unlock dome from frozen lockout
         if (c == 'U' || c == 'u') {
           if (fdOpenBlocked()) {   // FIX (P1): also while the lockout is pending after the 3rd verdict
@@ -2275,7 +2418,7 @@ void handleWebClient() {
         // $C = Calibrate ToF baseline (dome must be closed)
         if (c == 'C' || c == 'c') {
           // Only calibrate if dome is fully closed (both shutters at closed limit)
-          if (digitalRead(lim1open) && digitalRead(lim2open) && tof_connected) {
+          if (digitalRead(LIM1_PHYS_CLOSED) && digitalRead(LIM2_PHYS_CLOSED) && tof_connected) {
             calibrateToF();
           }
           action_parameter_in_url = true;
@@ -2284,11 +2427,11 @@ void handleWebClient() {
  // IMPROVED WEB LOGIC - Automatic stop before new command
         if (c == '1') {
           // $1 = CLOSE Shutter 1 (physically)
-          if (mot1dir != 0 && mot1dir != OPEN) {
+          if (mot1dir != 0 && mot1dir != DIR_PHYS_CLOSE) {
               mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
           }
-          if (!digitalRead(lim1open)) {
-              if (mot1dir != OPEN) startMotor1(OPEN, dynTimeout_M1_Close);   // P2: a repeated command must not reload the timeout
+          if (!digitalRead(LIM1_PHYS_CLOSED)) {
+              if (mot1dir != DIR_PHYS_CLOSE) startMotor1(DIR_PHYS_CLOSE, dynTimeout_M1_Close);   // P2: a repeated command must not reload the timeout
               stop1reason = 0; m1AutoClosedByIP = false;                    // ... but it still takes ownership of the motion
           }
         } else if (c == '2') {
@@ -2296,21 +2439,21 @@ void handleWebClient() {
           if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
-            if (mot1dir != 0 && mot1dir != CLOSE) {
+            if (mot1dir != 0 && mot1dir != DIR_PHYS_OPEN) {
                 mot1dir = 0; stop1reason = 2; m1AutoClosedByIP = false;
             }
-            if (!digitalRead(lim1closed)) {
-                if (mot1dir != CLOSE) startMotor1(CLOSE, dynTimeout_M1_Open);
+            if (!digitalRead(LIM1_PHYS_OPEN)) {
+                if (mot1dir != DIR_PHYS_OPEN) startMotor1(DIR_PHYS_OPEN, dynTimeout_M1_Open);
                 stop1reason = 0; m1AutoClosedByIP = false;
             }
           }
         } else if (c == '3') {
           // $3 = CLOSE Shutter 2 (physically)
-          if (mot2dir != 0 && mot2dir != OPEN) {
+          if (mot2dir != 0 && mot2dir != DIR_PHYS_CLOSE) {
               mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
           }
-          if (!digitalRead(lim2open)) {
-              if (mot2dir != OPEN) startMotor2(OPEN, dynTimeout_M2_Close);
+          if (!digitalRead(LIM2_PHYS_CLOSED)) {
+              if (mot2dir != DIR_PHYS_CLOSE) startMotor2(DIR_PHYS_CLOSE, dynTimeout_M2_Close);
               stop2reason = 0; m2AutoClosedByIP = false;
           }
         } else if (c == '4') {
@@ -2318,11 +2461,11 @@ void handleWebClient() {
           if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
-            if (mot2dir != 0 && mot2dir != CLOSE) {
+            if (mot2dir != 0 && mot2dir != DIR_PHYS_OPEN) {
                 mot2dir = 0; stop2reason = 2; m2AutoClosedByIP = false;
             }
-            if (!digitalRead(lim2closed)) {
-                if (mot2dir != CLOSE) startMotor2(CLOSE, dynTimeout_M2_Open);
+            if (!digitalRead(LIM2_PHYS_OPEN)) {
+                if (mot2dir != DIR_PHYS_OPEN) startMotor2(DIR_PHYS_OPEN, dynTimeout_M2_Open);
                 stop2reason = 0; m2AutoClosedByIP = false;
             }
           }
@@ -2376,7 +2519,7 @@ void handleWebClient() {
           client.println(F("Content-Type: text/plain"));
           client.println(F("Connection: close"));
           client.println(); 
-          if (digitalRead(lim1open) && digitalRead(lim2open)) {
+          if (digitalRead(LIM1_PHYS_CLOSED) && digitalRead(LIM2_PHYS_CLOSED)) {
             client.println(F("CLOSED"));
           } else {
             client.println(F("OPEN")); 
@@ -2384,33 +2527,33 @@ void handleWebClient() {
         } else if (ascom_status_request) {
           // ASCOM driver endpoint — compact pipe-delimited status
           // Format: S1_STATE|S1_MOTOR|S2_STATE|S2_MOTOR
-          // Physical reality (inverted from code variable names)
+          // Physical reality, resolved through the site profile (PHYSICAL SEMANTICS)
           client.println(F("HTTP/1.1 200 OK"));
           client.println(F("Content-Type: text/plain"));
           client.println(F("Connection: close"));
           client.println();
 
           // Shutter 1 (East) physical state
-          if (digitalRead(lim1closed))      client.print(F("OPEN"));       // lim1closed = physically open
-          else if (digitalRead(lim1open))   client.print(F("CLOSED"));     // lim1open = physically closed
+          if (digitalRead(LIM1_PHYS_OPEN))      client.print(F("OPEN"));
+          else if (digitalRead(LIM1_PHYS_CLOSED)) client.print(F("CLOSED"));
           else                              client.print(F("INTERMEDIATE"));
           client.print('|');
 
           // Shutter 1 motor direction (physical)
-          if (mot1dir == CLOSE)             client.print(F("OPENING"));    // CLOSE direction = physically opening
-          else if (mot1dir == OPEN)         client.print(F("CLOSING"));    // OPEN direction = physically closing
+          if (mot1dir == DIR_PHYS_OPEN)         client.print(F("OPENING"));
+          else if (mot1dir == DIR_PHYS_CLOSE)   client.print(F("CLOSING"));
           else                              client.print(F("STOPPED"));
           client.print('|');
 
           // Shutter 2 (West) physical state
-          if (digitalRead(lim2closed))      client.print(F("OPEN"));
-          else if (digitalRead(lim2open))   client.print(F("CLOSED"));
+          if (digitalRead(LIM2_PHYS_OPEN))      client.print(F("OPEN"));
+          else if (digitalRead(LIM2_PHYS_CLOSED)) client.print(F("CLOSED"));
           else                              client.print(F("INTERMEDIATE"));
           client.print('|');
 
           // Shutter 2 motor direction (physical)
-          if (mot2dir == CLOSE)             client.print(F("OPENING"));
-          else if (mot2dir == OPEN)         client.print(F("CLOSING"));
+          if (mot2dir == DIR_PHYS_OPEN)         client.print(F("OPENING"));
+          else if (mot2dir == DIR_PHYS_CLOSE)   client.print(F("CLOSING"));
           else                              client.print(F("STOPPED"));
           client.println();
 
@@ -2508,8 +2651,8 @@ void sendFullHtmlResponse(Print& client) {
       client.println(F("</div>"));
       client.println(F("<div class='status'>"));
       // Status display logic for Shutter 1
-      bool s1_is_physically_closed_state = digitalRead(lim1open);
-      bool s1_is_physically_open_state = digitalRead(lim1closed);
+      bool s1_is_physically_closed_state = digitalRead(LIM1_PHYS_CLOSED);
+      bool s1_is_physically_open_state = digitalRead(LIM1_PHYS_OPEN);
       client.print(F("<strong>State:</strong> "));
       if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
       else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
@@ -2517,14 +2660,14 @@ void sendFullHtmlResponse(Print& client) {
       if (mot1dir == 0 && !s1_is_physically_open_state && !s1_is_physically_closed_state) client.print(F(" (Stopped)"));
 
       client.print(F("<br><strong>Movement:</strong> "));
-      if (mot1dir == OPEN) { client.print(F("Closing (physically)")); if(m1AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop1reason==4) client.print(F(" (VCC Fail)"));}
-      else if (mot1dir == CLOSE) { client.print(F("Opening (physically)"));}
+      if (mot1dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m1AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop1reason==4) client.print(F(" (VCC Fail)"));}
+      else if (mot1dir == DIR_PHYS_OPEN) { client.print(F("Opening (physically)"));}
       else {client.print(F("Stopped"));}
 
       if(mot1dir == 0) {
           client.print(F("<br><strong>Stop Reason:</strong> "));
-          if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (lim1closed)"));
-          else if (s1_is_physically_closed_state && stop1reason==0) client.print(F("Limit 'Phys. Closed' (lim1open)"));
+          if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (" LIM1_PHYS_OPEN_NAME ")"));
+          else if (s1_is_physically_closed_state && stop1reason==0) client.print(F("Limit 'Phys. Closed' (" LIM1_PHYS_CLOSED_NAME ")"));
           else if (stop1reason == 1) client.print(F("Button/SWSTOP"));
           else if (stop1reason == 2) client.print(F("Web STOP"));
           else if (stop1reason == 3 && m1AutoClosedByIP) client.print(F("IP Fail Auto-Close"));
@@ -2544,8 +2687,8 @@ void sendFullHtmlResponse(Print& client) {
       client.println(F("</div>"));
       client.println(F("<div class='status'>"));
       // Status display logic for Shutter 2
-      bool s2_is_physically_closed_state = digitalRead(lim2open);
-      bool s2_is_physically_open_state = digitalRead(lim2closed);
+      bool s2_is_physically_closed_state = digitalRead(LIM2_PHYS_CLOSED);
+      bool s2_is_physically_open_state = digitalRead(LIM2_PHYS_OPEN);
       client.print(F("<strong>State:</strong> "));
       if (s2_is_physically_closed_state) client.print(F("Physically CLOSED"));
       else if (s2_is_physically_open_state) client.print(F("Physically OPEN"));
@@ -2553,14 +2696,14 @@ void sendFullHtmlResponse(Print& client) {
       if (mot2dir == 0 && !s2_is_physically_open_state && !s2_is_physically_closed_state) client.print(F(" (Stopped)"));
 
       client.print(F("<br><strong>Movement:</strong> "));
-      if (mot2dir == OPEN) { client.print(F("Closing (physically)")); if(m2AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop2reason==4) client.print(F(" (VCC Fail)"));}
-      else if (mot2dir == CLOSE) { client.print(F("Opening (physically)"));}
+      if (mot2dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m2AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop2reason==4) client.print(F(" (VCC Fail)"));}
+      else if (mot2dir == DIR_PHYS_OPEN) { client.print(F("Opening (physically)"));}
       else {client.print(F("Stopped"));}
 
       if(mot2dir == 0) {
           client.print(F("<br><strong>Stop Reason:</strong> "));
-          if (s2_is_physically_open_state && stop2reason==0) client.print(F("Limit 'Phys. Open' (lim2closed)"));
-          else if (s2_is_physically_closed_state && stop2reason==0) client.print(F("Limit 'Phys. Closed' (lim2open)"));
+          if (s2_is_physically_open_state && stop2reason==0) client.print(F("Limit 'Phys. Open' (" LIM2_PHYS_OPEN_NAME ")"));
+          else if (s2_is_physically_closed_state && stop2reason==0) client.print(F("Limit 'Phys. Closed' (" LIM2_PHYS_CLOSED_NAME ")"));
           else if (stop2reason == 1) client.print(F("Button/SWSTOP"));
           else if (stop2reason == 2) client.print(F("Web STOP"));
           else if (stop2reason == 3 && m2AutoClosedByIP) client.print(F("IP Fail Auto-Close"));
@@ -2674,7 +2817,7 @@ void sendFullHtmlResponse(Print& client) {
       if (frozenDomeState == FD_LOCKOUT) {
         client.print(F("<a href='/?$U' class='button b-stop fullwidth'>UNLOCK DOME</a>"));
       }
-      bool domeFullyClosed = digitalRead(lim1open) && digitalRead(lim2open);
+      bool domeFullyClosed = digitalRead(LIM1_PHYS_CLOSED) && digitalRead(LIM2_PHYS_CLOSED);
       if (domeFullyClosed && tof_connected && mot1dir == 0 && mot2dir == 0) {
         client.print(F("<a href='/?$C' class='button b-reset fullwidth'>Calibrate ToF Baseline</a>"));
       }
@@ -2682,6 +2825,9 @@ void sendFullHtmlResponse(Print& client) {
 
       // --- IP Monitoring Status ---
       client.println(F("<div class='section'><h2>IP Monitoring</h2><table>"));
+      client.print(F("<tr><td>Cloudwatcher Check</td><td>"));          // v4.2.0: $W runtime switch
+      client.print(remoteCheckEnabled ? F("ENABLED") : F("DISABLED"));
+      client.println(F("</td></tr>"));
       client.print(F("<tr><td>Current IP Fails</td><td>"));
       client.print(connectFailCount);
       client.print(F("/"));
@@ -2715,18 +2861,24 @@ void sendFullHtmlResponse(Print& client) {
 
       client.println(F("</table>"));
       client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
+      client.print(F("<a href='/?$W' class='button "));                 // v4.2.0: toggle $W
+      client.print(remoteCheckEnabled ? F("b-stop") : F("b-open"));
+      client.print(F(" fullwidth' style='margin-top:8px;'>"));
+      client.print(remoteCheckEnabled ? F("Disable Cloudwatcher Check") : F("Enable Cloudwatcher Check"));
+      client.println(F("</a>"));
       client.println(F("</div>"));
 
       // --- System Status ---
       client.println(F("<div class='section'><h2>System Status</h2><table>"));
       client.print(F("<tr><th>Sensor</th><th>State</th></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(lim1open);client.print(F(")</td><td>")); client.print(digitalRead(lim1open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(lim1closed);client.print(F(")</td><td>")); client.print(digitalRead(lim1closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(lim2open);client.print(F(")</td><td>")); client.print(digitalRead(lim2open) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
-      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(lim2closed);client.print(F(")</td><td>")); client.print(digitalRead(lim2closed) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Closed (Pin "));client.print(LIM1_PHYS_CLOSED);client.print(F(")</td><td>")); client.print(digitalRead(LIM1_PHYS_CLOSED) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S1 Phys. Open (Pin "));client.print(LIM1_PHYS_OPEN);client.print(F(")</td><td>")); client.print(digitalRead(LIM1_PHYS_OPEN) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Closed (Pin "));client.print(LIM2_PHYS_CLOSED);client.print(F(")</td><td>")); client.print(digitalRead(LIM2_PHYS_CLOSED) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
+      client.print(F("<tr><td>Limit S2 Phys. Open (Pin "));client.print(LIM2_PHYS_OPEN);client.print(F(")</td><td>")); client.print(digitalRead(LIM2_PHYS_OPEN) ? F("HIGH (Active)") : F("LOW")); client.println(F("</td></tr>"));
       client.print(F("<tr><td>VCC1 (Main Power)</td><td>")); client.print((float)analogRead(VCC1) * 24.0f / 1023.0f * (1023.0f / VCC_RAW_MAX), 1); client.println(F("V</td></tr>"));
       client.print(F("<tr><td>SWSTOP Pressed</td><td>")); client.print(!digitalRead(SWSTOP) ? F("YES") : F("NO")); client.println(F("</td></tr>"));
       client.print(F("<tr><td>Network Status</td><td>")); client.print(ethernet_initialized ? F("OK") : F("ERROR")); client.println(F("</td></tr>"));
+      client.println(F("<tr><td>Limit Wiring</td><td>" WIRING_LABEL "</td></tr>"));   // v4.2.0: site profile
       client.println(F("</table></div>"));
 
       // --- Tick Logging Section ---
@@ -2908,20 +3060,24 @@ ISR(TIMER2_COMPA_vect) {
   }
 
   //--- LIMIT SWITCH DETECTION ---
-  // Stop motor immediately when endpoint is reached
-  // Note: Switch names are inverted due to wiring (lim1open = physically closed)
+  // Stop motor immediately when endpoint is reached. This is the HARDWARE pairing and
+  // identical on every site: direction OPEN ends at lim*open, direction CLOSE at lim*closed.
+  // Both branches keep an IP/VCC auto-close stop reason (v4.2.0: symmetric, because which
+  // of the two directions is the physical close depends on the site profile).
   if (digitalRead(lim1open) && mot1dir == OPEN) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
     #if defined(SERIAL_DEBUG_LIMITS)
-    Serial.println(F("ISR: M1 reached closed position -> STOP"));
+    Serial.println(F("ISR: M1 reached lim1open -> STOP"));
     #endif
   }
   if (digitalRead(lim1closed) && mot1dir == CLOSE) {
-    mot1dir = 0; stop1reason = 0; m1AutoClosedByIP = false;
+    mot1dir = 0;
+    if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
+    m1AutoClosedByIP = false;
     #if defined(SERIAL_DEBUG_LIMITS)
-    Serial.println(F("ISR: M1 reached open position -> STOP"));
+    Serial.println(F("ISR: M1 reached lim1closed -> STOP"));
     #endif
   }
   if (digitalRead(lim2open) && mot2dir == OPEN) {
@@ -2929,13 +3085,15 @@ ISR(TIMER2_COMPA_vect) {
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
     #if defined(SERIAL_DEBUG_LIMITS)
-    Serial.println(F("ISR: M2 reached closed position -> STOP"));
+    Serial.println(F("ISR: M2 reached lim2open -> STOP"));
     #endif
   }
   if (digitalRead(lim2closed) && mot2dir == CLOSE) {
-    mot2dir = 0; stop2reason = 0; m2AutoClosedByIP = false;
+    mot2dir = 0;
+    if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
+    m2AutoClosedByIP = false;
     #if defined(SERIAL_DEBUG_LIMITS)
-    Serial.println(F("ISR: M2 reached open position -> STOP"));
+    Serial.println(F("ISR: M2 reached lim2closed -> STOP"));
     #endif
   }
 
@@ -2986,12 +3144,13 @@ ISR(TIMER2_COMPA_vect) {
   // Debounced (cnt > 6 = ~100ms), toggle behavior:
   // - If motor running: stop it
   // - If motor stopped: start in button's direction (if not at limit)
-  // - Open buttons (SW1down, SW2down) blocked during frozen lockout
+  // - The button that physically OPENS is blocked during frozen lockout (BUTTON_MAY_START),
+  //   the motor timeout follows the physical direction (TIMEOUT_M*_FOR); both are compile-time
   if (!digitalRead(SW1up) && cnt > 6 && !sw1up_pressed_flag) {
     sw1up_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M1;
     if (mot1dir) { mot1dir = 0; stop1reason = 1; m1AutoClosedByIP = false; }
-    else if (!digitalRead(lim1open)) {
-        mot1dir = OPEN; mot1timer = dynTimeout_M1_Close; stop1reason = 0; m1AutoClosedByIP = false;
+    else if (BUTTON_MAY_START(OPEN) && !digitalRead(lim1open)) {
+        mot1dir = OPEN; mot1timer = TIMEOUT_M1_FOR(OPEN); stop1reason = 0; m1AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)
     Serial.println(F("ISR: SW1up action"));
@@ -3000,8 +3159,8 @@ ISR(TIMER2_COMPA_vect) {
   if (!digitalRead(SW1down) && cnt > 6 && !sw1down_pressed_flag) {
     sw1down_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M1;
     if (mot1dir) { mot1dir = 0; stop1reason = 1; m1AutoClosedByIP = false; }
-    else if (!fdOpenBlocked() && !digitalRead(lim1closed)) {
-        mot1dir = CLOSE; mot1timer = dynTimeout_M1_Open; stop1reason = 0; m1AutoClosedByIP = false;
+    else if (BUTTON_MAY_START(CLOSE) && !digitalRead(lim1closed)) {
+        mot1dir = CLOSE; mot1timer = TIMEOUT_M1_FOR(CLOSE); stop1reason = 0; m1AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)
     Serial.println(F("ISR: SW1down action"));
@@ -3010,8 +3169,8 @@ ISR(TIMER2_COMPA_vect) {
   if (!digitalRead(SW2up) && cnt > 6 && !sw2up_pressed_flag) {
     sw2up_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M2;
     if (mot2dir) { mot2dir = 0; stop2reason = 1; m2AutoClosedByIP = false; }
-    else if (!digitalRead(lim2open)) {
-        mot2dir = OPEN; mot2timer = dynTimeout_M2_Close; stop2reason = 0; m2AutoClosedByIP = false;
+    else if (BUTTON_MAY_START(OPEN) && !digitalRead(lim2open)) {
+        mot2dir = OPEN; mot2timer = TIMEOUT_M2_FOR(OPEN); stop2reason = 0; m2AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)
     Serial.println(F("ISR: SW2up action"));
@@ -3020,8 +3179,8 @@ ISR(TIMER2_COMPA_vect) {
   if (!digitalRead(SW2down) && cnt > 6 && !sw2down_pressed_flag) {
     sw2down_pressed_flag = true; cnt = 0; fdExternalCommand |= FD_CMD_M2;
     if (mot2dir) { mot2dir = 0; stop2reason = 1; m2AutoClosedByIP = false; }
-    else if (!fdOpenBlocked() && !digitalRead(lim2closed)) {
-        mot2dir = CLOSE; mot2timer = dynTimeout_M2_Open; stop2reason = 0; m2AutoClosedByIP = false;
+    else if (BUTTON_MAY_START(CLOSE) && !digitalRead(lim2closed)) {
+        mot2dir = CLOSE; mot2timer = TIMEOUT_M2_FOR(CLOSE); stop2reason = 0; m2AutoClosedByIP = false;
     }
     #if defined(SERIAL_DEBUG_BUTTONS)
     Serial.println(F("ISR: SW2down action"));
@@ -3052,14 +3211,14 @@ ISR(TIMER2_COMPA_vect) {
   // Detect motor START (transition from stopped to running)
   if (mot1dir != 0 && m1_prev_dir == 0) {
     // Motor just started - check if at a limit switch (valid full-run start)
-    bool at_open_limit = digitalRead(lim1closed);   // lim1closed = physically OPEN
-    bool at_closed_limit = digitalRead(lim1open);   // lim1open = physically CLOSED
+    bool at_open_limit = digitalRead(LIM1_PHYS_OPEN);
+    bool at_closed_limit = digitalRead(LIM1_PHYS_CLOSED);
 
     if (at_open_limit || at_closed_limit) {
       // Started at a limit - this could be a valid full-run
       m1_full_run_active = true;
       m1_tick_counter = 0;
-      m1_was_closing = (mot1dir == OPEN);  // OPEN command = physically closing
+      m1_was_closing = (mot1dir == DIR_PHYS_CLOSE);  // physical direction
     } else {
       // Started from intermediate position - not a full-run
       m1_full_run_active = false;
@@ -3077,13 +3236,13 @@ ISR(TIMER2_COMPA_vect) {
     if (m1_full_run_active) {
       bool at_target = false;
 
-      if (m1_was_closing && digitalRead(lim1open)) {
+      if (m1_was_closing && digitalRead(LIM1_PHYS_CLOSED)) {
         // Was closing and reached closed limit - VALID
         at_target = true;
         m1_last_ticks_closing = m1_tick_counter;
         m1_last_direction = 1;  // closing
       }
-      else if (!m1_was_closing && digitalRead(lim1closed)) {
+      else if (!m1_was_closing && digitalRead(LIM1_PHYS_OPEN)) {
         // Was opening and reached open limit - VALID
         at_target = true;
         m1_last_ticks_opening = m1_tick_counter;
@@ -3108,13 +3267,13 @@ ISR(TIMER2_COMPA_vect) {
   //--- MOTOR 2 TICK TRACKING ---
   // Detect motor START
   if (mot2dir != 0 && m2_prev_dir == 0) {
-    bool at_open_limit = digitalRead(lim2closed);   // lim2closed = physically OPEN
-    bool at_closed_limit = digitalRead(lim2open);   // lim2open = physically CLOSED
+    bool at_open_limit = digitalRead(LIM2_PHYS_OPEN);
+    bool at_closed_limit = digitalRead(LIM2_PHYS_CLOSED);
 
     if (at_open_limit || at_closed_limit) {
       m2_full_run_active = true;
       m2_tick_counter = 0;
-      m2_was_closing = (mot2dir == OPEN);
+      m2_was_closing = (mot2dir == DIR_PHYS_CLOSE);
     } else {
       m2_full_run_active = false;
     }
@@ -3130,12 +3289,12 @@ ISR(TIMER2_COMPA_vect) {
     if (m2_full_run_active) {
       bool at_target = false;
 
-      if (m2_was_closing && digitalRead(lim2open)) {
+      if (m2_was_closing && digitalRead(LIM2_PHYS_CLOSED)) {
         at_target = true;
         m2_last_ticks_closing = m2_tick_counter;
         m2_last_direction = 1;
       }
-      else if (!m2_was_closing && digitalRead(lim2closed)) {
+      else if (!m2_was_closing && digitalRead(LIM2_PHYS_OPEN)) {
         at_target = true;
         m2_last_ticks_opening = m2_tick_counter;
         m2_last_direction = 2;
