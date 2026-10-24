@@ -50,10 +50,12 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\RegAsm.exe /codebase AstroShellD
 
 ### Swap Open/Close
 
-The AstroShell dome has inverted limit switch wiring (documented in main README). The default command mapping matches the standard AstroShell configuration:
+Leave this **unchecked** on both domes with firmware v4.2.0 or newer. The Arduino resolves the wiring through its site profile and reports physical state on `$A`, so `OpenShutter()` sending `$4` + `$2` physically opens on the mirrored German dome and on the standard Portuguese dome alike.
 
-- **Unchecked (default):** `OpenShutter()` sends `$4` (West) + `$2` (East) = physically opens
-- **Checked:** `OpenShutter()` sends `$3` (West) + `$1` (East) = reversed for opposite wiring
+The option only inverts the *commands*; the `$A` status parsing is not inverted. On a firmware that reports the wrong physical state (any version before 4.2.0 on a standard-wired dome) ticking the box makes the commands work but leaves NINA seeing the opposite shutter state. Update the firmware instead.
+
+- **Unchecked (default):** `OpenShutter()` sends `$4` (West) + `$2` (East)
+- **Checked:** `OpenShutter()` sends `$3` (West) + `$1` (East) — legacy only
 
 ## How It Works
 

@@ -19,7 +19,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 
 | File | Purpose |
 |------|---------|
-| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.0 with safety sensors, dynamic timeout, frozen dome detection |
+| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.2.0, dual-site (Germany mirrored / Portugal standard), safety sensors, dynamic timeout, frozen dome detection |
 | `astroshell_ticklogger.py` | **Pi server** - Receives tick data + events from Arduino, logs to CSV, sends Pushover alerts |
 | `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
@@ -29,14 +29,16 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `open_astroshell.bat` | **NINA script** - Opens dome via sequence instruction, Pushover notification |
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
-| `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.0.0) |
+| `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 35 scenarios per site profile (v4.2.0) |
+| `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
 ## Hardware Configuration
 
 - **Microcontroller**: Arduino MEGA 2560 with Ethernet Shield (W5100/W5500)
 - **Dome IP**: 192.168.1.177 (static)
-- **Cloudwatcher IP**: 192.168.1.151 (monitored for connectivity)
+- **Cloudwatcher IP**: 192.168.1.151 (monitored for connectivity; the check is switchable at runtime with `$W`, see Network Monitoring)
 - **Motors**: Two DC motors with PWM soft-start (pins 3, 5, 6, 9)
 - **Limit switches**: Pins 0, 1, 2, 7 (pins 0/1 conflict with Serial - debugging disabled)
 - **Buttons**: A2-A5 (shutter controls), pin 8 (emergency STOP)
@@ -60,7 +62,7 @@ All real-time operations run in the interrupt service routine:
 
 ### Sensors (v4.0)
 - **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout
-- **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection
+- **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection. **Compiled out by default since v4.2.0** (`ENABLE_TOF_FROZEN_DETECTION 0`, no sensor mounted on either dome): no Wire/VL53L0X libraries, no I2C traffic; `tof_connected` stays false so the frozen state machine, `$C`/`$U` and the conflict check are inert. The host test suite runs each site with and without the layer.
 - Both sensors degrade gracefully: 10 consecutive failures → feature disabled
 
 ### Dynamic Motor Timeout (v4.0)
@@ -87,6 +89,7 @@ All real-time operations run in the interrupt service routine:
 - Cable removal triggers **immediate** auto-close
 - Uses `netClient.setTimeout(3000)` to prevent watchdog timeout
 - No Pushover for IP auto-close (network is down when it triggers)
+- **`$W` (v4.2.0)**: the whole block is gated by `remoteCheckEnabled` (EEPROM byte 9, with the site id in bits 1-2). OFF = no polling, no fail counting, no IP or cable-removal auto-close, no tick/interrupt/event pushes; a running auto-close is left alone. `$W1`/`$W0` are idempotent (the character after the W is parsed, so `$W1` is not followed by a `$1` CLOSE command); only a real change resets the failure window; the first real check comes 90 s (+ one skipped check after an Ethernet rebuild) after enabling.
 
 ### Event Notifications (v4.0)
 - Arduino pushes events to Solo:88/event via HTTP GET
@@ -113,8 +116,9 @@ All real-time operations run in the interrupt service routine:
 | `/?$L` | Toggle tick logging on/off (default: ON after reboot) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be fully closed (v4.0) |
+| `/?$W` | Toggle Cloudwatcher link check; `/?$W1` = on, `/?$W0` = off (idempotent; the UI button uses these) — persisted in EEPROM byte 9 with the site id; OFF also disables cable-removal auto-close and all pushes to the Solo (v4.2.0) |
 
-**Note:** Button labels in code are inverted due to hardware wiring swap. The web interface shows physical reality.
+**Note:** The web API, `$S`, `$A` and the web page are physical on both sites; the site profile resolves the wiring (see Site Profile and Physical Semantics).
 
 ## Motor Stop Reason Codes
 
@@ -130,17 +134,23 @@ Displayed on web interface under "Stop Reason":
 | 5 | Motor timeout reached | "TIMEOUT at X ticks" |
 | 6 | Frozen dome auto-reverse (v4.0) | "FROZEN DOME Auto-Reverse" |
 
-## Critical Code Quirk - Inverted Limit Switches
+## Site Profile and Physical Semantics (v4.2.0)
 
-Due to installation wiring error, limit switch names are **inverted** in code:
-```
-lim1open (pin 7)   → Actually detects PHYSICALLY CLOSED
-lim1closed (pin 2) → Actually detects PHYSICALLY OPEN
-lim2open (pin 1)   → Actually detects PHYSICALLY CLOSED
-lim2closed (pin 0) → Actually detects PHYSICALLY OPEN
-```
+Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (`#define SITE SITE_GERMANY`, the default) or override with `-DSITE=2` on the command line (CI builds both).
 
-The **motor control logic is unchanged** from original. Only the **web display** was inverted to show physical reality. See README.md for details if adapting for correctly-wired installations.
+| | `SITE_GERMANY` (mirrored install) | `SITE_PORTUGAL` (original AstroShell wiring) |
+|---|---|---|
+| `LIMIT_WIRING_SWAPPED` | 1 | 0 |
+| Direction `OPEN` (PWM motor*b, ends at `lim*open`) is physically | closing | opening |
+| `lim1open` (pin 7) / `lim2open` (pin 1) HIGH | physically CLOSED | physically OPEN |
+| Panel button "up" (SW*up) | closes | opens |
+| `DEFAULT_REMOTE_CHECK` (Cloudwatcher check until `$W` is used) | 1 | 0 |
+
+Rules:
+- The hardware pairing never changes: the ISR stops direction `OPEN` at `lim*open` and `CLOSE` at `lim*closed`; the PWM pin mapping is fixed.
+- **Everything that means "physically open/closed" must use** `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM1_PHYS_CLOSED` / `LIM1_PHYS_OPEN` / `LIM2_PHYS_CLOSED` / `LIM2_PHYS_OPEN` (plus the `*_NAME` strings and `WIRING_LABEL` for UI text). Raw `OPEN`/`CLOSE`/`lim*` are allowed only in the defines, the PHYSICAL SEMANTICS block, `pinMode`, the ISR limit stops, the ISR PWM output, the ISR stop-reason housekeeping and the ISR panel buttons (which use `BUTTON_MAY_START(dir)` and `TIMEOUT_M*_FOR(dir)`).
+- The web API is physical on both sites: `$1`/`$3` close, `$2`/`$4` open; `$S`, `$A` and the web page report physical state. The ASCOM driver needs no site setting ("Swap Open/Close" stays unchecked on both domes).
+- Before v4.2.0 the mirrored interpretation was hard-coded in 109 places. Flashed on a standard-wired dome, the IP-fail auto-close drove the shutters to the physically OPEN end stop. Never add a raw limit/direction test outside the allowed places; `make -C test/host test` runs every scenario for both sites and catches it.
 
 ## EEPROM Memory Map
 
@@ -152,11 +162,14 @@ The **motor control logic is unchanged** from original. Only the **web display**
 | 5 | 1 byte | Uptime day counter |
 | 6-7 | 2 bytes | ToF baseline distance in mm (v4.0) |
 | 8 | 1 byte | ToF calibration magic (0xA5) (v4.0) |
+| 9 | 1 byte | Config flags (v4.2.0): bit 0 = Cloudwatcher check enabled; bits 1-2 = SITE that wrote the byte (another SITE re-applies its default); bit 7 set (0xFF, never written) = apply site default and persist |
 
 ## Key Configuration Constants
 
 ### domecontrol_JK3.ino
 ```cpp
+#define SITE SITE_GERMANY                   // Site profile: SITE_GERMANY (mirrored) or SITE_PORTUGAL (standard), v4.2.0
+#define ENABLE_TOF_FROZEN_DETECTION 0       // v4.2.0: ToF/I2C layer compiled out until a VL53L0X is mounted
 #define SMOOTH 30                           // Soft-start smoothness
 #define MAX_MOT1_OPEN  6527                 // Motor timeout fallback (107 sec at 61Hz)
 
@@ -261,7 +274,14 @@ mount -o remount,ro /
 Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
 - SPI.h, Ethernet.h, EEPROM.h, avr/wdt.h (built-in)
 - OneWire.h, DallasTemperature.h (install via Library Manager) (v4.0)
-- Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) (v4.0)
+- Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) — only when `ENABLE_TOF_FROZEN_DETECTION` is 1 (default 0 since v4.2.0, then not needed)
+
+### Host Logic Tests (v4.2.0)
+`make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile, with the ToF layer compiled out and built in (four binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
+Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position.
+
+### Toolchain Note (Apple Silicon Mac)
+The Arduino IDE's bundled avr-gcc is x86_64. Without Rosetta neither the IDE nor `arduino-cli` can compile here ("bad CPU type in executable"); install Rosetta (`softwareupdate --install-rosetta --agree-to-license`) or rely on the CI build. Bundled CLI: `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`. Compile from a folder named like the sketch (`domecontrol_JK3/domecontrol_JK3.ino`), never from the repo root (it holds three `.ino` files).
 
 ### Debug Modes (USE WITH CAUTION)
 Serial debugging conflicts with limit switch pins 0/1. Only enable with limit switches disconnected:
@@ -421,7 +441,14 @@ This file has documented bugs (see file header for full list):
 4. **Frozen dome simulation**: Block ToF sensor during open → verify stop + reverse + 3 retries + lockout
 5. **Unlock**: After lockout → click "UNLOCK DOME" → verify open commands work again
 6. **Graceful degradation**: Disconnect both sensors → verify system behaves identically to v3.3
-7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup.
+7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup. (Germany profile; in the Portugal profile the roles of pins 2 and 7 swap.)
+
+### Portugal Commissioning Checklist (v4.2.0)
+1. Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show "Cloudwatcher Check: DISABLED".
+2. Dome in intermediate position: "OPEN S1" must physically open S1, the page must say "Opening (physically)", `$A` must say `INTERMEDIATE|OPENING|...`. Then "CLOSE S1".
+3. Run one shutter to each end stop: state line "Physically OPEN/CLOSED" and the pin rows (S1 phys. closed = pin 2, phys. open = pin 7) must match.
+4. ASCOM driver: "Swap Open/Close" unchecked; NINA must show the real shutter state.
+5. Keep "Cloudwatcher Check" DISABLED until a Solo exists at 192.168.1.151; enabled without one, the dome closes about 16 minutes after every opening.
 
 ### Important Implementation Details (v4.0)
 
@@ -433,3 +460,6 @@ These patterns were discovered during lab testing and are critical for future mo
 - **DS18B20 pullup resistor**: 4.7kΩ required (5.1kΩ also works). Without pullup, OneWire open-drain bus cannot communicate.
 - **URL encoding**: Event detail strings sent to the Solo must be URL-encoded (spaces → `%20`). Python's `BaseHTTPRequestHandler` rejects URLs with literal spaces (HTTP 400). Encoding is done in a local buffer before `print()`, not char-by-char via `write()` (which caused TCP issues on W5100/W5500).
 - **Python stdout buffering**: The ticklogger service file must use `python3 -u` (unbuffered) or `print()` output won't appear in `journalctl`. The `-u` flag is set in `astroshell_ticklogger.service`.
+- **Rate-limiter timestamps start at 0** (v4.2.0): a plain `now - last < interval` test with `last == 0` suppresses the first event after boot (events for 10 s, conflict events for 5 min). Treat 0 as "never sent".
+- **Stop reasons at limit switches**: once a motor is off at a limit, the ISR clears every stop reason except 3 (with the auto-close flag) and 4 on the next tick. Reason 6 (frozen) is therefore only visible mid-travel.
+- **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`.
