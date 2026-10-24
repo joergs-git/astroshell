@@ -29,8 +29,10 @@
 // - Every physical decision (web commands, $S/$A status, IP and cable auto-close, frozen-dome cycle,
 //   tick-logging direction, timeout selection, UI texts) goes through DIR_PHYS_* / LIM*_PHYS_* only.
 //   The ISR pairing (direction OPEN ends at lim*open, CLOSE at lim*closed) is hardware and unchanged.
-// - $W toggles the Cloudwatcher link check at runtime, persisted in EEPROM byte 9. OFF also disables the
-//   cable-removal auto-close and all tick/interrupt/event traffic to the Solo (no Solo on site).
+// - $W toggles the Cloudwatcher link check at runtime ($W1 = on, $W0 = off, idempotent), persisted in
+//   EEPROM byte 9 together with the SITE id (a board re-flashed with the other profile falls back to
+//   that profile's default). OFF also disables the cable-removal auto-close and all tick/interrupt/event
+//   traffic to the Solo (no Solo on site).
 // - Event rate limiters no longer swallow the first event after boot (their timestamps started at 0:
 //   normal events were dropped for 10 s, conflict events for 5 min after every reset).
 // - Web UI: "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row.
@@ -231,6 +233,8 @@
 #define TOF_CALIB_MAGIC_BYTE 0xA5     // Identifies valid ToF calibration
 #define EEPROM_ADDR_CONFIG_FLAGS 9    // Byte 9: config flags (v4.2.0); bit 7 set (0xFF) = never written
 #define CFG_REMOTE_CHECK 0x01         // Bit 0: Cloudwatcher link check enabled ($W)
+#define CFG_SITE_MASK    0x06         // Bits 1-2: SITE that wrote the byte; another SITE re-applies its default
+#define CFG_SITE_SHIFT   1
 
 //=============================================================================
 // DYNAMIC TIMEOUT CONFIGURATION — Linear Regression Coefficients
@@ -533,6 +537,7 @@ void saveCountersToEEPROM();                    // Save counters if changed
 void incrementDayCounter();                     // Track uptime days
 void loadConfigFlags();                         // Load $W flag from EEPROM byte 9 (v4.2.0)
 void saveConfigFlags();                         // Persist $W flag to EEPROM byte 9 (v4.2.0)
+void setRemoteCheck(bool on);                   // Switch the Cloudwatcher link check ($W) (v4.2.0)
 void pushTickDataIfReady();                     // Push tick data to logging server
 void pushInterruptDataIfReady();                // Push interrupted stop data
 
@@ -655,7 +660,11 @@ void initializeEEPROM() {
  */
 void loadConfigFlags() {
   byte flags = EEPROM.read(EEPROM_ADDR_CONFIG_FLAGS);
-  if (flags & 0x80) {
+  byte storedSite = (flags & CFG_SITE_MASK) >> CFG_SITE_SHIFT;
+  if ((flags & 0x80) || storedSite != SITE) {
+    // Never written, or written by a build for the OTHER site (board re-flashed with a different
+    // profile): a choice made under the other site's semantics must not carry over, so the
+    // default of THIS site applies and is persisted together with the site id.
     remoteCheckEnabled = DEFAULT_REMOTE_CHECK;
     saveConfigFlags();
   } else {
@@ -663,10 +672,24 @@ void loadConfigFlags() {
   }
 }
 
-/** Persist the config flags (byte 9). update() only writes when the value changed. */
+/** Persist the config flags (byte 9) with the site id. update() only writes when the value changed. */
 void saveConfigFlags() {
-  byte flags = remoteCheckEnabled ? CFG_REMOTE_CHECK : 0;
+  byte flags = (remoteCheckEnabled ? CFG_REMOTE_CHECK : 0) | ((SITE << CFG_SITE_SHIFT) & CFG_SITE_MASK);
   EEPROM.update(EEPROM_ADDR_CONFIG_FLAGS, flags);
+}
+
+/**
+ * Switch the Cloudwatcher link check ($W). Acts only on a real change: persists the flag and
+ * restarts the failure window, so a repeated $W1 / $W0 (double click, reload) is harmless.
+ * A running auto-close is left alone; the ISR clears its flag at the limit switch.
+ */
+void setRemoteCheck(bool on) {
+  if (on == remoteCheckEnabled) return;
+  remoteCheckEnabled = on;
+  saveConfigFlags();
+  connectFailCount = 0;
+  firstFailTimestamp = 0;
+  lastConnectAttemptTimestamp = millis();
 }
 
 /**
@@ -1975,6 +1998,8 @@ void checkRemoteConnectionAndAutoClose() {
       firstFailTimestamp = 0;
       lastConnectAttemptTimestamp = millis();
       cableRemovalAutoCloseTriggered = false;
+      if (mot1dir == 0) m1AutoClosedByIP = false;   // idle: drop a stale "IP Fail" display flag
+      if (mot2dir == 0) m2AutoClosedByIP = false;
       return;
     }
 
@@ -2332,7 +2357,7 @@ class PageWriter : public Print {
  *   /?$L  - Toggle tick logging on/off
  *   /?$U  - Unlock dome after a frozen-dome lockout
  *   /?$C  - Calibrate ToF baseline (dome must be closed)
- *   /?$W  - Toggle the Cloudwatcher link check on/off (persisted in EEPROM, v4.2.0)
+ *   /?$W  - Toggle the Cloudwatcher link check; /?$W1 = on, /?$W0 = off (persisted in EEPROM, v4.2.0)
  *
  * Design notes:
  * - 1.5 second timeout prevents blocking on slow/broken connections
@@ -2357,6 +2382,7 @@ void handleWebClient() {
   bool plain_text_status_request = false;
   bool ascom_status_request = false;
   bool reset_counters_request = false;
+  bool remoteCheckPending = false;   // v4.2.0: "$W" seen, the next character decides (1 / 0 / toggle)
 
   while (client.connected()) {
     // MUCH MORE AGGRESSIVE TIMEOUT - Key fix!
@@ -2368,6 +2394,10 @@ void handleWebClient() {
     }
     if (client.available()) {
       char c = client.read();
+      if (remoteCheckPending) {          // v4.2.0: character after "$W": '1' = on, '0' = off, else toggle
+        remoteCheckPending = false;
+        setRemoteCheck(c == '1' ? true : (c == '0' ? false : !remoteCheckEnabled));
+      }
       if (newInfo && c == ' ') { newInfo = false; }
       if (c == '\n') { inRequestLine = false; }
       if (c == '$' && inRequestLine) { newInfo = true; }
@@ -2394,14 +2424,11 @@ void handleWebClient() {
           action_parameter_in_url = true;
         }
 
-        // $W = Toggle Cloudwatcher link check (v4.2.0), persisted in EEPROM byte 9.
-        // Either way the failure window starts clean; a running auto-close is left alone.
+        // $W = Cloudwatcher link check (v4.2.0), persisted in EEPROM byte 9. The character AFTER
+        // the W decides: '1' = on, '0' = off (idempotent; used by the UI button and by scripts),
+        // anything else = toggle. Resolved when the next character arrives (remoteCheckPending).
         if (c == 'W' || c == 'w') {
-          remoteCheckEnabled = !remoteCheckEnabled;
-          saveConfigFlags();
-          connectFailCount = 0;
-          firstFailTimestamp = 0;
-          lastConnectAttemptTimestamp = millis();
+          remoteCheckPending = true;
           action_parameter_in_url = true;
         }
 
@@ -2861,7 +2888,8 @@ void sendFullHtmlResponse(Print& client) {
 
       client.println(F("</table>"));
       client.print(F("<a href='/?$R' class='button b-reset fullwidth'>Reset Counters</a>"));
-      client.print(F("<a href='/?$W' class='button "));                 // v4.2.0: toggle $W
+      // v4.2.0: explicit $W0 / $W1 so a double click or a reload of the redirect target cannot flip it back
+      client.print(remoteCheckEnabled ? F("<a href='/?$W0' class='button ") : F("<a href='/?$W1' class='button "));
       client.print(remoteCheckEnabled ? F("b-stop") : F("b-open"));
       client.print(F(" fullwidth' style='margin-top:8px;'>"));
       client.print(remoteCheckEnabled ? F("Disable Cloudwatcher Check") : F("Enable Cloudwatcher Check"));
@@ -3062,8 +3090,10 @@ ISR(TIMER2_COMPA_vect) {
   //--- LIMIT SWITCH DETECTION ---
   // Stop motor immediately when endpoint is reached. This is the HARDWARE pairing and
   // identical on every site: direction OPEN ends at lim*open, direction CLOSE at lim*closed.
-  // Both branches keep an IP/VCC auto-close stop reason (v4.2.0: symmetric, because which
-  // of the two directions is the physical close depends on the site profile).
+  // Both branches treat an IP/VCC auto-close stop reason the same way (v4.2.0: symmetric,
+  // because which of the two directions is the physical close depends on the site profile).
+  // The flag is cleared here, so the stop-reason housekeeping above normalises reason 3 to 0
+  // one tick later and the web page then shows the limit switch as stop reason.
   if (digitalRead(lim1open) && mot1dir == OPEN) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;

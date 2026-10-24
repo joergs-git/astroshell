@@ -89,7 +89,7 @@ All real-time operations run in the interrupt service routine:
 - Cable removal triggers **immediate** auto-close
 - Uses `netClient.setTimeout(3000)` to prevent watchdog timeout
 - No Pushover for IP auto-close (network is down when it triggers)
-- **`$W` (v4.2.0)**: the whole block is gated by `remoteCheckEnabled` (EEPROM byte 9). OFF = no polling, no fail counting, no IP or cable-removal auto-close, no tick/interrupt/event pushes; a running auto-close is left alone. Toggling resets the failure window; the first real check comes 90 s (+ one skipped check after an Ethernet rebuild) after enabling.
+- **`$W` (v4.2.0)**: the whole block is gated by `remoteCheckEnabled` (EEPROM byte 9, with the site id in bits 1-2). OFF = no polling, no fail counting, no IP or cable-removal auto-close, no tick/interrupt/event pushes; a running auto-close is left alone. `$W1`/`$W0` are idempotent (the character after the W is parsed, so `$W1` is not followed by a `$1` CLOSE command); only a real change resets the failure window; the first real check comes 90 s (+ one skipped check after an Ethernet rebuild) after enabling.
 
 ### Event Notifications (v4.0)
 - Arduino pushes events to Solo:88/event via HTTP GET
@@ -116,7 +116,7 @@ All real-time operations run in the interrupt service routine:
 | `/?$L` | Toggle tick logging on/off (default: ON after reboot) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be fully closed (v4.0) |
-| `/?$W` | Toggle Cloudwatcher link check — persisted in EEPROM byte 9; OFF also disables cable-removal auto-close and all pushes to the Solo (v4.2.0) |
+| `/?$W` | Toggle Cloudwatcher link check; `/?$W1` = on, `/?$W0` = off (idempotent; the UI button uses these) — persisted in EEPROM byte 9 with the site id; OFF also disables cable-removal auto-close and all pushes to the Solo (v4.2.0) |
 
 **Note:** The web API, `$S`, `$A` and the web page are physical on both sites; the site profile resolves the wiring (see Site Profile and Physical Semantics).
 
@@ -162,7 +162,7 @@ Rules:
 | 5 | 1 byte | Uptime day counter |
 | 6-7 | 2 bytes | ToF baseline distance in mm (v4.0) |
 | 8 | 1 byte | ToF calibration magic (0xA5) (v4.0) |
-| 9 | 1 byte | Config flags (v4.2.0): bit 0 = Cloudwatcher check enabled; bit 7 set (0xFF, never written) = apply site default and persist |
+| 9 | 1 byte | Config flags (v4.2.0): bit 0 = Cloudwatcher check enabled; bits 1-2 = SITE that wrote the byte (another SITE re-applies its default); bit 7 set (0xFF, never written) = apply site default and persist |
 
 ## Key Configuration Constants
 

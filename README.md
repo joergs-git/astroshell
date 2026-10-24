@@ -71,7 +71,7 @@ Telescope Protection Priority:
 |---------|-------------|
 | **Site profile** | `#define SITE SITE_GERMANY` (mirrored wiring) or `SITE_PORTUGAL` (standard AstroShell wiring) at the top of the sketch — one source for both domes |
 | **Physical semantics layer** | Every physical decision (commands, `$S`/`$A`, auto-close, frozen dome, tick logging, UI) uses `DIR_PHYS_*` / `LIM*_PHYS_*`, resolved at compile time at zero cost |
-| **Cloudwatcher check switch** | `/?$W` turns the Cloudwatcher link check on/off at runtime, persisted in EEPROM byte 9 — a site without a Solo is no longer auto-closed after every boot |
+| **Cloudwatcher check switch** | `/?$W` (toggle), `/?$W1` (on), `/?$W0` (off) switch the Cloudwatcher link check at runtime, persisted in EEPROM byte 9 together with the site id — a site without a Solo is no longer auto-closed after every boot, and a board re-flashed with the other profile falls back to that profile's default |
 | **Web UI** | "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row |
 | **Rate limiter fix** | The first event after a reboot is no longer dropped (10 s / 5 min blackout after boot removed) |
 | **Logic test suite + CI** | `test/host/` simulates the dome on a PC and runs 35 scenarios per site; GitHub Actions also compiles both profiles with avr-gcc |
@@ -185,7 +185,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `/?$L` | Toggle tick logging on/off (default: ON) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
-| `/?$W` | Toggle Cloudwatcher link check on/off — persisted in EEPROM; OFF also disables the cable-removal auto-close and all pushes to the Solo (v4.2.0) |
+| `/?$W` | Toggle Cloudwatcher link check; `/?$W1` = on, `/?$W0` = off (idempotent) — persisted in EEPROM with the site id; OFF also disables the cable-removal auto-close and all pushes to the Solo (v4.2.0) |
 
 ---
 
@@ -389,6 +389,8 @@ My German dome was installed mirrored: the motor polarity **and** the limit swit
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH means | physically CLOSED | physically OPEN |
 | Panel button "up" | closes | opens |
 | Cloudwatcher check default (`$W`) | ON | OFF |
+
+The `$W` setting is stored with the site id. If a board is ever flashed with the other profile, the stored value is ignored and the new profile's default applies, so a Portugal board that once ran a Germany build does not inherit "check ON" (and vice versa).
 
 The hardware pairing in the ISR never changes (direction `OPEN` always ends at `lim*open`). Everything that needs to know what is *physically* open or closed goes through `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM*_PHYS_CLOSED` / `LIM*_PHYS_OPEN`, which the profile resolves at compile time. The web API stays physical on both sites: `$1`/`$3` always close, `$2`/`$4` always open, and the ASCOM driver needs no site setting.
 

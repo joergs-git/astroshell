@@ -362,6 +362,9 @@ SCENARIO(ip_autoclose_closes_dome, "Cloudwatcher unreachable: 10 failed checks c
   CHECK_STREQ(status(), "CLOSED");
   CHECK(connects(80, false, true) >= 10 && connects(80, false, true) <= 12);
   CHECK_EQ(connects(80, true), 0);
+  std::string p = page();   // at the limit the ISR normalises reason 3 -> 0: the limit switch is shown
+  CHECK_CONTAINS(s1(p), "Limit 'Phys. Closed'"); CHECK_NOT_CONTAINS(s1(p), "IP Fail");
+  CHECK_EQ(totalAutoCloses, 1);
 }
 
 SCENARIO(ip_autoclose_reverses_opening, "auto-close reverses a shutter that is opening") {
@@ -402,6 +405,7 @@ SCENARIO(no_ip_checks_when_closed, "a closed dome never polls the Cloudwatcher a
 SCENARIO(cable_removed_closes_dome, "Ethernet cable pulled with the dome open: immediate physical close, once") {
   setPos(2500, g_travel); boot(); ensureRemoteCheck(true);
   runMs(5000);
+  http("/?$2"); runTicks(30); CHECK(movingToOpen(0));   // S1 is opening when the cable goes
   sim::g_link = sim::LINK_OFF;
   runMs(1000);
   CHECK(movingToClosed(0)); CHECK(movingToClosed(1)); CHECK_EQ(totalAutoCloses, 1);
@@ -427,6 +431,11 @@ SCENARIO(tick_push_direction, "a full close run is logged as d=1 (closing), a fu
   http("/?$2"); runMs(120000);
   CHECK(physOpen(0));
   CHECK(outboundHas("GET /log?m=1&d=2&t=50"));
+  setPos(g_travel, g_travel); runTicks(5);
+  http("/?$3"); runMs(120000); CHECK(physClosed(1));
+  CHECK(outboundHas("GET /log?m=2&d=1&t=50")); CHECK(!outboundHas("GET /log?m=2&d=2"));
+  http("/?$4"); runMs(120000); CHECK(physOpen(1));
+  CHECK(outboundHas("GET /log?m=2&d=2&t=50"));
 }
 
 SCENARIO(interrupt_push_direction, "an interrupted close is logged on /interrupt with d=1") {
@@ -507,6 +516,85 @@ SCENARIO(frozen_cycle_cancelled_by_close_command, "a close command during the gr
   CHECK(physClosed(0)); CHECK(motorOff(0)); CHECK_EQ(frozenDomeState, FD_IDLE);
 }
 
+SCENARIO(frozen_s2_mid_travel_lockout, "shutter 2: frozen mid-travel reverses physically closed, locks out, panel open button blocked, $U unlocks") {
+  tofFromPhysics(); seedTofCalibration(100);
+  setPos(0, 2000); boot(); ensureRemoteCheck(true);
+  S[1].stuckOpening = true;
+  sim::g_tofFn = [] { return S[1].stuckOpening ? 100 : 100 + S[1].pos / 5; };
+  http("/?$4"); runMs(6000);
+  CHECK(motorOff(1)); CHECK_EQ(stop2reason, 6); CHECK_EQ(frozenDomeState, FD_GRAVITY_WAIT); CHECK_EQ(frozenMotorNum, 2);
+  CHECK(outboundHas("detail=S2%20attempt%201/3"));
+  CHECK(idle(0));                                                   // shutter 1 untouched throughout
+  runMs(22000);
+  CHECK(movingToClosed(1)); CHECK_EQ(frozenDomeState, FD_CLOSING); CHECK_EQ(stop2reason, 6);
+  CHECK_CONTAINS(s2(page()), "Closing (physically)");
+  runMs(40000);
+  CHECK(physClosed(1)); CHECK(S[1].ticksMovingClosed >= 2000);
+  runMs(80000);
+  CHECK_EQ(frozenDomeState, FD_LOCKOUT); CHECK_EQ(frozenRetryCount, 3);
+  CHECK(outboundHas("type=frozen_lockout"));
+  http("/?$4"); runTicks(10); CHECK(motorOff(1)); CHECK(idle(1));
+  pressButton(T.btnOpen2); CHECK(motorOff(1)); CHECK(idle(1));
+  CHECK(idle(0)); CHECK_EQ(S[0].pos, 0);
+  S[1].stuckOpening = false;
+  http("/?$U"); CHECK_EQ(frozenDomeState, FD_IDLE);
+  http("/?$4"); runTicks(5); CHECK(movingToOpen(1));
+  runMs(120000); CHECK(physOpen(1));
+}
+
+SCENARIO(lockout_never_blocks_closing, "during a lockout the other, open shutter still closes via web and panel button; opening stays blocked") {
+  tofFromPhysics(); seedTofCalibration(100);
+  setPos(0, g_travel); boot(); ensureRemoteCheck(true);
+  S[0].stuckOpening = true;
+  sim::g_tofFn = [] { return S[0].stuckOpening ? 100 : 100 + S[0].pos / 5; };   // the sensor watches the frozen half only
+  http("/?$2"); runMs(100000);
+  CHECK_EQ(frozenDomeState, FD_LOCKOUT);
+  http("/?$3"); runTicks(5); CHECK(movingToClosed(1));              // web close works
+  runTicks(200); http("/?$5"); runTicks(2); CHECK(motorOff(1)); CHECK(!physClosed(1)); CHECK(!physOpen(1));
+  http("/?$4"); runTicks(10); CHECK(motorOff(1)); CHECK(idle(1));    // web open blocked mid-travel
+  pressButton(T.btnOpen2); CHECK(motorOff(1)); CHECK(idle(1));      // panel open blocked mid-travel
+  pressButton(T.btnClose2); CHECK(movingToClosed(1));               // panel close works (BUTTON_MAY_START folds to true)
+  runMs(120000); CHECK(physClosed(1)); CHECK(motorOff(1));
+  CHECK_EQ(frozenDomeState, FD_LOCKOUT);                            // lockout untouched by closing
+  CHECK_EQ(S[0].pos, 0); CHECK(idle(0));
+}
+
+SCENARIO(cable_autoclose_during_frozen_cycle, "cable pulled during the gravity wait: shutter closes and the frozen cycle never re-opens it") {
+  tofFromPhysics(); seedTofCalibration(100);
+  setPos(2000, 0); boot(); ensureRemoteCheck(true);
+  S[0].stuckOpening = true;
+  sim::g_tofFn = [] { return S[0].stuckOpening ? 100 : 100 + S[0].pos / 5; };
+  http("/?$2"); runMs(6000);
+  CHECK_EQ(frozenDomeState, FD_GRAVITY_WAIT);
+  sim::g_link = sim::LINK_OFF;
+  runMs(1000);
+  CHECK(movingToClosed(0)); CHECK_EQ(totalAutoCloses, 1); CHECK_EQ(stop1reason, 3); CHECK_EQ(frozenDomeState, FD_IDLE);
+  runMs(60000);
+  CHECK(physClosed(0)); CHECK(motorOff(0));
+  long openTicks = S[0].ticksMovingOpen;
+  runMs(180000);
+  CHECK(physClosed(0)); CHECK(idle(0)); CHECK_EQ(S[0].ticksMovingOpen, openTicks); CHECK_EQ(frozenDomeState, FD_IDLE);
+}
+
+SCENARIO(ip_autoclose_during_frozen_cycle, "10th Cloudwatcher failure during the gravity wait: shutter closes and stays closed") {
+  tofFromPhysics(); seedTofCalibration(100);
+  setPos(2000, 0); boot(); ensureRemoteCheck(true);
+  sim::g_reachable[80] = false;
+  S[0].stuckOpening = true;
+  sim::g_tofFn = [] { return S[0].stuckOpening ? 100 : 100 + S[0].pos / 5; };
+  while (sim::g_millis < 995000UL) { sim::tickOnce(); loop(); }      // 9 failures so far, 10th at ~1010 s
+  CHECK_EQ(totalAutoCloses, 0);
+  http("/?$2"); runMs(5000);
+  CHECK_EQ(frozenDomeState, FD_GRAVITY_WAIT); CHECK(motorOff(0));   // gravity wait spans ~999 s .. 1019 s
+  runMs(25000);
+  CHECK_EQ(totalAutoCloses, 1); CHECK(movingToClosed(0) || physClosed(0)); CHECK_EQ(frozenDomeState, FD_IDLE);
+  runMs(60000);
+  CHECK(physClosed(0)); CHECK(motorOff(0));
+  long openTicks = S[0].ticksMovingOpen;
+  runMs(180000);
+  CHECK(physClosed(0)); CHECK(idle(0)); CHECK_EQ(S[0].ticksMovingOpen, openTicks);
+}
+
 SCENARIO(tof_calibration_only_when_closed, "$C stores the baseline only with both shutters physically closed") {
   sim::g_tofPresent = true; sim::g_tofMm = 123;
   setPos(0, 2500); boot();
@@ -547,34 +635,63 @@ SCENARIO(preventive_reset_only_when_closed, "the 8 h Ethernet reset waits until 
 // SCENARIOS - dual-site firmware only: $W Cloudwatcher check toggle
 //=============================================================================
 #ifdef LIMIT_WIRING_SWAPPED
-SCENARIO(remote_check_default_and_toggle, "$W toggles the Cloudwatcher check, shows it and persists it in EEPROM byte 9") {
+static const uint8_t CFG_ON  = (uint8_t)((SITE << 1) | 1);   // byte 9 written by THIS site, check on
+static const uint8_t CFG_OFF = (uint8_t)((SITE << 1) | 0);   // byte 9 written by THIS site, check off
+static const uint8_t CFG_DEF = DEFAULT_REMOTE_CHECK ? CFG_ON : CFG_OFF;
+
+SCENARIO(remote_check_default_and_toggle, "$W toggles the Cloudwatcher check, shows it and persists it with the site id in EEPROM byte 9") {
   setPos(2500, 2500); boot();
   CHECK_EQ(remoteCheckEnabled, DEFAULT_REMOTE_CHECK);
-  CHECK_EQ(sim::g_eeprom[9], DEFAULT_REMOTE_CHECK ? 0x01 : 0x00);
+  CHECK_EQ(sim::g_eeprom[9], CFG_DEF);
   CHECK_CONTAINS(page(), std::string("Cloudwatcher Check</td><td>") + (DEFAULT_REMOTE_CHECK ? "ENABLED" : "DISABLED"));
-  CHECK_CONTAINS(page(), DEFAULT_REMOTE_CHECK ? "Disable Cloudwatcher Check" : "Enable Cloudwatcher Check");
+  CHECK_CONTAINS(page(), DEFAULT_REMOTE_CHECK ? "href='/?$W0' class='button b-stop fullwidth' style='margin-top:8px;'>Disable Cloudwatcher Check"
+                                              : "href='/?$W1' class='button b-open fullwidth' style='margin-top:8px;'>Enable Cloudwatcher Check");
   http("/?$W");
   CHECK_EQ(remoteCheckEnabled, !DEFAULT_REMOTE_CHECK);
-  CHECK_EQ(sim::g_eeprom[9], DEFAULT_REMOTE_CHECK ? 0x00 : 0x01);
+  CHECK_EQ(sim::g_eeprom[9], DEFAULT_REMOTE_CHECK ? CFG_OFF : CFG_ON);
   CHECK_CONTAINS(page(), std::string("Cloudwatcher Check</td><td>") + (DEFAULT_REMOTE_CHECK ? "DISABLED" : "ENABLED"));
   http("/?$W");
   CHECK_EQ(remoteCheckEnabled, DEFAULT_REMOTE_CHECK);
-  CHECK_EQ(sim::g_eeprom[9], DEFAULT_REMOTE_CHECK ? 0x01 : 0x00);
+  CHECK_EQ(sim::g_eeprom[9], CFG_DEF);
   CHECK_CONTAINS(page(), WIRING_LABEL);
 }
 
-SCENARIO(remote_check_persists_off, "EEPROM byte 9 = 0x00 from an earlier session keeps the check off after a reboot") {
-  seedEepromInitialized(); sim::g_eeprom[9] = 0x00;
+SCENARIO(remote_check_explicit_forms, "$W1 / $W0 are idempotent and only a real change resets the failure window") {
   setPos(2500, 2500); boot();
-  CHECK(!remoteCheckEnabled);
+  http("/?$W0"); CHECK(!remoteCheckEnabled); CHECK_EQ(sim::g_eeprom[9], CFG_OFF);
+  http("/?$W0"); CHECK(!remoteCheckEnabled); CHECK_EQ(sim::g_eeprom[9], CFG_OFF);   // double click: stays off
+  http("/?$W1"); CHECK(remoteCheckEnabled);  CHECK_EQ(sim::g_eeprom[9], CFG_ON);
+  connectFailCount = 3; firstFailTimestamp = 1000;
+  http("/?$W1"); CHECK(remoteCheckEnabled);  CHECK_EQ(connectFailCount, 3);          // no change: window untouched
+  http("/?$W0"); CHECK(!remoteCheckEnabled); CHECK_EQ(connectFailCount, 0); CHECK_EQ(firstFailTimestamp, 0);
+  http("/?$W1$1"); CHECK(remoteCheckEnabled); runTicks(5); CHECK(movingToClosed(0));   // a command may follow
+  http("/?$5");
+  http("/?$W1"); http("/?$W1"); CHECK(remoteCheckEnabled);
+  CHECK(motorOff(0));                                                               // "$W1": the '1' is not CLOSE S1
+  http("/?$w0"); CHECK(!remoteCheckEnabled);                                        // lower case accepted
+}
+
+SCENARIO(remote_check_persists_off, "byte 9 written by this site with the check off keeps it off after a reboot") {
+  seedEepromInitialized(); sim::g_eeprom[9] = CFG_OFF;
+  setPos(2500, 2500); boot();
+  CHECK(!remoteCheckEnabled); CHECK_EQ(sim::g_eeprom[9], CFG_OFF);
   CHECK_CONTAINS(page(), "Cloudwatcher Check</td><td>DISABLED");
 }
 
-SCENARIO(remote_check_persists_on, "EEPROM byte 9 = 0x01 keeps the check on after a reboot") {
-  seedEepromInitialized(); sim::g_eeprom[9] = 0x01;
+SCENARIO(remote_check_persists_on, "byte 9 written by this site with the check on keeps it on after a reboot") {
+  seedEepromInitialized(); sim::g_eeprom[9] = CFG_ON;
   setPos(2500, 2500); boot();
-  CHECK(remoteCheckEnabled);
+  CHECK(remoteCheckEnabled); CHECK_EQ(sim::g_eeprom[9], CFG_ON);
   CHECK_CONTAINS(page(), "Cloudwatcher Check</td><td>ENABLED");
+}
+
+SCENARIO(remote_check_reapplies_default_after_site_change, "byte 9 written by a build for the OTHER site is ignored: this site's default applies") {
+  const uint8_t otherSite = (SITE == 1) ? 2 : 1;
+  seedEepromInitialized();
+  sim::g_eeprom[9] = (uint8_t)((otherSite << 1) | (DEFAULT_REMOTE_CHECK ? 0 : 1));   // opposite of our default
+  setPos(2500, 2500); boot();
+  CHECK_EQ(remoteCheckEnabled, DEFAULT_REMOTE_CHECK);
+  CHECK_EQ(sim::g_eeprom[9], CFG_DEF);
 }
 
 SCENARIO(remote_check_upgrade_from_v41, "EEPROM written by v4.1.0 (byte 9 untouched): site default applies, nothing else is lost") {
@@ -583,7 +700,7 @@ SCENARIO(remote_check_upgrade_from_v41, "EEPROM written by v4.1.0 (byte 9 untouc
   setPos(2500, 2500); boot();
   CHECK_EQ(remoteCheckEnabled, DEFAULT_REMOTE_CHECK);
   CHECK_EQ(totalIpFailures, 7); CHECK_EQ(totalAutoCloses, 2); CHECK_EQ(dayCounter, 42);
-  CHECK_EQ(sim::g_eeprom[9], DEFAULT_REMOTE_CHECK ? 0x01 : 0x00);
+  CHECK_EQ(sim::g_eeprom[9], CFG_DEF);
 }
 
 SCENARIO(remote_check_off_no_autoclose, "check off: unreachable Cloudwatcher never polls, never closes, counters stay 0") {
