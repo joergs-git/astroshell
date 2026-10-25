@@ -35,8 +35,12 @@ Done:
 - [x] Host suite: 6 binaries (site x default/sensors/bare), 32/41/32 scenarios per site, green; CI Arduino matrix site x ToF x DS18B20 (8 builds)
 - [x] IDE-toolchain sizes, default profiles: Germany 43724 B flash / 870 B RAM, Portugal 39608 B / 727 B
 
+## Completed (2026-10-25) — Portugal commissioning
+- [x] v4.2.1 flashed with `SITE_PORTUGAL` (board Mega 2560). Web page reachable after fixing the IDE board selection and the LAN subnet; open / stop / end positions verified via web UI and via the panel buttons (user report)
+
 ## Next
-- [ ] Portugal: flash with `#define SITE SITE_PORTUGAL`, commissioning with the dome in intermediate position (checklist in README / CLAUDE.md)
+- [ ] Portugal: confirm subnet; if `IP_ADR2` was changed locally, move the IP into the `SITE_PORTUGAL` profile so a `git pull` cannot revert it
+- [ ] Portugal: ASCOM driver with "Swap Open/Close" unchecked, check NINA shutter state against reality
 - [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON
 - [ ] When a VL53L0X is mounted: `ENABLE_TOF_FROZEN_DETECTION 1` (per site if only one dome), calibrate with `$C`
 
