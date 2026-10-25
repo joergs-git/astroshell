@@ -65,7 +65,7 @@ Telescope Protection Priority:
 
 ---
 
-## What's New in v4.2.0 — Dual-Site Firmware
+## What's New in v4.2.1 — Dual-Site Firmware
 
 | Feature | Description |
 |---------|-------------|
@@ -74,7 +74,7 @@ Telescope Protection Priority:
 | **Cloudwatcher check switch** | `/?$W` (toggle), `/?$W1` (on), `/?$W0` (off) switch the Cloudwatcher link check at runtime, persisted in EEPROM byte 9 together with the site id — a site without a Solo is no longer auto-closed after every boot, and a board re-flashed with the other profile falls back to that profile's default |
 | **Web UI** | "Cloudwatcher Check" row + toggle button, read-only "Limit Wiring" row |
 | **Rate limiter fix** | The first event after a reboot is no longer dropped (10 s / 5 min blackout after boot removed) |
-| **ToF layer switchable** | `ENABLE_TOF_FROZEN_DETECTION` (default 0: no VL53L0X mounted on either dome yet) compiles the I2C/ToF layer out — no Wire/VL53L0X libraries needed, no I2C traffic; the frozen-dome logic, `$C` and `$U` stay inert until a sensor is installed |
+| **Sensor layers switchable** | `ENABLE_TOF_FROZEN_DETECTION` (default 0: no VL53L0X mounted on either dome yet) compiles the I2C/ToF layer out — no Wire/VL53L0X libraries, no I2C traffic; the frozen-dome logic, `$C` and `$U` stay inert. `ENABLE_DS18B20_DYNAMIC_TIMEOUT` (Germany 1, Portugal 0, v4.2.1) does the same for the temperature probe: no OneWire/DallasTemperature libraries, static 107 s timeout, "Temperature: Not installed" |
 | **Logic test suite + CI** | `test/host/` simulates the dome on a PC and runs the scenario suite per site, with and without the ToF layer; GitHub Actions also compiles all four variants with avr-gcc |
 
 See [Important: Limit Switch Wiring (Site Profile)](#important-limit-switch-wiring-site-profile) for the details and the commissioning checklist.
@@ -155,7 +155,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 
 | File | Description |
 |------|-------------|
-| `domecontrol_JK3.ino` | Main Arduino firmware (v4.2.0, dual-site) with safety sensors, dynamic timeout, frozen dome detection |
+| `domecontrol_JK3.ino` | Main Arduino firmware (v4.2.1, dual-site) with safety sensors, dynamic timeout, frozen dome detection |
 | `cloudwatcher-raincheckerV3.sh` | Rain checker script for Cloudwatcher Solo - auto-closes dome on rain |
 | `cloudwatcher-rainchecker.service` | Systemd service for rain checker autostart |
 | `astroshell_ticklogger.py` | Motor runtime & event server - receives tick data + events, logs CSV, sends Pushover |
@@ -267,6 +267,8 @@ mount -o remount,ro /
 ---
 
 ## Dynamic Motor Timeout (v4.0)
+
+> **v4.2.1:** needs `ENABLE_DS18B20_DYNAMIC_TIMEOUT 1` (Germany profile). The Portugal profile has no temperature probe yet and compiles the OneWire layer out; it uses the static 6527-tick (107 s) timeout and shows "Temperature: Not installed".
 
 Motor runtime varies with ambient temperature due to motor oil viscosity. The v4.0 firmware uses a linear regression model derived from 253 measured motor cycles (-1.6C to 22.6C) to compute temperature-appropriate timeouts.
 
@@ -392,6 +394,8 @@ My German dome was installed mirrored: the motor polarity **and** the limit swit
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH means | physically CLOSED | physically OPEN |
 | Panel button "up" | closes | opens |
 | Cloudwatcher check default (`$W`) | ON | OFF |
+| DS18B20 temperature probe / dynamic timeout (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`) | built in | compiled out (static 6527-tick timeout) |
+| VL53L0X ToF / frozen-dome detection (`ENABLE_TOF_FROZEN_DETECTION`) | compiled out | compiled out |
 
 The `$W` setting is stored with the site id. If a board is ever flashed with the other profile, the stored value is ignored and the new profile's default applies, so a Portugal board that once ran a Germany build does not inherit "check ON" (and vice versa).
 
@@ -403,7 +407,7 @@ The hardware pairing in the ISR never changes (direction `OPEN` always ends at `
 
 ### Commissioning a Site (do this with the dome in an intermediate position)
 
-1. Flash the right profile. The web UI must show the expected **Limit Wiring** row (System Details → System Status) and the expected **Cloudwatcher Check** default.
+1. In the Arduino IDE select **Tools → Board → Arduino Mega or Mega 2560** (Processor ATmega2560). With "Arduino Uno" selected the build stops with "Sketch too big" at 32256 bytes. Flash the right profile. The web UI must show the expected **Limit Wiring** row (System Details → System Status) and the expected **Cloudwatcher Check** default.
 2. Click **OPEN S1**: the shutter must physically open, the page must say "Opening (physically)" and `/?$A` must report `INTERMEDIATE|OPENING|...`. Stop, then **CLOSE S1**.
 3. Let one shutter reach each end stop: the state line must read "Physically OPEN" / "Physically CLOSED" and the pin rows must show HIGH on the matching input.
 4. ASCOM: leave "Swap Open/Close" unchecked; NINA must show the shutter state that matches reality.

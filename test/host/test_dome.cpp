@@ -305,6 +305,7 @@ SCENARIO(emergency_stop, "STOP button halts both motors immediately") {
 //=============================================================================
 // SCENARIOS - timeouts
 //=============================================================================
+#if ENABLE_DS18B20_DYNAMIC_TIMEOUT
 SCENARIO(dynamic_timeout_follows_physical_direction, "closing uses the Close regression, opening the Open regression (DS18B20 at 10 C)") {
   sim::g_dsPresent = true; sim::g_tempC = 10.0f;
   setPos(2500, 2500); boot();
@@ -327,6 +328,23 @@ SCENARIO(dynamic_timeout_follows_physical_direction, "closing uses the Close reg
   pressButton(T.btnClose2);
   pressButton(T.btnOpen2);  CHECK(movingToOpen(1));   CHECK(mot2timer > 5594 && mot2timer <= 5607);
 }
+
+#else
+SCENARIO(temp_layer_compiled_out, "DS18B20 layer compiled out: a present probe is never used, static 6527 timeout, UI says so, pushes carry temp=-999") {
+  sim::g_dsPresent = true; sim::g_tempC = 10.0f;     // the mock would answer, the firmware must not ask
+  setPos(g_travel, 2500); boot(); ensureRemoteCheck(true);
+  CHECK(!ds18b20_connected); CHECK_EQ(currentTemp_x10, -9990); CHECK(!dynamicTimeoutActive);
+  CHECK_EQ(dynTimeout_M1_Close, 6527); CHECK_EQ(dynTimeout_M1_Open, 6527);
+  CHECK_EQ(dynTimeout_M2_Close, 6527); CHECK_EQ(dynTimeout_M2_Open, 6527);
+  std::string p = page();
+  CHECK_CONTAINS(p, "Temperature</td><td>Not installed");
+  CHECK_CONTAINS(p, "Timeout Mode</td><td>Static fallback (6527 ticks)");
+  http("/?$1"); CHECK(mot1timer > 6510 && mot1timer <= 6527);
+  runMs(120000); CHECK(physClosed(0));
+  CHECK(outboundHas("GET /log?m=1&d=1&t=50")); CHECK(outboundHas("&temp=-999&tof=-1"));
+  runMs(60000); CHECK(!dynamicTimeoutActive); CHECK(!ds18b20_connected);
+}
+#endif
 
 SCENARIO(static_timeout_without_sensor, "no DS18B20: static 6527 tick timeout, broken limit switch stops the motor with reason 5") {
   setPos(g_travel, 2500); boot();
@@ -626,6 +644,7 @@ SCENARIO(tof_layer_compiled_out, "ToF layer compiled out: a present sensor is ne
   CHECK_CONTAINS(p, "ToF Distance</td><td>Not installed");
   CHECK_CONTAINS(p, "Frozen Detection</td><td>Disabled (not built in)");
   CHECK_NOT_CONTAINS(p, "Calibrate ToF Baseline");
+  CHECK_CONTAINS(p, "Push target: 192.168.1.151:88</p>");                     // check on: pushes active
   http("/?$C"); CHECK(!tofCalibrated); CHECK_EQ(sim::g_eeprom[8], 0xFF);
   S[0].stuckOpening = true;                          // ice, but nobody can see it
   http("/?$2"); runMs(30000);
@@ -731,6 +750,7 @@ SCENARIO(remote_check_off_no_autoclose, "check off: unreachable Cloudwatcher nev
   CHECK_EQ(connects(80), 0); CHECK_EQ(totalAutoCloses, 0); CHECK_EQ(connectFailCount, 0);
   CHECK(idle(0)); CHECK(idle(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
   CHECK_CONTAINS(page(), "Current IP Fails</td><td>0/10");
+  CHECK_CONTAINS(page(), "Push target: 192.168.1.151:88 (pushes suspended while the Cloudwatcher check is off)");
 }
 
 SCENARIO(remote_check_off_no_cable_autoclose, "check off: a pulled cable does not close the dome") {
@@ -787,8 +807,9 @@ SCENARIO(remote_check_off_leaves_running_close_alone, "switching the check off d
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   const char* filter = argc > 1 ? argv[1] : nullptr;
-  printf("=== AstroShell logic tests - SITE %d: %s - ToF layer %s - firmware %s ===\n", SITE, T.name,
-         ENABLE_TOF_FROZEN_DETECTION ? "built in" : "compiled out", FIRMWARE_PATH);
+  printf("=== AstroShell logic tests - SITE %d: %s - ToF layer %s - DS18B20 layer %s - firmware %s ===\n", SITE, T.name,
+         ENABLE_TOF_FROZEN_DETECTION ? "built in" : "compiled out",
+         ENABLE_DS18B20_DYNAMIC_TIMEOUT ? "built in" : "compiled out", FIRMWARE_PATH);
   int passed = 0, failed = 0;
   for (auto& sc : registry()) {
     if (filter && !strstr(sc.name, filter)) continue;
