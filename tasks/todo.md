@@ -28,6 +28,13 @@ Done:
 
 - [x] PR #3 merged into main by the user's instruction (merge commit c2c0350), branch deleted
 
+## Completed (2026-10-25) — v4.2.1: DS18B20 layer per site
+- [x] User: no temperature probe in Portugal -> `ENABLE_DS18B20_DYNAMIC_TIMEOUT` per site (Germany 1, Portugal 0); OneWire/Dallas compiled out, static 6527 timeout, "Temperature: Not installed"
+- [x] Compile error in Portugal was the IDE board selection (Uno instead of Mega 2560); documented in README/CLAUDE.md commissioning steps
+- [x] Tick logger: no Solo/Synology in Portugal; with the Cloudwatcher check off no pushes happen, web page now says "pushes suspended"
+- [x] Host suite: 6 binaries (site x default/sensors/bare), 32/41/32 scenarios per site, green; CI Arduino matrix site x ToF x DS18B20 (8 builds)
+- [x] IDE-toolchain sizes, default profiles: Germany 43724 B flash / 870 B RAM, Portugal 39608 B / 727 B
+
 ## Next
 - [ ] Portugal: flash with `#define SITE SITE_PORTUGAL`, commissioning with the dome in intermediate position (checklist in README / CLAUDE.md)
 - [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON

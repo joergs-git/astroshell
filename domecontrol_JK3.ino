@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.2.0)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.2.1)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -21,6 +21,12 @@
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
 // - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.2.1 Changes:
+// - ENABLE_DS18B20_DYNAMIC_TIMEOUT per site (Germany 1, Portugal 0): without a temperature probe the
+//   OneWire/DallasTemperature layer is compiled out, the static 6527-tick timeout applies and the web
+//   page shows "Temperature: Not installed". Same pattern as ENABLE_TOF_FROZEN_DETECTION.
+// - Web page notes that tick/event pushes are suspended while the Cloudwatcher check is off.
 //
 // v4.2.0 Changes (dual-site firmware):
 // - SITE profile (SITE_GERMANY / SITE_PORTUGAL) decides how the hardware signals are interpreted. The
@@ -95,12 +101,21 @@
 #if SITE == SITE_GERMANY
   #define LIMIT_WIRING_SWAPPED  1   // direction OPEN / lim*open mean physically CLOSED
   #define DEFAULT_REMOTE_CHECK  1   // Cloudwatcher link check ON until toggled with $W
+  #ifndef ENABLE_DS18B20_DYNAMIC_TIMEOUT
+  #define ENABLE_DS18B20_DYNAMIC_TIMEOUT 1   // DS18B20 on pin 22: temperature-based motor timeout
+  #endif
 #elif SITE == SITE_PORTUGAL
   #define LIMIT_WIRING_SWAPPED  0   // direction OPEN / lim*open mean physically OPEN (original design)
   #define DEFAULT_REMOTE_CHECK  0   // no Cloudwatcher yet: link check OFF until toggled with $W
+  #ifndef ENABLE_DS18B20_DYNAMIC_TIMEOUT
+  #define ENABLE_DS18B20_DYNAMIC_TIMEOUT 0   // no temperature probe yet: static 6527-tick timeout (v4.2.1)
+  #endif
 #else
   #error "SITE must be SITE_GERMANY or SITE_PORTUGAL"
 #endif
+// ENABLE_DS18B20_DYNAMIC_TIMEOUT 0 compiles the OneWire/DallasTemperature layer out: no bus scan on
+// pin 22, no 30 s re-detection, the four motor timeouts stay at the static 6527 ticks and the web page
+// shows "Temperature: Not installed". -DENABLE_DS18B20_DYNAMIC_TIMEOUT=0/1 overrides (CI matrix).
 
 // VL53L0X frozen-dome detection. No sensor is mounted on either dome yet (v4.2.0), so the whole
 // I2C/ToF layer is compiled out: no Wire/VL53L0X libraries, no I2C traffic, pins 20/21 untouched.
@@ -138,8 +153,10 @@
 #include <utility/w5100.h> // W5100 mode register (chip reset) and SnSR socket states (P1)
 #include <EEPROM.h>       // Persistent storage for counters
 #include <avr/wdt.h>      // Hardware watchdog for automatic recovery
+#if ENABLE_DS18B20_DYNAMIC_TIMEOUT
 #include <OneWire.h>      // OneWire protocol for DS18B20 temperature probe
 #include <DallasTemperature.h>  // DS18B20 high-level API
+#endif
 #if ENABLE_TOF_FROZEN_DETECTION
 #include <Wire.h>         // I2C for VL53L0X (built-in)
 #include <VL53L0X.h>      // Pololu VL53L0X Time-of-Flight sensor
@@ -328,8 +345,10 @@ volatile byte swstop_pressed_flag = 0; // STOP button state
 //=============================================================================
 // DS18B20 TEMPERATURE SENSOR
 //=============================================================================
+#if ENABLE_DS18B20_DYNAMIC_TIMEOUT
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
+#endif
 
 // Temperature reading state (non-blocking async pattern)
 int currentTemp_x10 = -9990;             // Current temp in tenths of C (-999.0 sentinel)
@@ -977,6 +996,7 @@ void pushInterruptDataIfReady() {
 // DS18B20 TEMPERATURE SENSOR FUNCTIONS
 //=============================================================================
 
+#if ENABLE_DS18B20_DYNAMIC_TIMEOUT
 /**
  * Initialize DS18B20 temperature probe on pin 22.
  * Called early in setup() BEFORE Ethernet init so temperature is available
@@ -1079,6 +1099,18 @@ void readTemperatureAsync() {
     }
   }
 }
+
+#else   // ENABLE_DS18B20_DYNAMIC_TIMEOUT == 0: no probe mounted, OneWire layer compiled out (v4.2.1)
+// The probe stays "disconnected": the four timeouts keep their static 6527-tick defaults,
+// the web page reports it, and events / tick pushes carry temp=-999.
+void setupDS18B20() {
+  ds18b20_connected = false;
+  currentTemp_x10 = -9990;
+  tempFailCount = TEMP_FAIL_THRESHOLD;
+  dynamicTimeoutActive = false;
+}
+void readTemperatureAsync() {}
+#endif
 
 /**
  * Compute dynamic timeout using integer-only linear regression.
@@ -1873,7 +1905,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.2.0 - Safety Sensors, dual-site"));
+    Serial.println(F("Dome Control v4.2.1 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -2779,7 +2811,9 @@ void sendFullHtmlResponse(Print& client) {
 
       // DS18B20 Temperature
       client.print(F("<tr><td>Temperature</td><td>"));
-      if (ds18b20_connected && currentTemp_x10 != -9990) {
+      if (!ENABLE_DS18B20_DYNAMIC_TIMEOUT) {       // v4.2.1: layer compiled out (constant, folded)
+        client.print(F("Not installed"));
+      } else if (ds18b20_connected && currentTemp_x10 != -9990) {
         printTempX10(client, currentTemp_x10);
         client.print(F(" C"));
       } else if (!ds18b20_connected) {
@@ -3031,6 +3065,7 @@ void sendFullHtmlResponse(Print& client) {
       client.print(remoteStationIp);
       client.print(F(":"));
       client.print(tickLogServerPort);
+      if (!remoteCheckEnabled) client.print(F(" (pushes suspended while the Cloudwatcher check is off)"));   // v4.2.1
       client.println(F("</p></div>"));
       client.println(F("</details>"));  // Close collapsible System Details
   }

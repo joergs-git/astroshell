@@ -19,7 +19,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 
 | File | Purpose |
 |------|---------|
-| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.2.0, dual-site (Germany mirrored / Portugal standard), safety sensors, dynamic timeout, frozen dome detection |
+| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.2.1, dual-site (Germany mirrored / Portugal standard), safety sensors, dynamic timeout, frozen dome detection |
 | `astroshell_ticklogger.py` | **Pi server** - Receives tick data + events from Arduino, logs to CSV, sends Pushover alerts |
 | `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
@@ -61,7 +61,7 @@ All real-time operations run in the interrupt service routine:
 - Frozen dome tick counter (~4 clock cycles overhead when active)
 
 ### Sensors (v4.0)
-- **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout
+- **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout. **Per site since v4.2.1** (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`, Germany 1, Portugal 0): compiled out, no OneWire/DallasTemperature libraries, static 6527 timeout, "Temperature: Not installed".
 - **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection. **Compiled out by default since v4.2.0** (`ENABLE_TOF_FROZEN_DETECTION 0`, no sensor mounted on either dome): no Wire/VL53L0X libraries, no I2C traffic; `tof_connected` stays false so the frozen state machine, `$C`/`$U` and the conflict check are inert. The host test suite runs each site with and without the layer.
 - Both sensors degrade gracefully: 10 consecutive failures → feature disabled
 
@@ -145,6 +145,8 @@ Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH | physically CLOSED | physically OPEN |
 | Panel button "up" (SW*up) | closes | opens |
 | `DEFAULT_REMOTE_CHECK` (Cloudwatcher check until `$W` is used) | 1 | 0 |
+| `ENABLE_DS18B20_DYNAMIC_TIMEOUT` (temperature probe, v4.2.1) | 1 | 0 (static 6527-tick timeout) |
+| `ENABLE_TOF_FROZEN_DETECTION` (VL53L0X, global default) | 0 | 0 |
 
 Rules:
 - The hardware pairing never changes: the ISR stops direction `OPEN` at `lim*open` and `CLOSE` at `lim*closed`; the PWM pin mapping is fixed.
@@ -170,6 +172,7 @@ Rules:
 ```cpp
 #define SITE SITE_GERMANY                   // Site profile: SITE_GERMANY (mirrored) or SITE_PORTUGAL (standard), v4.2.0
 #define ENABLE_TOF_FROZEN_DETECTION 0       // v4.2.0: ToF/I2C layer compiled out until a VL53L0X is mounted
+#define ENABLE_DS18B20_DYNAMIC_TIMEOUT 1    // v4.2.1: per site (Germany 1, Portugal 0); 0 = OneWire layer out, static 6527 timeout
 #define SMOOTH 30                           // Soft-start smoothness
 #define MAX_MOT1_OPEN  6527                 // Motor timeout fallback (107 sec at 61Hz)
 
@@ -273,11 +276,11 @@ mount -o remount,ro /
 ### Arduino IDE Setup
 Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
 - SPI.h, Ethernet.h, EEPROM.h, avr/wdt.h (built-in)
-- OneWire.h, DallasTemperature.h (install via Library Manager) (v4.0)
+- OneWire.h, DallasTemperature.h (install via Library Manager) — only when `ENABLE_DS18B20_DYNAMIC_TIMEOUT` is 1 (Germany profile; Portugal compiles the layer out since v4.2.1)
 - Wire.h (built-in), VL53L0X.h (Pololu, install via Library Manager) — only when `ENABLE_TOF_FROZEN_DETECTION` is 1 (default 0 since v4.2.0, then not needed)
 
 ### Host Logic Tests (v4.2.0)
-`make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile, with the ToF layer compiled out and built in (four binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
+`make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile in three sensor configurations: default (as flashed), both sensor layers built in, both compiled out (six binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
 Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position.
 
 ### Toolchain Note (Apple Silicon Mac)
@@ -444,7 +447,7 @@ This file has documented bugs (see file header for full list):
 7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup. (Germany profile; in the Portugal profile the roles of pins 2 and 7 swap.)
 
 ### Portugal Commissioning Checklist (v4.2.0)
-1. Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show "Cloudwatcher Check: DISABLED".
+1. IDE board = Arduino Mega or Mega 2560 (an "Arduino Uno" selection fails with "Sketch too big", 32256 bytes). Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show "Cloudwatcher Check: DISABLED", Sensors must show "Temperature: Not installed".
 2. Dome in intermediate position: "OPEN S1" must physically open S1, the page must say "Opening (physically)", `$A` must say `INTERMEDIATE|OPENING|...`. Then "CLOSE S1".
 3. Run one shutter to each end stop: state line "Physically OPEN/CLOSED" and the pin rows (S1 phys. closed = pin 2, phys. open = pin 7) must match.
 4. ASCOM driver: "Swap Open/Close" unchecked; NINA must show the real shutter state.
