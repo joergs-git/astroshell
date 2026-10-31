@@ -29,3 +29,45 @@
 - **Root cause:** Python buffers stdout when not connected to a TTY (standard behavior when running as a systemd service)
 - **Rule:** Always use `python3 -u` (unbuffered) in systemd service ExecStart, or set `Environment=PYTHONUNBUFFERED=1`. This applies to ALL Python services that use `print()` for logging under systemd
 - **Applies to:** Any Python script running as a systemd service that uses print() for logging
+
+## [2026-10-24] — Wiring convention was hard-coded far beyond the display
+- **Mistake:** README claimed the mirrored German wiring only affected the web display ("revert three lines for correct wiring"). In v4.1.0 the convention was baked into 109 places, including the IP/cable auto-close direction, frozen-dome reverse, tick-logging direction and timeout selection
+- **Root cause:** Each v4.x feature re-derived "physically closed" from the raw `lim*open` / `OPEN` names instead of one semantic layer
+- **Rule:** Every physical open/closed decision goes through `DIR_PHYS_*` / `LIM*_PHYS_*`; raw `OPEN`/`CLOSE`/`lim*` only in the ISR pairing, PWM map and panel buttons. Any firmware change runs `make -C test/host test` (both sites) first
+- **Applies to:** domecontrol_JK3.ino, any new feature that moves or reports a shutter
+
+## [2026-10-24] — Rate-limiter timestamps initialised to 0 swallowed the first event after boot
+- **Mistake:** `now - lastEventSentTime < 10 s` with `lastEventSentTime == 0` dropped events for 10 s after every reset; the conflict limiter dropped them for 5 minutes
+- **Root cause:** "never sent" and "sent at millis()==0" were not distinguished
+- **Rule:** Treat 0 as "never sent" (`last == 0 || now - last >= interval`) in every `millis()`-based limiter
+- **Applies to:** all Arduino rate limiters and periodic timers
+
+## [2026-10-24] — Test expectations at limit switches (made the same mistake three times)
+- **Mistake:** Scenarios asserted stop reason 5 or 6 after a motor stopped at an end stop; the checks failed although the firmware was right
+- **Root cause:** The ISR stop-reason housekeeping clears every reason except 3 (with the auto-close flag) and 4 on the next tick once a motor is off at a limit
+- **Rule:** At an end stop assert the state machine or `m*_interrupt_ticks`, never reason 5/6; panel-button tests need more than 6 ticks between presses (ISR debounce)
+- **Applies to:** test/host/test_dome.cpp
+
+## [2026-10-24] — Multi-file edit script applied partially
+- **Mistake:** One replacement script edited the firmware, then hit a stale search string in the test file and stopped; firmware and tests were out of step for one run
+- **Root cause:** Each file was written as soon as its own replacements matched instead of validating all files first
+- **Rule:** Validate every replacement in every file, then write all files, or none. Keep the count-asserting approach (refuse on mismatch); it caught two miscounted sites in the 109-site sweep
+- **Applies to:** any scripted refactor across several files
+
+## [2026-10-24] — Shell working directory drifted between parallel tool calls
+- **Mistake:** A workflow file was written relative to the wrong directory and silently missed the repo
+- **Root cause:** `cd` in one Bash call persisted into a parallel call
+- **Rule:** Always write files with absolute paths; never rely on the cwd in a parallel batch
+- **Applies to:** every Claude Code session in this repo
+
+## [2026-10-24] — Persisted safety flag not tied to the build that wrote it
+- **Mistake:** First `$W` design stored only the on/off bit; a board flashed with the other site profile would have inherited the wrong default (Portugal with rain-check ON -> auto-close every 16 min; Germany with it OFF)
+- **Root cause:** EEPROM outlives re-flashing, the semantics of the flag did not
+- **Rule:** Persist the writer's site id next to any site-dependent flag and re-apply the default when it differs; make web toggles idempotent (`$W1`/`$W0`) so reloads or double clicks cannot flip safety settings. Found by an independent review, not by me: request one for every safety-relevant change
+- **Applies to:** EEPROM config bytes, web commands that change persistent state
+
+## [2026-10-25] — Portugal commissioning pitfalls
+- **Mistake:** Two false alarms: "Sketch too big" (32256 B) and "no web response"
+- **Root cause:** IDE board set to Arduino Uno instead of Mega 2560; firmware IP is static 192.168.1.177 while the browser was on another subnet
+- **Rule:** Commissioning step 1 = board Mega 2560; step 2 = Arduino IP must be inside the local subnet (`IP_ADR2`), ideally carried by the site profile
+- **Applies to:** flashing any dome controller on a new site
