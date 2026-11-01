@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Read before editing** - Always read a file before making changes
 - **Preserve code style** - Match existing formatting, indentation, and naming conventions
 - **Comments-only commits** - When adding comments/analysis without code changes, state this clearly in the commit message
-- **Use different MAC and IP for testing before git commit and push** - During development and testing ALWAYS use IP `192.168.1.179` and MAC `{0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEA}` to avoid conflicts with the live production dome at .177/:ED. Before the final commit and push, ALWAYS change back to IP `192.168.1.177` and MAC `{0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED}`. This is a mandatory pre-commit check — never push test IP/MAC to the repository.
+- **Use different MAC and IP for testing before git commit and push** - During development and testing ALWAYS use IP `192.168.1.179` (`IP_ADR3 179`) and MAC `{0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xEA}` to avoid conflicts with the live production dome at .177/:ED. Before the final commit and push, ALWAYS change back to `IP_ADR3 177` and MAC `{0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED}`. The third octet comes from the site profile since v4.2.2 (Germany 1, Portugal 0) and is not a test value. This is a mandatory pre-commit check — never push test IP/MAC to the repository.
 
 
 ## Project Overview
@@ -37,8 +37,8 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 ## Hardware Configuration
 
 - **Microcontroller**: Arduino MEGA 2560 with Ethernet Shield (W5100/W5500)
-- **Dome IP**: 192.168.1.177 (static)
-- **Cloudwatcher IP**: 192.168.1.151 (monitored for connectivity; the check is switchable at runtime with `$W`, see Network Monitoring)
+- **Dome IP**: static, per site profile (v4.2.2): Germany 192.168.1.177, Portugal 192.168.0.177 (`IP_ADR2`)
+- **Cloudwatcher IP**: x.x.`IP_ADR2`.151, i.e. 192.168.1.151 in Germany (monitored for connectivity; the check is switchable at runtime with `$W`, see Network Monitoring)
 - **Motors**: Two DC motors with PWM soft-start (pins 3, 5, 6, 9)
 - **Limit switches**: Pins 0, 1, 2, 7 (pins 0/1 conflict with Serial - debugging disabled)
 - **Buttons**: A2-A5 (shutter controls), pin 8 (emergency STOP)
@@ -145,6 +145,7 @@ Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH | physically CLOSED | physically OPEN |
 | Panel button "up" (SW*up) | closes | opens |
 | `DEFAULT_REMOTE_CHECK` (Cloudwatcher check until `$W` is used) | 1 | 0 |
+| `IP_ADR2` dome IP / Solo IP (v4.2.2) | 1 → 192.168.1.177 / .1.151 | 0 → 192.168.0.177 / .0.151 |
 | `ENABLE_DS18B20_DYNAMIC_TIMEOUT` (temperature probe, v4.2.1) | 1 | 0 (static 6527-tick timeout) |
 | `ENABLE_TOF_FROZEN_DETECTION` (VL53L0X, global default) | 0 | 0 |
 

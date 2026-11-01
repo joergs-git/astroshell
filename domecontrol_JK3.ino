@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.2.1)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.2.2)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -21,6 +21,10 @@
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
 // - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.2.2 Changes:
+// - Dome IP per site: the third octet (IP_ADR2) comes from the site profile, Germany 192.168.1.177,
+//   Portugal 192.168.0.177. The Cloudwatcher Solo address uses the same subnet (x.x.IP_ADR2.151).
 //
 // v4.2.1 Changes:
 // - ENABLE_DS18B20_DYNAMIC_TIMEOUT per site (Germany 1, Portugal 0): without a temperature probe the
@@ -101,12 +105,14 @@
 #if SITE == SITE_GERMANY
   #define LIMIT_WIRING_SWAPPED  1   // direction OPEN / lim*open mean physically CLOSED
   #define DEFAULT_REMOTE_CHECK  1   // Cloudwatcher link check ON until toggled with $W
+  #define IP_ADR2               1   // dome 192.168.1.177, Solo 192.168.1.151 (v4.2.2)
   #ifndef ENABLE_DS18B20_DYNAMIC_TIMEOUT
   #define ENABLE_DS18B20_DYNAMIC_TIMEOUT 1   // DS18B20 on pin 22: temperature-based motor timeout
   #endif
 #elif SITE == SITE_PORTUGAL
   #define LIMIT_WIRING_SWAPPED  0   // direction OPEN / lim*open mean physically OPEN (original design)
   #define DEFAULT_REMOTE_CHECK  0   // no Cloudwatcher yet: link check OFF until toggled with $W
+  #define IP_ADR2               0   // dome 192.168.0.177, a future Solo 192.168.0.151 (v4.2.2)
   #ifndef ENABLE_DS18B20_DYNAMIC_TIMEOUT
   #define ENABLE_DS18B20_DYNAMIC_TIMEOUT 0   // no temperature probe yet: static 6527-tick timeout (v4.2.1)
   #endif
@@ -138,10 +144,10 @@
 #define MAX_MOT2_VCC_CLOSE_ACTION MAX_MOT2_OPEN
 
 // --- Network Configuration ---
-// Static IP address for the dome controller
+// Static IP address for the dome controller. The third octet (IP_ADR2) is set by the site
+// profile above: Germany 192.168.1.177, Portugal 192.168.0.177 (v4.2.2).
 #define IP_ADR0 192
 #define IP_ADR1 168
-#define IP_ADR2 1
 #define IP_ADR3 177
 
 // --- Voltage Monitoring ---
@@ -443,7 +449,7 @@ EthernetServer server(80);                          // Web server on port 80
 // --- Cloudwatcher Monitoring Target ---
 // The dome monitors this IP (Lunatico Cloudwatcher Solo) for connectivity.
 // If unreachable for too long, dome auto-closes as safety precaution.
-IPAddress remoteStationIp(192, 168, 1, 151);
+IPAddress remoteStationIp(IP_ADR0, IP_ADR1, IP_ADR2, 151);   // same subnet as the dome (v4.2.2)
 const int remoteStationPort = 80;
 
 //=============================================================================
@@ -1905,7 +1911,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.2.1 - Safety Sensors, dual-site"));
+    Serial.println(F("Dome Control v4.2.2 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
