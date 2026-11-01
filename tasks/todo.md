@@ -38,9 +38,13 @@ Done:
 ## Completed (2026-10-25) — Portugal commissioning
 - [x] v4.2.1 flashed with `SITE_PORTUGAL` (board Mega 2560). Web page reachable after fixing the IDE board selection and the LAN subnet; open / stop / end positions verified via web UI and via the panel buttons (user report)
 
+## Completed (2026-11-01) — v4.2.2: IP per site, Portugal fully verified
+- [x] Portugal LAN is 192.168.0.x: `IP_ADR2` moved into the site profile (Germany 1 -> 192.168.1.177, Portugal 0 -> 192.168.0.177), Solo address derived from the same subnet. PR #5 merged (b56d5a9); host suite 6 builds green, IDE builds Germany 43724 B / 870 B, Portugal 39606 B / 727 B
+- [x] Portugal: ASCOM dome driver verified by the user (open / close, end detection), "Swap Open/Close" unchecked
+
 ## Next
-- [ ] Portugal: confirm subnet; if `IP_ADR2` was changed locally, move the IP into the `SITE_PORTUGAL` profile so a `git pull` cannot revert it
-- [ ] Portugal: ASCOM driver with "Swap Open/Close" unchecked, check NINA shutter state against reality
+- [ ] Germany: flash v4.2.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON)
+- [ ] Portugal, later: Solo at 192.168.0.151 -> `$W1`; sensors -> flip `ENABLE_DS18B20_DYNAMIC_TIMEOUT` / `ENABLE_TOF_FROZEN_DETECTION` in the profile, calibrate ToF with `$C`
 - [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON
 - [ ] When a VL53L0X is mounted: `ENABLE_TOF_FROZEN_DETECTION 1` (per site if only one dome), calibrate with `$C`
 
