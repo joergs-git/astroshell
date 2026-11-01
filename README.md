@@ -394,6 +394,7 @@ My German dome was installed mirrored: the motor polarity **and** the limit swit
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH means | physically CLOSED | physically OPEN |
 | Panel button "up" | closes | opens |
 | Cloudwatcher check default (`$W`) | ON | OFF |
+| Dome IP / expected Solo IP (`IP_ADR2`, v4.2.2) | 192.168.1.177 / 192.168.1.151 | 192.168.0.177 / 192.168.0.151 |
 | DS18B20 temperature probe / dynamic timeout (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`) | built in | compiled out (static 6527-tick timeout) |
 | VL53L0X ToF / frozen-dome detection (`ENABLE_TOF_FROZEN_DETECTION`) | compiled out | compiled out |
 
@@ -407,7 +408,7 @@ The hardware pairing in the ISR never changes (direction `OPEN` always ends at `
 
 ### Commissioning a Site (do this with the dome in an intermediate position)
 
-1. In the Arduino IDE select **Tools → Board → Arduino Mega or Mega 2560** (Processor ATmega2560). With "Arduino Uno" selected the build stops with "Sketch too big" at 32256 bytes. Flash the right profile. The web UI must show the expected **Limit Wiring** row (System Details → System Status) and the expected **Cloudwatcher Check** default.
+1. In the Arduino IDE select **Tools → Board → Arduino Mega or Mega 2560** (Processor ATmega2560). With "Arduino Uno" selected the build stops with "Sketch too big" at 32256 bytes. Flash the right profile; it also sets the dome IP (Germany 192.168.1.177, Portugal 192.168.0.177), which must be inside the local subnet to be reachable. The web UI must show the expected **Limit Wiring** row (System Details → System Status) and the expected **Cloudwatcher Check** default.
 2. Click **OPEN S1**: the shutter must physically open, the page must say "Opening (physically)" and `/?$A` must report `INTERMEDIATE|OPENING|...`. Stop, then **CLOSE S1**.
 3. Let one shutter reach each end stop: the state line must read "Physically OPEN" / "Physically CLOSED" and the pin rows must show HIGH on the matching input.
 4. ASCOM: leave "Swap Open/Close" unchecked; NINA must show the shutter state that matches reality.

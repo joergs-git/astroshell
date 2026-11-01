@@ -644,7 +644,7 @@ SCENARIO(tof_layer_compiled_out, "ToF layer compiled out: a present sensor is ne
   CHECK_CONTAINS(p, "ToF Distance</td><td>Not installed");
   CHECK_CONTAINS(p, "Frozen Detection</td><td>Disabled (not built in)");
   CHECK_NOT_CONTAINS(p, "Calibrate ToF Baseline");
-  CHECK_CONTAINS(p, "Push target: 192.168.1.151:88</p>");                     // check on: pushes active
+  CHECK_CONTAINS(p, "Push target: 192.168." + std::to_string(IP_ADR2) + ".151:88</p>");   // check on: pushes active, Solo in the site subnet
   http("/?$C"); CHECK(!tofCalibrated); CHECK_EQ(sim::g_eeprom[8], 0xFF);
   S[0].stuckOpening = true;                          // ice, but nobody can see it
   http("/?$2"); runMs(30000);
@@ -750,7 +750,7 @@ SCENARIO(remote_check_off_no_autoclose, "check off: unreachable Cloudwatcher nev
   CHECK_EQ(connects(80), 0); CHECK_EQ(totalAutoCloses, 0); CHECK_EQ(connectFailCount, 0);
   CHECK(idle(0)); CHECK(idle(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
   CHECK_CONTAINS(page(), "Current IP Fails</td><td>0/10");
-  CHECK_CONTAINS(page(), "Push target: 192.168.1.151:88 (pushes suspended while the Cloudwatcher check is off)");
+  CHECK_CONTAINS(page(), "Push target: 192.168." + std::to_string(IP_ADR2) + ".151:88 (pushes suspended while the Cloudwatcher check is off)");
 }
 
 SCENARIO(remote_check_off_no_cable_autoclose, "check off: a pulled cable does not close the dome") {
