@@ -30,7 +30,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
-| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 39 scenarios per site profile (48 with both sensor layers built in) (v4.3.0) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 42 scenarios per site profile (51 with both sensor layers built in) (v4.3.1) |
 | `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
@@ -55,7 +55,7 @@ NO existing pins/wiring can be changed (hardwired on the board). Only MEGA-exclu
 All real-time operations run in the interrupt service routine:
 - Motor PWM control with soft-start (SMOOTH=30)
 - Button debouncing (cnt > 6 ticks = ~100ms)
-- Limit switch sampling: a level counts only after `LIM_CONFIRM_TICKS` (4) identical samples; every reader uses `limRead()` (v4.3.0)
+- Limit switch sampling: a level counts only after `LIM_CONFIRM_TICKS` (4) identical samples; every reader uses `limRead()` (v4.3.0). The far end stop of a full run is ignored for its first `LIM_MIN_RUN_TICKS` (2440) ticks, reversals exempt (v4.3.1)
 - Motor timeout safety (dynamic in Germany, otherwise the static site values `STATIC_TIMEOUT_M*_CLOSE/OPEN`)
 - Tick counting for motor runtime measurement
 - Frozen dome tick counter (~4 clock cycles overhead when active)
@@ -153,7 +153,7 @@ Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (
 
 Rules:
 - The hardware pairing never changes: the ISR stops direction `OPEN` at `lim*open` and `CLOSE` at `lim*closed`; the PWM pin mapping is fixed.
-- Limit switches are read only through `limRead()` (level confirmed over `LIM_CONFIRM_TICKS` = 4 ISR ticks, v4.3.0). The raw pins are read only in `limSample()` (ISR) and once in `setup()`. Never add a `digitalRead()` of a limit pin anywhere else.
+- Limit switches are read only through `limRead()` (level confirmed over `LIM_CONFIRM_TICKS` = 4 ISR ticks, v4.3.0). The raw pins are read only in `limSample()` (ISR) and once in `setup()`. Never add a `digitalRead()` of a limit pin anywhere else. The ISR limit stops also apply `LIM_FAR_END_IMPLAUSIBLE()` (v4.3.1): a full run cannot reach its far end within `LIM_MIN_RUN_TICKS`; keep that value well below the fastest full run (4859 ticks measured).
 - **Everything that means "physically open/closed" must use** `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM1_PHYS_CLOSED` / `LIM1_PHYS_OPEN` / `LIM2_PHYS_CLOSED` / `LIM2_PHYS_OPEN` (plus the `*_NAME` strings and `WIRING_LABEL` for UI text). Raw `OPEN`/`CLOSE`/`lim*` are allowed only in the defines, the PHYSICAL SEMANTICS block, `pinMode`, the ISR limit stops, the ISR PWM output, the ISR stop-reason housekeeping and the ISR panel buttons (which use `BUTTON_MAY_START(dir)` and `TIMEOUT_M*_FOR(dir)`).
 - The web API is physical on both sites: `$1`/`$3` close, `$2`/`$4` open; `$S`, `$A` and the web page report physical state. The ASCOM driver needs no site setting ("Swap Open/Close" stays unchecked on both domes).
 - Before v4.2.0 the mirrored interpretation was hard-coded in 109 places. Flashed on a standard-wired dome, the IP-fail auto-close drove the shutters to the physically OPEN end stop. Never add a raw limit/direction test outside the allowed places; `make -C test/host test` runs every scenario for both sites and catches it.
@@ -180,6 +180,7 @@ Rules:
 #define HAVE_TIMEOUT_REGRESSION 1           // v4.3.0: per site (Germany 1, Portugal 0); 0 = probe shows temperature only
 #define STATIC_TIMEOUT_M1_CLOSE 6527        // v4.3.0: per site and physical direction; Portugal 7320 / 6527 / 7930 / 6527
 #define LIM_CONFIRM_TICKS 4                 // v4.3.0: identical ISR samples before a limit level is accepted (~66 ms)
+#define LIM_MIN_RUN_TICKS 2440              // v4.3.1: far end stop of a full run ignored before this (~40 s), reversals exempt
 #define SMOOTH 30                           // Soft-start smoothness
 
 // Dynamic timeout regression coefficients (v4.0)
@@ -475,5 +476,5 @@ These patterns were discovered during lab testing and are critical for future mo
 - **Rate-limiter timestamps start at 0** (v4.2.0): a plain `now - last < interval` test with `last == 0` suppresses the first event after boot (events for 10 s, conflict events for 5 min). Treat 0 as "never sent".
 - **Stop reasons at limit switches**: once a motor is off at a limit, the ISR clears every stop reason except 3 (with the auto-close flag) and 4 on the next tick. Reason 6 (frozen) is therefore only visible mid-travel.
 - **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`. (v4.3.0: the 62 limit reads were swept the same way.)
-- **Limit confirmation (v4.3.0)**: Portugal, 2026-11-02 08:29 UTC, a single spurious HIGH sample on pin 0 (`lim2closed`, shares RX0) stopped the closing West shutter after 252 ticks; because the tick tracker re-read the pin in the same ISR pass, the stop was logged as a *valid* 252-tick close. The German 253-cycle CSV has no such run. `limSample()` now needs 4 identical samples; USB is never connected to the Portuguese MEGA in operation, so the source is electrical noise on the limit line.
+- **Limit confirmation (v4.3.0) and far-end plausibility (v4.3.1)**: Portugal, 2026-11-02: three West closes from fully open, two stopped at 252 and 212 ticks (4.1 s / 3.5 s) by a HIGH on pin 0 (`lim2closed`, shares RX0) that the firmware logged as *valid* closes; the second one happened with the 4-tick confirmation already active, so the level lasted > 66 ms, and the operator saw it coincide with the release of the OPEN switch (pin 1). The clean run took 5485 ticks (89.9 s). The German 253-cycle CSV has no such run. USB is never connected to the Portuguese MEGA in operation; suspect the West limit wiring (shared/loose line between the two switches). The night failure of 2026-11-02 05:58 may have been this glitch as well (NINA's state poll adds up to ~6 s of latency), not necessarily the timeout.
 - **Portugal night close (2026-11-02 05:58 local)**: NINA's AscomDome.CloseShutter waits 3 s and then polls once per second while the state is ShutterClosing, without an own timeout; the wait ended 107.24 s after the call, i.e. at the firmware's 6527-tick timeout (106.9 s), with East closed (5943 ticks) and West intermediate. The ASCOM driver reports ShutterError only when both motors are stopped and the shutters are not both closed or both open, so a NINA ShutterError always means a motor stopped early.

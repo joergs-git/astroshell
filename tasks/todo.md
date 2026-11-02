@@ -69,7 +69,14 @@ Tasks:
 - [x] IDE toolchain builds clean (after the review fixes): Germany 44040 B flash / 877 B RAM, Portugal 39942 B / 733 B (+316 B / +7 B vs v4.2.2)
 - [x] README (v4.3.0 section, site table, commissioning step 6), CLAUDE.md, firmware header v4.3.0; MAC :ED / IP_ADR3 177 unchanged
 - [x] Pushed as PR #6 (feature/limit-debounce-site-timeouts); CI green on both commits (runs 41416587060 and 41420258063: 6 host builds + 8 Arduino builds)
-- [ ] PR #6 merge on the user's word
+- [x] v4.3.0 flashed in Portugal by the user on site (2026-11-02 ~12:40 local): page shows Static (site profile), 7320/6527, 7930/6527,
+      check ENABLED; opens 5240 / 5028 ticks. First West close from open: glitch stop at 212 ticks (pin 0 HIGH > 66 ms at the
+      release of the OPEN switch); re-open + close: clean 5485 ticks (89.9 s). East close 5707.
+- [x] v4.3.1: far-end plausibility (LIM_MIN_RUN_TICKS 2440, reversals exempt), m*_run_start_dir in the tick tracking, 3 scenarios
+      (42/51/42 per site green; v4.2.2 fails the far-end scenario); the night failure may have been the same glitch
+- [ ] PR #6 merge on the user's word; user re-flashes Portugal with v4.3.1 and repeats open/close from fully open
+- [ ] Portugal, on site: inspect the West limit-switch wiring (pin 0 line vs pin 1 line, shared common, connector), the glitch
+      coincides with the release of the OPEN switch
 - [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
       timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
       logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise

@@ -83,3 +83,9 @@
 - **Root cause:** (a) a "close whatever is not closed" decision read a now-debounced level without treating "motor already moving away from the stop" explicitly; (b) a 0-means-never sentinel was faked with `| 1`
 - **Rule:** Any decision on a debounced/confirmed level must handle the motor direction first. Never fake a non-zero timestamp with `| 1`; use `if (stamp == 0) stamp = 1` or a flag. Request the independent review for every safety-relevant change (this is the second time it found a real bug I did not)
 - **Applies to:** domecontrol_JK3.ino auto-close and any millis()-based filter
+
+## [2026-11-02] — A debounce alone did not cover the field fault
+- **Mistake:** v4.3.0 assumed the spurious limit level was a single sample; the next close on the real dome showed a HIGH that outlasted the 4-tick confirmation (212-tick stop, logged as a valid run)
+- **Root cause:** The confirmation window was sized from one observation; the fault is a sustained level coupled to the release of the other switch, not a one-sample glitch
+- **Rule:** For safety inputs combine a short debounce with a physical plausibility check (a full run cannot reach the far end before LIM_MIN_RUN_TICKS); never size a filter from a single event. Watch the first real runs after flashing with the logger before declaring a fix done
+- **Applies to:** domecontrol_JK3.ino limit handling, any sensor filter sized from field data

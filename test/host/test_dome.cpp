@@ -27,6 +27,9 @@
 
 // Compatibility with firmware revisions before v4.3.0 (make test FW=<old.ino>): one raw sample decided
 // a limit switch, one 6527-tick timeout served every motor and direction, the Solo was always .151.
+#ifndef LIM_MIN_RUN_TICKS
+#define LIM_MIN_RUN_TICKS 0                           // pre-4.3.1: no far-end plausibility
+#endif
 #ifndef LIM_CONFIRM_TICKS
 #define LIM_CONFIRM_TICKS 1
 #define limRead(pin) digitalRead(pin)                 // pre-4.3.0: raw reads, no confirmation, no reversal hold
@@ -449,9 +452,42 @@ SCENARIO(limit_glitch_ignored, "a spurious HIGH on the closed-limit input shorte
   CHECK(m2_last_ticks_closing >= g_travel && m2_last_ticks_closing <= g_travel + LIM_CONFIRM_TICKS + 2);
 }
 
-SCENARIO(limit_level_at_threshold_is_real, "a HIGH that persists for LIM_CONFIRM_TICKS counts as the limit: the motor stops") {
+SCENARIO(far_end_glitch_during_full_run_ignored, "a long spurious 'closed' level early in a close from the open stop is ignored (far end implausible)") {
+  setPos(g_travel, g_travel); boot(); ensureRemoteCheck(true);
+  http("/?$3"); runTicks(200);                        // 3.3 s: where the Portuguese West shutter was stopped
+  CHECK(movingToClosed(1)); CHECK(m2_full_run_active);
+  S[1].closedGlitchTicks = 30;                         // ~0.5 s HIGH, far longer than the confirmation window
+  runTicks(60);
+  CHECK(movingToClosed(1)); CHECK(m2_full_run_active);
+  CHECK(!outboundHas("GET /log?m=2")); CHECK(!outboundHas("GET /interrupt?m=2"));
+  runMs(130000);
+  CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(stop2reason, 0);
+  CHECK(m2_last_ticks_closing >= g_travel); CHECK(outboundHas("GET /log?m=2&d=1&t=50"));
+}
+
+SCENARIO(far_end_level_after_min_run_counts, "the same level after LIM_MIN_RUN_TICKS is taken as the end stop") {
   setPos(g_travel, g_travel); boot();
-  http("/?$3"); runTicks(250);
+  http("/?$3"); runTicks(LIM_MIN_RUN_TICKS + 50);
+  CHECK(movingToClosed(1));
+  S[1].closedGlitchTicks = 30;
+  runTicks(LIM_CONFIRM_TICKS + 2);
+  CHECK(motorOff(1)); CHECK(!physClosed(1));
+}
+
+SCENARIO(reversal_to_start_limit_stops_at_once, "a close from the open stop reversed after 5 s stops at the open stop without overrun") {
+  setPos(g_travel, g_travel); boot();
+  http("/?$3"); runTicks(300);
+  CHECK(movingToClosed(1)); CHECK(S[1].pos < g_travel - 250);
+  http("/?$4"); runTicks(5); CHECK(movingToOpen(1));
+  long before = S[1].ticksMovingOpen;
+  runMs(10000);
+  CHECK(physOpen(1)); CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingOpen - before <= 300 + LIM_CONFIRM_TICKS + 10);   // no pushing against the open stop
+}
+
+SCENARIO(limit_level_at_threshold_is_real, "a HIGH that persists for LIM_CONFIRM_TICKS counts as the limit once the far end is plausible: the motor stops") {
+  setPos(g_travel, g_travel); boot();
+  http("/?$3"); runTicks(LIM_MIN_RUN_TICKS + 50);     // v4.3.1: before that the far end is implausible and ignored
   S[1].closedGlitchTicks = LIM_CONFIRM_TICKS;
   runTicks(LIM_CONFIRM_TICKS + 2);
   CHECK(motorOff(1)); CHECK(!physClosed(1));

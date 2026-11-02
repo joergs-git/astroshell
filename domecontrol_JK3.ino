@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.0)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.1)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -21,6 +21,14 @@
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
 // - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.3.1 Changes (Portugal, 2026-11-02 afternoon, first runs with v4.3.0 on the board):
+// - Far-end plausibility for the limit stops: a run that started at one end stop cannot reach the other
+//   one within LIM_MIN_RUN_TICKS (~40 s), so the far limit is ignored until then. Two of three West
+//   closes from fully open were stopped at 3.5-4.1 s by a HIGH on pin 0 ("closed") that lasted longer
+//   than the 4-tick confirmation and coincided with the release of the OPEN switch on pin 1; the
+//   complete West close takes 5485 ticks. A reversal (direction differs from the start direction) is
+//   exempt, so a shutter sent back to its start limit still stops there at once.
 //
 // v4.3.0 Changes (Portugal night of 2026-11-01/02 and the measurement cycle of 2026-11-02):
 // - Limit switch confirmation: the ISR samples the four limit inputs every tick and takes a level over
@@ -409,6 +417,14 @@ static byte limPending[4] = {0, 0, 0, 0};   // consecutive samples that differ f
 // shutter a millimetre open. The hold suppresses the limit stop of that motor for LIM_CONFIRM_TICKS
 // ticks (at most ~66 ms of pushing against the stop). Set from loop() before startMotor*() (v4.3.0).
 volatile byte m1LimitHold = 0, m2LimitHold = 0;
+// Far-end plausibility (v4.3.1): a run that started at one end stop (m*_run_start_dir != 0, set by the
+// tick tracking) cannot arrive at the opposite end stop within LIM_MIN_RUN_TICKS; the fastest full run
+// ever measured is 4859 ticks (Germany), 5028 (Portugal). Until then the far limit is ignored, which
+// defeats a long spurious HIGH on that input (Portugal 2026-11-02: >= 66 ms on pin 0 when the OPEN
+// switch released, 3.5 s into the close). A reversal is exempt: the direction then differs from the
+// start direction and the start limit stops the motor as usual. The motor timeout stays the backstop.
+#define LIM_MIN_RUN_TICKS 2440
+#define LIM_FAR_END_IMPLAUSIBLE(startDir, dir, ticks)  ((startDir) == (dir) && (ticks) < LIM_MIN_RUN_TICKS)
 
 static inline byte limBit(byte pin) {
   return pin == lim1open ? 0 : pin == lim1closed ? 1 : pin == lim2open ? 2 : 3;
@@ -621,12 +637,14 @@ volatile word m1_tick_counter = 0;            // Current tick count during run
 volatile bool m1_full_run_active = false;     // True if started at a limit switch
 volatile bool m1_was_closing = false;         // True if direction is open→close (physically)
 volatile byte m1_prev_dir = 0;                // Previous motor direction for transition detection
+volatile byte m1_run_start_dir = 0;           // Hardware direction at the start of a full run, 0 otherwise (v4.3.1)
 
 // --- Motor 2 Tick Tracking ---
 volatile word m2_tick_counter = 0;
 volatile bool m2_full_run_active = false;
 volatile bool m2_was_closing = false;
 volatile byte m2_prev_dir = 0;
+volatile byte m2_run_start_dir = 0;           // v4.3.1
 
 // --- Last Valid Measurements (available for display and push) ---
 volatile word m1_last_ticks_closing = 0;      // Last valid open→close ticks (M1)
@@ -2002,7 +2020,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.3.0 - Safety Sensors, dual-site"));
+    Serial.println(F("Dome Control v4.3.1 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -3273,7 +3291,8 @@ ISR(TIMER2_COMPA_vect) {
   bool hold1 = m1LimitHold != 0, hold2 = m2LimitHold != 0;   // v4.3.0: reversal from the stop, see m*LimitHold
   if (hold1) m1LimitHold--;
   if (hold2) m2LimitHold--;
-  if (!hold1 && limRead(lim1open) && mot1dir == OPEN) {
+  // v4.3.1: the far end stop is ignored during the first LIM_MIN_RUN_TICKS of a full run (see LIM_FAR_END_IMPLAUSIBLE)
+  if (!hold1 && limRead(lim1open) && mot1dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, OPEN, m1_tick_counter)) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3281,7 +3300,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1open -> STOP"));
     #endif
   }
-  if (!hold1 && limRead(lim1closed) && mot1dir == CLOSE) {
+  if (!hold1 && limRead(lim1closed) && mot1dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, CLOSE, m1_tick_counter)) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3289,7 +3308,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1closed -> STOP"));
     #endif
   }
-  if (!hold2 && limRead(lim2open) && mot2dir == OPEN) {
+  if (!hold2 && limRead(lim2open) && mot2dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, OPEN, m2_tick_counter)) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
@@ -3297,7 +3316,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M2 reached lim2open -> STOP"));
     #endif
   }
-  if (!hold2 && limRead(lim2closed) && mot2dir == CLOSE) {
+  if (!hold2 && limRead(lim2closed) && mot2dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, CLOSE, m2_tick_counter)) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
@@ -3428,9 +3447,11 @@ ISR(TIMER2_COMPA_vect) {
       m1_full_run_active = true;
       m1_tick_counter = 0;
       m1_was_closing = (mot1dir == DIR_PHYS_CLOSE);  // physical direction
+      m1_run_start_dir = mot1dir;                    // v4.3.1: far-end plausibility
     } else {
       // Started from intermediate position - not a full-run
       m1_full_run_active = false;
+      m1_run_start_dir = 0;
     }
   }
 
@@ -3468,6 +3489,7 @@ ISR(TIMER2_COMPA_vect) {
       }
 
       m1_full_run_active = false;
+      m1_run_start_dir = 0;
     }
   }
 
@@ -3483,8 +3505,10 @@ ISR(TIMER2_COMPA_vect) {
       m2_full_run_active = true;
       m2_tick_counter = 0;
       m2_was_closing = (mot2dir == DIR_PHYS_CLOSE);
+      m2_run_start_dir = mot2dir;                    // v4.3.1
     } else {
       m2_full_run_active = false;
+      m2_run_start_dir = 0;
     }
   }
 
@@ -3519,6 +3543,7 @@ ISR(TIMER2_COMPA_vect) {
       }
 
       m2_full_run_active = false;
+      m2_run_start_dir = 0;
     }
   }
 
