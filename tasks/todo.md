@@ -42,6 +42,55 @@ Done:
 - [x] Portugal LAN is 192.168.0.x: `IP_ADR2` moved into the site profile (Germany 1 -> 192.168.1.177, Portugal 0 -> 192.168.0.177), Solo address derived from the same subnet. PR #5 merged (b56d5a9); host suite 6 builds green, IDE builds Germany 43724 B / 870 B, Portugal 39606 B / 727 B
 - [x] Portugal: ASCOM dome driver verified by the user (open / close, end detection), "Swap Open/Close" unchecked
 
+## Planned (2026-11-02) — v4.3.0: limit-switch debounce + per-site static timeouts (Portugal)
+Findings (Portugal dome 192.168.0.177, Solo/tick logger 192.168.0.185):
+- Night close 2026-11-02 via NINA: West hit the static 6527-tick timeout. NINA's AscomDome wait loop has no own timeout
+  (polls while ShutterClosing, 1 s); it ended 107.24 s after the close call = firmware timeout at 106.9 s. East closed in 5943 ticks.
+- Measurement cycle 2026-11-02 08:28 UTC (21 C, dry): West close stopped after 252 ticks by a spurious HIGH on pin 0
+  (lim2closed = West "phys. closed" in the Portugal profile, shares RX0 with the USB-serial chip); the firmware logged it as a
+  VALID full run of 252 ticks. Re-sent $3 closed the rest in 87.4 s -> warm West close about 91.5 s (~5585 ticks).
+  East close 5877, East open 5410, West open 5201 ticks. Germany's 253-cycle CSV shows no such short run.
+- The ISR stops a motor on a single raw limit sample (no debounce); 55 digitalRead(lim*/LIM*) sites in 7 functions.
+Tasks:
+- [x] ISR samples the four limit pins every tick; a level counts only after LIM_CONFIRM_TICKS = 4 identical samples (66 ms,
+      ~1.5 mm of travel); `limRead()` replaced all 62 raw reads via a counted replacement script; raw digitalRead only in
+      `limSample()` and once in setup()
+- [x] STATIC_TIMEOUT_M*_CLOSE/OPEN in the site profile (physical direction); Portugal: West close 7930 (130 s), East close
+      7320 (120 s), opens 6527; Germany 6527 x4 (dynamic cap unchanged). HAVE_TIMEOUT_REGRESSION gates the German regression
+      (Portugal 0: a probe only shows the temperature). SOLO_IP_ADR3 per site (.151 / .185), Portugal remote-check default ON
+- [x] Host tests: physics can inject limit glitches; 7 new scenarios (glitch ignored, threshold level counts, real end stop
+      within the window, site timeouts via web and panel buttons, one LinkOFF read ignored, auto-close reversal right after
+      an open from the stop) + probe-without-regression for the Portugal sensors build; fallback defines keep `FW=<old.ino>`
+      compiling. New firmware: 39/48/39 per site green; v4.2.2 against the new suite fails the glitch, LinkOFF and reversal ones
+- [x] Independent review (subagent, 2026-11-02): no blockers; fixed its two should-fix code findings (auto-close skipped a
+      shutter that had just left the closed stop; `millis() | 1` stamp bypassed the 200 ms LinkOFF filter), the DYN cap guard,
+      the probe-without-regression periodic path, the panel-button timeout checks and the commissioning text. Residual noted:
+      a glitch of >= LIM_CONFIRM_TICKS samples is logged as a valid run (logger plausibility check = follow-up)
+- [x] IDE toolchain builds clean (after the review fixes): Germany 44040 B flash / 877 B RAM, Portugal 39942 B / 733 B (+316 B / +7 B vs v4.2.2)
+- [x] README (v4.3.0 section, site table, commissioning step 6), CLAUDE.md, firmware header v4.3.0; MAC :ED / IP_ADR3 177 unchanged
+- [x] Pushed as PR #6 (feature/limit-debounce-site-timeouts); CI green on both commits (runs 41416587060 and 41420258063: 6 host builds + 8 Arduino builds)
+- [x] v4.3.0 flashed in Portugal by the user on site (2026-11-02 ~12:40 local): page shows Static (site profile), 7320/6527, 7930/6527,
+      check ENABLED; opens 5240 / 5028 ticks. First West close from open: glitch stop at 212 ticks (pin 0 HIGH > 66 ms at the
+      release of the OPEN switch); re-open + close: clean 5485 ticks (89.9 s). East close 5707.
+- [x] v4.3.1: far-end plausibility (LIM_MIN_RUN_TICKS 2440, reversals exempt), m*_run_start_dir in the tick tracking, 3 scenarios
+      (42/51/42 per site green; v4.2.2 fails the far-end scenario); the night failure may have been the same glitch
+- [x] v4.3.2: ignored far-end levels counted once per episode (web row "Ignored limit levels", `limit_glitch` event), suite 42/51/42
+- [x] v4.3.2 flashed in Portugal (2026-11-02 ~13:05 local). Four full open/close cycles with it: all clean, "Ignored limit
+      levels" 0, no limit_glitch event. Day total: 8 West closes from fully open, 2 glitch stops (both v4.3.0), 6 clean
+      (5277-5485 ticks); East close 5600-5720; opens West 4753-5028, East 5027-5240 (21-28 C, warm motor, short rests)
+- [ ] PR #6 merge on the user's word
+- [ ] Watch "Ignored limit levels" (web, System Status) and `journalctl -u astroshell_ticklogger | grep limit_glitch` on the
+      Solo over the first NINA nights; the user suspects the West OPEN switch itself (cables judged OK); candidate: an SPDT
+      switch whose second contact touches the "closed" line on release
+- [ ] The Portugal CSV lives on tmpfs (/home/aagsolo) and is lost on a Solo reboot: no Synology there. Decide on a persistent
+      copy (cron to persistent storage, or pull it over SSH now and then); session copy taken 2026-11-02 12:55 UTC
+- [ ] After a few NINA nights: tighten the Portugal static timeouts (currently West close 7930, East close 7320) from the CSV
+- [ ] Portugal, on site: inspect the West limit-switch wiring (pin 0 line vs pin 1 line, shared common, connector), the glitch
+      coincides with the release of the OPEN switch
+- [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
+      timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
+      logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise
+
 ## Next
 - [ ] Germany: flash v4.2.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON)
 - [ ] Portugal, later: Solo at 192.168.0.151 -> `$W1`; sensors -> flip `ENABLE_DS18B20_DYNAMIC_TIMEOUT` / `ENABLE_TOF_FROZEN_DETECTION` in the profile, calibrate ToF with `$C`

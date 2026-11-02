@@ -71,3 +71,21 @@
 - **Root cause:** IDE board set to Arduino Uno instead of Mega 2560; firmware IP is static 192.168.1.177 while the browser was on another subnet
 - **Rule:** Commissioning step 1 = board Mega 2560; step 2 = Arduino IP must be inside the local subnet (`IP_ADR2`), ideally carried by the site profile
 - **Applies to:** flashing any dome controller on a new site
+
+## [2026-11-02] — Incident analysed for the wrong dome
+- **Mistake:** A "dome did not close completely" report was analysed against the German profile (dynamic timeout, DS18B20) until the user pointed out that 192.168.0.177 is the Portugal dome
+- **Root cause:** The report only said "IP address 177"; both domes end in .177 and differ in timeout mode (Germany dynamic, Portugal static 6527), sensors and Cloudwatcher check
+- **Rule:** For any incident report first establish the site (full IP / subnet, or ask), then read the live status page of THAT dome before reasoning about firmware paths. Note that the Portugal board can run a locally adapted build (its page showed push target .185 while main says .151)
+- **Applies to:** every dual-site incident analysis in this repo
+
+## [2026-11-02] — Independent review found two pre-existing bugs behind a safety change
+- **Mistake:** My v4.3.0 diff was correct in itself, but (a) the auto-close skipped a shutter that had just started opening from the closed stop while its confirmed level still said "closed", and (b) the 200 ms LinkOFF filter stamped `millis() | 1`, which wraps the subtraction on even millis
+- **Root cause:** (a) a "close whatever is not closed" decision read a now-debounced level without treating "motor already moving away from the stop" explicitly; (b) a 0-means-never sentinel was faked with `| 1`
+- **Rule:** Any decision on a debounced/confirmed level must handle the motor direction first. Never fake a non-zero timestamp with `| 1`; use `if (stamp == 0) stamp = 1` or a flag. Request the independent review for every safety-relevant change (this is the second time it found a real bug I did not)
+- **Applies to:** domecontrol_JK3.ino auto-close and any millis()-based filter
+
+## [2026-11-02] — A debounce alone did not cover the field fault
+- **Mistake:** v4.3.0 assumed the spurious limit level was a single sample; the next close on the real dome showed a HIGH that outlasted the 4-tick confirmation (212-tick stop, logged as a valid run)
+- **Root cause:** The confirmation window was sized from one observation; the fault is a sustained level coupled to the release of the other switch, not a one-sample glitch
+- **Rule:** For safety inputs combine a short debounce with a physical plausibility check (a full run cannot reach the far end before LIM_MIN_RUN_TICKS); never size a filter from a single event. Watch the first real runs after flashing with the logger before declaring a fix done
+- **Applies to:** domecontrol_JK3.ino limit handling, any sensor filter sized from field data
