@@ -78,7 +78,7 @@ Tasks:
 - [x] v4.3.2 flashed in Portugal (2026-11-02 ~13:05 local). Four full open/close cycles with it: all clean, "Ignored limit
       levels" 0, no limit_glitch event. Day total: 8 West closes from fully open, 2 glitch stops (both v4.3.0), 6 clean
       (5277-5485 ticks); East close 5600-5720; opens West 4753-5028, East 5027-5240 (21-28 C, warm motor, short rests)
-- [ ] PR #6 merge on the user's word
+- [x] PR #6 merged into main on the user's word (merge commit aa414e0, 2026-11-02); branch deleted. main = v4.3.2 for both sites
 - [ ] Watch "Ignored limit levels" (web, System Status) and `journalctl -u astroshell_ticklogger | grep limit_glitch` on the
       Solo over the first NINA nights; the user suspects the West OPEN switch itself (cables judged OK); candidate: an SPDT
       switch whose second contact touches the "closed" line on release
@@ -92,7 +92,7 @@ Tasks:
       logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise
 
 ## Next
-- [ ] Germany: flash v4.2.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON)
+- [ ] Germany: flash v4.3.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON; limit confirmation + far-end rule apply there too)
 - [ ] Portugal, later: Solo at 192.168.0.151 -> `$W1`; sensors -> flip `ENABLE_DS18B20_DYNAMIC_TIMEOUT` / `ENABLE_TOF_FROZEN_DETECTION` in the profile, calibrate ToF with `$C`
 - [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON
 - [ ] When a VL53L0X is mounted: `ENABLE_TOF_FROZEN_DETECTION 1` (per site if only one dome), calibrate with `$C`
