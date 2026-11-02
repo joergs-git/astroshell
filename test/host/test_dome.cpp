@@ -25,6 +25,24 @@
 #endif
 #include FIRMWARE_PATH
 
+// Compatibility with firmware revisions before v4.3.0 (make test FW=<old.ino>): one raw sample decided
+// a limit switch, one 6527-tick timeout served every motor and direction, the Solo was always .151.
+#ifndef LIM_CONFIRM_TICKS
+#define LIM_CONFIRM_TICKS 1
+#endif
+#ifndef STATIC_TIMEOUT_M1_CLOSE
+#define STATIC_TIMEOUT_M1_CLOSE 6527
+#define STATIC_TIMEOUT_M1_OPEN  6527
+#define STATIC_TIMEOUT_M2_CLOSE 6527
+#define STATIC_TIMEOUT_M2_OPEN  6527
+#endif
+#ifndef HAVE_TIMEOUT_REGRESSION
+#define HAVE_TIMEOUT_REGRESSION 1
+#endif
+#ifndef SOLO_IP_ADR3
+#define SOLO_IP_ADR3 151
+#endif
+
 #ifndef SITE
 #define SITE 1
 #endif
@@ -62,6 +80,7 @@ struct Shutter {
   int openPwm = 0, closePwm = 0, physOpenPin = 0, physClosedPin = 0;
   bool stuckOpening = false;            // frozen: cannot move towards open
   bool closedLimitBroken = false, openLimitBroken = false;
+  int closedGlitchTicks = 0, openGlitchTicks = 0;   // spurious HIGH samples injected on a limit input (v4.3.0)
   long ticksMovingOpen = 0, ticksMovingClosed = 0;
 };
 static Shutter S[2];
@@ -76,6 +95,8 @@ static void physicsStep() {
     else if (c) { s.ticksMovingClosed++; if (s.pos > 0) s.pos--; }
     sim::g_pinIn[s.physOpenPin]   = (s.pos >= g_travel && !s.openLimitBroken) ? HIGH : LOW;
     sim::g_pinIn[s.physClosedPin] = (s.pos <= 0 && !s.closedLimitBroken) ? HIGH : LOW;
+    if (s.openGlitchTicks > 0)   { sim::g_pinIn[s.physOpenPin]   = HIGH; s.openGlitchTicks--; }     // electrical glitch on the line
+    if (s.closedGlitchTicks > 0) { sim::g_pinIn[s.physClosedPin] = HIGH; s.closedGlitchTicks--; }
   }
 }
 
@@ -269,9 +290,9 @@ SCENARIO(close_all_open_all, "CLOSE ALL / OPEN ALL buttons move both shutters") 
 SCENARIO(plain_status, "$S is CLOSED only when both shutters are physically closed") {
   setPos(0, 0); boot();
   CHECK_STREQ(status(), "CLOSED");
-  setPos(0, 1);  CHECK_STREQ(status(), "OPEN");
-  setPos(1, 0);  CHECK_STREQ(status(), "OPEN");
-  setPos(g_travel, g_travel); CHECK_STREQ(status(), "OPEN");
+  setPos(0, 1); runTicks(LIM_CONFIRM_TICKS); CHECK_STREQ(status(), "OPEN");    // v4.3.0: levels are confirmed over LIM_CONFIRM_TICKS
+  setPos(1, 0); runTicks(LIM_CONFIRM_TICKS); CHECK_STREQ(status(), "OPEN");
+  setPos(g_travel, g_travel); runTicks(LIM_CONFIRM_TICKS); CHECK_STREQ(status(), "OPEN");
 }
 
 //=============================================================================
@@ -305,7 +326,22 @@ SCENARIO(emergency_stop, "STOP button halts both motors immediately") {
 //=============================================================================
 // SCENARIOS - timeouts
 //=============================================================================
-#if ENABLE_DS18B20_DYNAMIC_TIMEOUT
+#if ENABLE_DS18B20_DYNAMIC_TIMEOUT && !HAVE_TIMEOUT_REGRESSION
+SCENARIO(probe_without_regression, "DS18B20 built in on a site without a regression: temperature shown, timeouts stay at the static site values") {
+  sim::g_dsPresent = true; sim::g_tempC = 10.0f;
+  setPos(2500, 2500); boot();
+  CHECK(ds18b20_connected); CHECK_EQ(currentTemp_x10, 100); CHECK(!dynamicTimeoutActive);
+  CHECK_EQ(dynTimeout_M1_Close, STATIC_TIMEOUT_M1_CLOSE); CHECK_EQ(dynTimeout_M1_Open, STATIC_TIMEOUT_M1_OPEN);
+  CHECK_EQ(dynTimeout_M2_Close, STATIC_TIMEOUT_M2_CLOSE); CHECK_EQ(dynTimeout_M2_Open, STATIC_TIMEOUT_M2_OPEN);
+  std::string p = page();
+  CHECK_CONTAINS(p, "Temperature</td><td>10.0 C");
+  CHECK_CONTAINS(p, "Timeout Mode</td><td>Static (site profile)");
+  http("/?$3"); CHECK(movingToClosed(1)); CHECK(mot2timer > STATIC_TIMEOUT_M2_CLOSE - 20 && mot2timer <= STATIC_TIMEOUT_M2_CLOSE);
+  http("/?$5");
+  runMs(30000); CHECK(!dynamicTimeoutActive);            // periodic reads never switch the German regression on here
+  CHECK_EQ(dynTimeout_M2_Close, STATIC_TIMEOUT_M2_CLOSE);
+}
+#elif ENABLE_DS18B20_DYNAMIC_TIMEOUT
 SCENARIO(dynamic_timeout_follows_physical_direction, "closing uses the Close regression, opening the Open regression (DS18B20 at 10 C)") {
   sim::g_dsPresent = true; sim::g_tempC = 10.0f;
   setPos(2500, 2500); boot();
@@ -330,33 +366,86 @@ SCENARIO(dynamic_timeout_follows_physical_direction, "closing uses the Close reg
 }
 
 #else
-SCENARIO(temp_layer_compiled_out, "DS18B20 layer compiled out: a present probe is never used, static 6527 timeout, UI says so, pushes carry temp=-999") {
+SCENARIO(temp_layer_compiled_out, "DS18B20 layer compiled out: a present probe is never used, static site timeouts, UI says so, pushes carry temp=-999") {
   sim::g_dsPresent = true; sim::g_tempC = 10.0f;     // the mock would answer, the firmware must not ask
   setPos(g_travel, 2500); boot(); ensureRemoteCheck(true);
   CHECK(!ds18b20_connected); CHECK_EQ(currentTemp_x10, -9990); CHECK(!dynamicTimeoutActive);
-  CHECK_EQ(dynTimeout_M1_Close, 6527); CHECK_EQ(dynTimeout_M1_Open, 6527);
-  CHECK_EQ(dynTimeout_M2_Close, 6527); CHECK_EQ(dynTimeout_M2_Open, 6527);
+  CHECK_EQ(dynTimeout_M1_Close, STATIC_TIMEOUT_M1_CLOSE); CHECK_EQ(dynTimeout_M1_Open, STATIC_TIMEOUT_M1_OPEN);
+  CHECK_EQ(dynTimeout_M2_Close, STATIC_TIMEOUT_M2_CLOSE); CHECK_EQ(dynTimeout_M2_Open, STATIC_TIMEOUT_M2_OPEN);
   std::string p = page();
   CHECK_CONTAINS(p, "Temperature</td><td>Not installed");
-  CHECK_CONTAINS(p, "Timeout Mode</td><td>Static fallback (6527 ticks)");
-  http("/?$1"); CHECK(mot1timer > 6510 && mot1timer <= 6527);
+  CHECK_CONTAINS(p, "Timeout Mode</td><td>Static (site profile)");
+  http("/?$1"); CHECK(mot1timer > STATIC_TIMEOUT_M1_CLOSE - 20 && mot1timer <= STATIC_TIMEOUT_M1_CLOSE);
   runMs(120000); CHECK(physClosed(0));
   CHECK(outboundHas("GET /log?m=1&d=1&t=50")); CHECK(outboundHas("&temp=-999&tof=-1"));
   runMs(60000); CHECK(!dynamicTimeoutActive); CHECK(!ds18b20_connected);
 }
 #endif
 
-SCENARIO(static_timeout_without_sensor, "no DS18B20: static 6527 tick timeout, broken limit switch stops the motor with reason 5") {
+SCENARIO(static_timeout_without_sensor, "no DS18B20: static site timeout, broken limit switch stops the motor with reason 5") {
   setPos(g_travel, 2500); boot();
   CHECK(!dynamicTimeoutActive);
-  CHECK_CONTAINS(page(), "Static fallback (6527 ticks)");
+  CHECK_CONTAINS(page(), "Static (site profile)");
   S[0].closedLimitBroken = true;
-  http("/?$1"); CHECK(mot1timer > 6510 && mot1timer <= 6527);
+  http("/?$1"); CHECK(mot1timer > STATIC_TIMEOUT_M1_CLOSE - 20 && mot1timer <= STATIC_TIMEOUT_M1_CLOSE);
   runMs(100000);
   CHECK(physClosed(0)); CHECK(movingToClosed(0));     // arrived, but the switch never reports it: motor still on
-  runMs(20000);
-  CHECK(motorOff(0)); CHECK_EQ(stop1reason, 5); CHECK_EQ(m1_interrupt_ticks, 6527);
-  CHECK_CONTAINS(s1(page()), "TIMEOUT at 6527 ticks");
+  runMs(35000);
+  CHECK(motorOff(0)); CHECK_EQ(stop1reason, 5); CHECK_EQ(m1_interrupt_ticks, STATIC_TIMEOUT_M1_CLOSE);
+  CHECK_CONTAINS(s1(page()), "TIMEOUT at " + std::to_string(STATIC_TIMEOUT_M1_CLOSE) + " ticks");
+}
+
+SCENARIO(site_static_timeouts, "the static timeouts come from the site profile: Portugal's West close may take longer than 6527 ticks") {
+  g_travel = 7000;                                      // 115 s run: longer than the old 107 s cap
+  setPos(g_travel, g_travel); boot();
+  CHECK_EQ(dynTimeout_M1_Close, STATIC_TIMEOUT_M1_CLOSE); CHECK_EQ(dynTimeout_M1_Open, STATIC_TIMEOUT_M1_OPEN);
+  CHECK_EQ(dynTimeout_M2_Close, STATIC_TIMEOUT_M2_CLOSE); CHECK_EQ(dynTimeout_M2_Open, STATIC_TIMEOUT_M2_OPEN);
+  http("/?$3"); runMs(140000);
+  if (SITE == 2) {                                      // Portugal: 7930 ticks (130 s), the run completes
+    CHECK_EQ(STATIC_TIMEOUT_M2_CLOSE, 7930); CHECK_EQ(STATIC_TIMEOUT_M1_CLOSE, 7320);
+    CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(stop2reason, 0);
+    CHECK_CONTAINS(s2(page()), "Limit 'Phys. Closed'");
+  } else {                                              // Germany: 6527 ticks (107 s), the run is cut
+    CHECK_EQ(STATIC_TIMEOUT_M2_CLOSE, 6527);
+    CHECK(motorOff(1)); CHECK(!physClosed(1)); CHECK_EQ(stop2reason, 5); CHECK_EQ(m2_interrupt_ticks, 6527);
+  }
+}
+
+//=============================================================================
+// SCENARIOS - limit switch confirmation (v4.3.0)
+//=============================================================================
+SCENARIO(limit_glitch_ignored, "a spurious HIGH on the closed-limit input shorter than LIM_CONFIRM_TICKS does not stop a closing shutter") {
+  setPos(g_travel, g_travel); boot(); ensureRemoteCheck(true);
+  http("/?$3"); runTicks(250);
+  CHECK(movingToClosed(1)); CHECK(m2_full_run_active);
+  int posBefore = S[1].pos;
+  S[1].closedGlitchTicks = LIM_CONFIRM_TICKS > 1 ? LIM_CONFIRM_TICKS - 1 : 1;   // Portugal 2026-11-02: ONE such sample stopped the motor after 252 ticks
+  runTicks(LIM_CONFIRM_TICKS + 5);
+  CHECK(movingToClosed(1)); CHECK(m2_full_run_active); CHECK(S[1].pos < posBefore);
+  CHECK(!outboundHas("GET /log?m=2")); CHECK(!outboundHas("GET /interrupt?m=2"));
+  CHECK_CONTAINS(ascom(), "INTERMEDIATE|CLOSING");
+  runMs(130000);
+  CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(stop2reason, 0);
+  CHECK(outboundHas("GET /log?m=2&d=1&t=50"));         // exactly one complete run of ~g_travel ticks
+  CHECK(m2_last_ticks_closing >= g_travel && m2_last_ticks_closing <= g_travel + LIM_CONFIRM_TICKS + 2);
+}
+
+SCENARIO(limit_level_at_threshold_is_real, "a HIGH that persists for LIM_CONFIRM_TICKS counts as the limit: the motor stops") {
+  setPos(g_travel, g_travel); boot();
+  http("/?$3"); runTicks(250);
+  S[1].closedGlitchTicks = LIM_CONFIRM_TICKS;
+  runTicks(LIM_CONFIRM_TICKS + 2);
+  CHECK(motorOff(1)); CHECK(!physClosed(1));
+}
+
+SCENARIO(real_limit_stops_within_confirmation_window, "a shutter arriving at its end stop is stopped within LIM_CONFIRM_TICKS ticks") {
+  setPos(300, 2500); boot();
+  http("/?$1"); runTicks(5); CHECK(movingToClosed(0));
+  int n = 0; while (!physClosed(0) && n < 1000) { runTicks(1); n++; }
+  CHECK(physClosed(0));
+  int k = 0; while (!motorOff(0) && k < 50) { runTicks(1); k++; }
+  CHECK(k <= LIM_CONFIRM_TICKS); CHECK_EQ(stop1reason, 0);
+  CHECK_CONTAINS(ascom(), "CLOSED|STOPPED|");
 }
 
 //=============================================================================
@@ -644,7 +733,7 @@ SCENARIO(tof_layer_compiled_out, "ToF layer compiled out: a present sensor is ne
   CHECK_CONTAINS(p, "ToF Distance</td><td>Not installed");
   CHECK_CONTAINS(p, "Frozen Detection</td><td>Disabled (not built in)");
   CHECK_NOT_CONTAINS(p, "Calibrate ToF Baseline");
-  CHECK_CONTAINS(p, "Push target: 192.168." + std::to_string(IP_ADR2) + ".151:88</p>");   // check on: pushes active, Solo in the site subnet
+  CHECK_CONTAINS(p, "Push target: 192.168." + std::to_string(IP_ADR2) + "." + std::to_string(SOLO_IP_ADR3) + ":88</p>");   // check on: pushes active, Solo per site
   http("/?$C"); CHECK(!tofCalibrated); CHECK_EQ(sim::g_eeprom[8], 0xFF);
   S[0].stuckOpening = true;                          // ice, but nobody can see it
   http("/?$2"); runMs(30000);
@@ -652,7 +741,7 @@ SCENARIO(tof_layer_compiled_out, "ToF layer compiled out: a present sensor is ne
   CHECK(!outboundHas("frozen")); CHECK(!outboundHas("conflict"));
   http("/?$U"); CHECK_EQ(frozenDomeState, FD_IDLE);
   runMs(120000);
-  CHECK(motorOff(0)); CHECK_EQ(m1_interrupt_ticks, 6527);   // only the motor timeout ends the pull (reason 5 is normalised at the limit)
+  CHECK(motorOff(0)); CHECK_EQ(m1_interrupt_ticks, STATIC_TIMEOUT_M1_OPEN);   // only the motor timeout ends the pull (reason 5 is normalised at the limit)
 }
 #endif
 
@@ -750,7 +839,7 @@ SCENARIO(remote_check_off_no_autoclose, "check off: unreachable Cloudwatcher nev
   CHECK_EQ(connects(80), 0); CHECK_EQ(totalAutoCloses, 0); CHECK_EQ(connectFailCount, 0);
   CHECK(idle(0)); CHECK(idle(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
   CHECK_CONTAINS(page(), "Current IP Fails</td><td>0/10");
-  CHECK_CONTAINS(page(), "Push target: 192.168." + std::to_string(IP_ADR2) + ".151:88 (pushes suspended while the Cloudwatcher check is off)");
+  CHECK_CONTAINS(page(), "Push target: 192.168." + std::to_string(IP_ADR2) + "." + std::to_string(SOLO_IP_ADR3) + ":88 (pushes suspended while the Cloudwatcher check is off)");
 }
 
 SCENARIO(remote_check_off_no_cable_autoclose, "check off: a pulled cable does not close the dome") {
@@ -809,7 +898,7 @@ int main(int argc, char** argv) {
   const char* filter = argc > 1 ? argv[1] : nullptr;
   printf("=== AstroShell logic tests - SITE %d: %s - ToF layer %s - DS18B20 layer %s - firmware %s ===\n", SITE, T.name,
          ENABLE_TOF_FROZEN_DETECTION ? "built in" : "compiled out",
-         ENABLE_DS18B20_DYNAMIC_TIMEOUT ? "built in" : "compiled out", FIRMWARE_PATH);
+         ENABLE_DS18B20_DYNAMIC_TIMEOUT ? (HAVE_TIMEOUT_REGRESSION ? "built in" : "built in, no regression") : "compiled out", FIRMWARE_PATH);
   int passed = 0, failed = 0;
   for (auto& sc : registry()) {
     if (filter && !strstr(sc.name, filter)) continue;

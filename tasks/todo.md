@@ -42,6 +42,32 @@ Done:
 - [x] Portugal LAN is 192.168.0.x: `IP_ADR2` moved into the site profile (Germany 1 -> 192.168.1.177, Portugal 0 -> 192.168.0.177), Solo address derived from the same subnet. PR #5 merged (b56d5a9); host suite 6 builds green, IDE builds Germany 43724 B / 870 B, Portugal 39606 B / 727 B
 - [x] Portugal: ASCOM dome driver verified by the user (open / close, end detection), "Swap Open/Close" unchecked
 
+## Planned (2026-11-02) — v4.3.0: limit-switch debounce + per-site static timeouts (Portugal)
+Findings (Portugal dome 192.168.0.177, Solo/tick logger 192.168.0.185):
+- Night close 2026-11-02 via NINA: West hit the static 6527-tick timeout. NINA's AscomDome wait loop has no own timeout
+  (polls while ShutterClosing, 1 s); it ended 107.24 s after the close call = firmware timeout at 106.9 s. East closed in 5943 ticks.
+- Measurement cycle 2026-11-02 08:28 UTC (21 C, dry): West close stopped after 252 ticks by a spurious HIGH on pin 0
+  (lim2closed = West "phys. closed" in the Portugal profile, shares RX0 with the USB-serial chip); the firmware logged it as a
+  VALID full run of 252 ticks. Re-sent $3 closed the rest in 87.4 s -> warm West close about 91.5 s (~5585 ticks).
+  East close 5877, East open 5410, West open 5201 ticks. Germany's 253-cycle CSV shows no such short run.
+- The ISR stops a motor on a single raw limit sample (no debounce); 55 digitalRead(lim*/LIM*) sites in 7 functions.
+Tasks:
+- [x] ISR samples the four limit pins every tick; a level counts only after LIM_CONFIRM_TICKS = 4 identical samples (66 ms,
+      ~1.5 mm of travel); `limRead()` replaced all 62 raw reads via a counted replacement script; raw digitalRead only in
+      `limSample()` and once in setup()
+- [x] STATIC_TIMEOUT_M*_CLOSE/OPEN in the site profile (physical direction); Portugal: West close 7930 (130 s), East close
+      7320 (120 s), opens 6527; Germany 6527 x4 (dynamic cap unchanged). HAVE_TIMEOUT_REGRESSION gates the German regression
+      (Portugal 0: a probe only shows the temperature). SOLO_IP_ADR3 per site (.151 / .185), Portugal remote-check default ON
+- [x] Host tests: physics can inject limit glitches; 4 new scenarios (glitch ignored, threshold level counts, real end stop
+      within the window, site timeouts) + probe-without-regression for the Portugal sensors build; fallback defines keep
+      `FW=<old.ino>` compiling. New firmware: 36/45/36 per site green; v4.2.2 against the new suite: 4 scenarios fail as intended
+- [x] IDE toolchain builds clean: Germany 43838 B flash / 875 B RAM, Portugal 39722 B / 731 B (+~115 B / +5 B vs v4.2.2)
+- [x] README (v4.3.0 section, site table, commissioning step 6), CLAUDE.md, firmware header v4.3.0; MAC :ED / IP_ADR3 177 unchanged
+- [ ] Push, CI green, PR merge on the user's word
+- [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
+      timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
+      logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise
+
 ## Next
 - [ ] Germany: flash v4.2.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON)
 - [ ] Portugal, later: Solo at 192.168.0.151 -> `$W1`; sensors -> flip `ENABLE_DS18B20_DYNAMIC_TIMEOUT` / `ENABLE_TOF_FROZEN_DETECTION` in the profile, calibrate ToF with `$C`

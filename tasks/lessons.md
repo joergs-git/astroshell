@@ -71,3 +71,9 @@
 - **Root cause:** IDE board set to Arduino Uno instead of Mega 2560; firmware IP is static 192.168.1.177 while the browser was on another subnet
 - **Rule:** Commissioning step 1 = board Mega 2560; step 2 = Arduino IP must be inside the local subnet (`IP_ADR2`), ideally carried by the site profile
 - **Applies to:** flashing any dome controller on a new site
+
+## [2026-11-02] — Incident analysed for the wrong dome
+- **Mistake:** A "dome did not close completely" report was analysed against the German profile (dynamic timeout, DS18B20) until the user pointed out that 192.168.0.177 is the Portugal dome
+- **Root cause:** The report only said "IP address 177"; both domes end in .177 and differ in timeout mode (Germany dynamic, Portugal static 6527), sensors and Cloudwatcher check
+- **Rule:** For any incident report first establish the site (full IP / subnet, or ask), then read the live status page of THAT dome before reasoning about firmware paths. Note that the Portugal board can run a locally adapted build (its page showed push target .185 while main says .151)
+- **Applies to:** every dual-site incident analysis in this repo

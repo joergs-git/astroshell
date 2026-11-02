@@ -65,6 +65,18 @@ Telescope Protection Priority:
 
 ---
 
+## What's New in v4.3.0 — Limit Confirmation and Site Timeouts
+
+| Feature | Description |
+|---------|-------------|
+| **Limit switch confirmation** | The ISR samples the four limit inputs every tick and accepts a level only after `LIM_CONFIRM_TICKS` (4) identical samples, about 66 ms or 1.5 mm of travel. Before, a single spurious HIGH sample stopped a motor: on the Portuguese dome one such sample on pin 0 ended a West close after 252 ticks and the firmware logged it as a completed run. Every limit read goes through `limRead()`; a run now ends four ticks after the switch really closes |
+| **Static timeouts per site and direction** | `STATIC_TIMEOUT_M1/M2_CLOSE/OPEN` live in the site profile. Portugal: West close 7930 ticks (130 s), East close 7320 (120 s), opening 6527 (107 s). The old single 6527-tick cap was fitted on the German motors and cut the Portuguese West close at 106.9 s every night (NINA: "Failed to close dome shutter. Current shutter state: ShutterError"). Germany keeps 6527 everywhere |
+| **Regression gate** | `HAVE_TIMEOUT_REGRESSION` (Germany 1, Portugal 0): the v4.0 temperature regression belongs to the German motors. On a site without a regression a DS18B20 only shows the temperature; the static site values stay in force |
+| **Solo address per site** | `SOLO_IP_ADR3` (Germany .151, Portugal .185 "astromonte"): link-check target and tick-logger address. Portugal's Cloudwatcher check now defaults to ON |
+| **Logic tests** | Four new scenarios per site: a glitch shorter than the confirmation window is ignored, a level that persists for the window counts, a real end stop is honoured within the window, the site timeouts are applied. Run against v4.2.2, the glitch scenario fails exactly as the dome did |
+
+---
+
 ## What's New in v4.2.1 — Dual-Site Firmware
 
 | Feature | Description |
@@ -88,7 +100,7 @@ See [Important: Limit Switch Wiring (Site Profile)](#important-limit-switch-wiri
    - `DallasTemperature` by Miles Burton
    - `VL53L0X` by Pololu
 2. **Upload** `domecontrol_JK3.ino` to Arduino MEGA
-3. **Configure** IP addresses in the code (dome: 192.168.1.177, Cloudwatcher: 192.168.1.151)
+3. **Select the site profile** (`SITE` at the top of the sketch): it sets the dome IP and the Solo address (Germany 192.168.1.177 / .151, Portugal 192.168.0.177 / .185)
 4. **Wire sensors** (see Hardware Setup below)
 5. **Calibrate ToF** — close dome, navigate to web UI, click "Calibrate ToF Baseline"
 6. **Deploy** tick logger + event server to Cloudwatcher Solo (optional but recommended)
@@ -268,7 +280,9 @@ mount -o remount,ro /
 
 ## Dynamic Motor Timeout (v4.0)
 
-> **v4.2.1:** needs `ENABLE_DS18B20_DYNAMIC_TIMEOUT 1` (Germany profile). The Portugal profile has no temperature probe yet and compiles the OneWire layer out; it uses the static 6527-tick (107 s) timeout and shows "Temperature: Not installed".
+> **v4.2.1:** needs `ENABLE_DS18B20_DYNAMIC_TIMEOUT 1` (Germany profile). The Portugal profile has no temperature probe yet and compiles the OneWire layer out; it uses its static timeouts and shows "Temperature: Not installed".
+>
+> **v4.3.0:** the static timeouts are per site and per physical direction (`STATIC_TIMEOUT_M*_CLOSE/OPEN` in the site profile, see the table in the site-profile section) and the regression only runs where `HAVE_TIMEOUT_REGRESSION` is 1 (Germany). A probe on a site without a regression shows the temperature and leaves the static values in force.
 
 Motor runtime varies with ambient temperature due to motor oil viscosity. The v4.0 firmware uses a linear regression model derived from 253 measured motor cycles (-1.6C to 22.6C) to compute temperature-appropriate timeouts.
 
@@ -278,7 +292,7 @@ Motor runtime varies with ambient temperature due to motor oil viscosity. The v4
 - Four separate regression formulas for M1/M2 closing/opening
 - Integer-only computation in loop() — no float math
 - ISR reads precomputed timeout values atomically (16-bit AVR)
-- Falls back to static 6527 ticks (107s) if sensor fails
+- Falls back to the static site values (Germany: 6527 ticks, 107 s) if the sensor fails
 
 ### Temperature Effect
 
@@ -337,7 +351,7 @@ All v4.0 features were lab-tested on real hardware (Arduino MEGA + DS18B20 + VL5
 
 `test/host/` compiles the unchanged firmware against small Arduino mocks and a dome physics model, then runs the scenario suite per site profile, once with the ToF layer compiled out (the default build) and once built in, each scenario in its own forked process (`make -C test/host test`). The physics decides which PWM pin physically opens and which input pin means "physically closed" for each site, independently of the firmware, so the suite checks what the dome *does*, not which constant the code uses.
 
-Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles.
+Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles. Since v4.3.0 the physics can inject spurious HIGH samples on a limit input (`closedGlitchTicks` / `openGlitchTicks`) and the suite covers the limit confirmation and the per-site timeouts: 36 scenarios per site in the default build, 45 with both sensor layers built in.
 
 Running the suite with the Portugal physics against the old v4.1.0 firmware fails 20 of 26 scenarios, including "Cloudwatcher unreachable closes the dome" — that is the hazard the site profile removes.
 
@@ -393,9 +407,10 @@ My German dome was installed mirrored: the motor polarity **and** the limit swit
 | Direction `OPEN` (PWM on motor*b, ends at `lim*open`) physically | closes | opens |
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH means | physically CLOSED | physically OPEN |
 | Panel button "up" | closes | opens |
-| Cloudwatcher check default (`$W`) | ON | OFF |
-| Dome IP / expected Solo IP (`IP_ADR2`, v4.2.2) | 192.168.1.177 / 192.168.1.151 | 192.168.0.177 / 192.168.0.151 |
-| DS18B20 temperature probe / dynamic timeout (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`) | built in | compiled out (static 6527-tick timeout) |
+| Cloudwatcher check default (`$W`) | ON | ON (since v4.3.0, Solo "astromonte" on site) |
+| Dome IP / Solo IP (`IP_ADR2`, `SOLO_IP_ADR3`, v4.3.0) | 192.168.1.177 / 192.168.1.151 | 192.168.0.177 / 192.168.0.185 |
+| DS18B20 temperature probe / dynamic timeout (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`) | built in, regression fitted on this dome (`HAVE_TIMEOUT_REGRESSION 1`) | compiled out; no regression (`HAVE_TIMEOUT_REGRESSION 0`), a probe would only show the temperature |
+| Static motor timeouts (`STATIC_TIMEOUT_M*_CLOSE/OPEN`, v4.3.0) | 6527 ticks (107 s) for all four runs | East close 7320 (120 s), West close 7930 (130 s), opening 6527 (107 s) |
 | VL53L0X ToF / frozen-dome detection (`ENABLE_TOF_FROZEN_DETECTION`) | compiled out | compiled out |
 
 The `$W` setting is stored with the site id. If a board is ever flashed with the other profile, the stored value is ignored and the new profile's default applies, so a Portugal board that once ran a Germany build does not inherit "check ON" (and vice versa).
@@ -412,7 +427,8 @@ The hardware pairing in the ISR never changes (direction `OPEN` always ends at `
 2. Click **OPEN S1**: the shutter must physically open, the page must say "Opening (physically)" and `/?$A` must report `INTERMEDIATE|OPENING|...`. Stop, then **CLOSE S1**.
 3. Let one shutter reach each end stop: the state line must read "Physically OPEN" / "Physically CLOSED" and the pin rows must show HIGH on the matching input.
 4. ASCOM: leave "Swap Open/Close" unchecked; NINA must show the shutter state that matches reality.
-5. Keep **Cloudwatcher Check** disabled until a Solo exists on the site; enabled without one, the dome closes about 16 minutes after every opening.
+5. Keep **Cloudwatcher Check** disabled until a Solo exists on the site (Portugal: "astromonte" at 192.168.0.185 since 2026-11-02, so the Portugal default is ON); enabled without one, the dome closes about 16 minutes after every opening.
+6. Run one full open and close per shutter and read **Last Valid Full-Runs** (System Details → Motor Runtime Logging): every value must stay well below the site's `STATIC_TIMEOUT_M*` for that direction. The Portuguese West close needed more than the old 6527 ticks after a night open.
 
 ---
 

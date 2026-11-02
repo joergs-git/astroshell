@@ -30,7 +30,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
-| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 35 scenarios per site profile (v4.2.0) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 36 scenarios per site profile (45 with both sensor layers built in) (v4.3.0) |
 | `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
@@ -38,7 +38,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 
 - **Microcontroller**: Arduino MEGA 2560 with Ethernet Shield (W5100/W5500)
 - **Dome IP**: static, per site profile (v4.2.2): Germany 192.168.1.177, Portugal 192.168.0.177 (`IP_ADR2`)
-- **Cloudwatcher IP**: x.x.`IP_ADR2`.151, i.e. 192.168.1.151 in Germany (monitored for connectivity; the check is switchable at runtime with `$W`, see Network Monitoring)
+- **Cloudwatcher IP**: x.x.`IP_ADR2`.`SOLO_IP_ADR3` per site (v4.3.0): Germany 192.168.1.151, Portugal 192.168.0.185 ("astromonte"). Monitored for connectivity and used as tick-logger target; the check is switchable at runtime with `$W`, see Network Monitoring
 - **Motors**: Two DC motors with PWM soft-start (pins 3, 5, 6, 9)
 - **Limit switches**: Pins 0, 1, 2, 7 (pins 0/1 conflict with Serial - debugging disabled)
 - **Buttons**: A2-A5 (shutter controls), pin 8 (emergency STOP)
@@ -55,13 +55,13 @@ NO existing pins/wiring can be changed (hardwired on the board). Only MEGA-exclu
 All real-time operations run in the interrupt service routine:
 - Motor PWM control with soft-start (SMOOTH=30)
 - Button debouncing (cnt > 6 ticks = ~100ms)
-- Limit switch monitoring
-- Motor timeout safety (dynamic or static 6527 ticks)
+- Limit switch sampling: a level counts only after `LIM_CONFIRM_TICKS` (4) identical samples; every reader uses `limRead()` (v4.3.0)
+- Motor timeout safety (dynamic in Germany, otherwise the static site values `STATIC_TIMEOUT_M*_CLOSE/OPEN`)
 - Tick counting for motor runtime measurement
 - Frozen dome tick counter (~4 clock cycles overhead when active)
 
 ### Sensors (v4.0)
-- **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout. **Per site since v4.2.1** (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`, Germany 1, Portugal 0): compiled out, no OneWire/DallasTemperature libraries, static 6527 timeout, "Temperature: Not installed".
+- **DS18B20**: Non-blocking async read every 5 seconds, used for dynamic timeout. **Per site since v4.2.1** (`ENABLE_DS18B20_DYNAMIC_TIMEOUT`, Germany 1, Portugal 0): compiled out, no OneWire/DallasTemperature libraries, static site timeouts, "Temperature: Not installed". **v4.3.0:** the regression itself is gated by `HAVE_TIMEOUT_REGRESSION` (Germany 1, Portugal 0); a probe on Portugal would only show the temperature.
 - **VL53L0X**: Continuous mode, read every 200ms, used for frozen dome detection. **Compiled out by default since v4.2.0** (`ENABLE_TOF_FROZEN_DETECTION 0`, no sensor mounted on either dome): no Wire/VL53L0X libraries, no I2C traffic; `tof_connected` stays false so the frozen state machine, `$C`/`$U` and the conflict check are inert. The host test suite runs each site with and without the layer.
 - Both sensors degrade gracefully: 10 consecutive failures → feature disabled
 
@@ -70,7 +70,7 @@ All real-time operations run in the interrupt service routine:
 - Four separate coefficients for M1/M2 closing/opening
 - Integer-only math (no floats): `timeout = base - (slope100 * temp_x10) / 1000 + margin`
 - Clamped to [2000, 6527] ticks
-- Falls back to static 6527 on temperature sensor failure
+- Falls back to the static site values (`STATIC_TIMEOUT_M*`) on temperature sensor failure or where `HAVE_TIMEOUT_REGRESSION` is 0
 
 ### Frozen Dome Detection (v4.0)
 - VL53L0X ToF measures gap between dome halves across mounting point
@@ -144,13 +144,16 @@ Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (
 | Direction `OPEN` (PWM motor*b, ends at `lim*open`) is physically | closing | opening |
 | `lim1open` (pin 7) / `lim2open` (pin 1) HIGH | physically CLOSED | physically OPEN |
 | Panel button "up" (SW*up) | closes | opens |
-| `DEFAULT_REMOTE_CHECK` (Cloudwatcher check until `$W` is used) | 1 | 0 |
-| `IP_ADR2` dome IP / Solo IP (v4.2.2) | 1 → 192.168.1.177 / .1.151 | 0 → 192.168.0.177 / .0.151 |
-| `ENABLE_DS18B20_DYNAMIC_TIMEOUT` (temperature probe, v4.2.1) | 1 | 0 (static 6527-tick timeout) |
+| `DEFAULT_REMOTE_CHECK` (Cloudwatcher check until `$W` is used) | 1 | 1 (since v4.3.0: Solo on site) |
+| `IP_ADR2` dome IP / `SOLO_IP_ADR3` Solo IP (v4.3.0) | 1 → 192.168.1.177 / .1.151 | 0 → 192.168.0.177 / .0.185 |
+| `ENABLE_DS18B20_DYNAMIC_TIMEOUT` (temperature probe, v4.2.1) | 1 | 0 (static site timeouts) |
+| `HAVE_TIMEOUT_REGRESSION` (v4.0 coefficients apply, v4.3.0) | 1 | 0 (a probe would only show the temperature) |
+| `STATIC_TIMEOUT_M1_CLOSE/OPEN`, `M2_CLOSE/OPEN` (ticks, v4.3.0) | 6527 / 6527, 6527 / 6527 | 7320 / 6527, 7930 / 6527 (120 s / 107 s, 130 s / 107 s) |
 | `ENABLE_TOF_FROZEN_DETECTION` (VL53L0X, global default) | 0 | 0 |
 
 Rules:
 - The hardware pairing never changes: the ISR stops direction `OPEN` at `lim*open` and `CLOSE` at `lim*closed`; the PWM pin mapping is fixed.
+- Limit switches are read only through `limRead()` (level confirmed over `LIM_CONFIRM_TICKS` = 4 ISR ticks, v4.3.0). The raw pins are read only in `limSample()` (ISR) and once in `setup()`. Never add a `digitalRead()` of a limit pin anywhere else.
 - **Everything that means "physically open/closed" must use** `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM1_PHYS_CLOSED` / `LIM1_PHYS_OPEN` / `LIM2_PHYS_CLOSED` / `LIM2_PHYS_OPEN` (plus the `*_NAME` strings and `WIRING_LABEL` for UI text). Raw `OPEN`/`CLOSE`/`lim*` are allowed only in the defines, the PHYSICAL SEMANTICS block, `pinMode`, the ISR limit stops, the ISR PWM output, the ISR stop-reason housekeeping and the ISR panel buttons (which use `BUTTON_MAY_START(dir)` and `TIMEOUT_M*_FOR(dir)`).
 - The web API is physical on both sites: `$1`/`$3` close, `$2`/`$4` open; `$S`, `$A` and the web page report physical state. The ASCOM driver needs no site setting ("Swap Open/Close" stays unchecked on both domes).
 - Before v4.2.0 the mirrored interpretation was hard-coded in 109 places. Flashed on a standard-wired dome, the IP-fail auto-close drove the shutters to the physically OPEN end stop. Never add a raw limit/direction test outside the allowed places; `make -C test/host test` runs every scenario for both sites and catches it.
@@ -173,9 +176,11 @@ Rules:
 ```cpp
 #define SITE SITE_GERMANY                   // Site profile: SITE_GERMANY (mirrored) or SITE_PORTUGAL (standard), v4.2.0
 #define ENABLE_TOF_FROZEN_DETECTION 0       // v4.2.0: ToF/I2C layer compiled out until a VL53L0X is mounted
-#define ENABLE_DS18B20_DYNAMIC_TIMEOUT 1    // v4.2.1: per site (Germany 1, Portugal 0); 0 = OneWire layer out, static 6527 timeout
+#define ENABLE_DS18B20_DYNAMIC_TIMEOUT 1    // v4.2.1: per site (Germany 1, Portugal 0); 0 = OneWire layer out, static site timeouts
+#define HAVE_TIMEOUT_REGRESSION 1           // v4.3.0: per site (Germany 1, Portugal 0); 0 = probe shows temperature only
+#define STATIC_TIMEOUT_M1_CLOSE 6527        // v4.3.0: per site and physical direction; Portugal 7320 / 6527 / 7930 / 6527
+#define LIM_CONFIRM_TICKS 4                 // v4.3.0: identical ISR samples before a limit level is accepted (~66 ms)
 #define SMOOTH 30                           // Soft-start smoothness
-#define MAX_MOT1_OPEN  6527                 // Motor timeout fallback (107 sec at 61Hz)
 
 // Dynamic timeout regression coefficients (v4.0)
 #define DYN_M1_CLOSE_BASE    6096           // M1 closing: base ticks at 0C
@@ -282,7 +287,7 @@ Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
 
 ### Host Logic Tests (v4.2.0)
 `make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile in three sensor configurations: default (as flashed), both sensor layers built in, both compiled out (six binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
-Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position.
+Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position. Since v4.3.0 a limit level is confirmed `LIM_CONFIRM_TICKS` (4) ticks after the pin changes: after `setPos()` on a booted firmware run `runTicks(LIM_CONFIRM_TICKS)` before asserting a state, a motor stops up to 4 ticks after the physical end stop (logged tick counts are up to 4 higher than `g_travel`), and `S[i].closedGlitchTicks` / `openGlitchTicks` inject spurious HIGH samples on a limit input. The test file carries fallback defines so `FW=<pre-4.3.0 .ino>` still compiles; the glitch and site-timeout scenarios then fail on purpose.
 
 ### Toolchain Note (Apple Silicon Mac)
 The Arduino IDE's bundled avr-gcc is x86_64. Without Rosetta neither the IDE nor `arduino-cli` can compile here ("bad CPU type in executable"); install Rosetta (`softwareupdate --install-rosetta --agree-to-license`) or rely on the CI build. Bundled CLI: `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`. Compile from a folder named like the sketch (`domecontrol_JK3/domecontrol_JK3.ino`), never from the repo root (it holds three `.ino` files).
@@ -439,7 +444,7 @@ This file has documented bugs (see file header for full list):
 
 ### Sensor Testing (v4.0)
 
-1. **DS18B20**: Verify temperature on web UI. Unplug → confirm "Not connected" and static 6527 timeout fallback
+1. **DS18B20**: Verify temperature on web UI. Unplug → confirm "Not connected" and the static site timeouts ("Timeout Mode: Static (site profile)")
 2. **VL53L0X**: Verify distance on web UI. Move hand → see distance change. Unplug → frozen detection shows "Disabled (sensor disconnected)"
 3. **ToF calibration**: Close dome → click "Calibrate ToF Baseline" → verify baseline stored → reboot → verify persists
 4. **Frozen dome simulation**: Block ToF sensor during open → verify stop + reverse + 3 retries + lockout
@@ -452,7 +457,8 @@ This file has documented bugs (see file header for full list):
 2. Dome in intermediate position: "OPEN S1" must physically open S1, the page must say "Opening (physically)", `$A` must say `INTERMEDIATE|OPENING|...`. Then "CLOSE S1".
 3. Run one shutter to each end stop: state line "Physically OPEN/CLOSED" and the pin rows (S1 phys. closed = pin 2, phys. open = pin 7) must match.
 4. ASCOM driver: "Swap Open/Close" unchecked; NINA must show the real shutter state.
-5. Keep "Cloudwatcher Check" DISABLED until a Solo exists at 192.168.1.151; enabled without one, the dome closes about 16 minutes after every opening.
+5. Keep "Cloudwatcher Check" DISABLED until a Solo exists at the site's `SOLO_IP_ADR3` (Portugal: "astromonte" 192.168.0.185 since 2026-11-02, default ON); enabled without one, the dome closes about 16 minutes after every opening.
+6. Run one full open and close per shutter and read "Last Valid Full-Runs": every value must stay well below the site's `STATIC_TIMEOUT_M*` for that direction (Portugal, 2026-11-02: East close 5877-5943, West close > 6527 ticks after a night open).
 
 ### Important Implementation Details (v4.0)
 
@@ -466,4 +472,6 @@ These patterns were discovered during lab testing and are critical for future mo
 - **Python stdout buffering**: The ticklogger service file must use `python3 -u` (unbuffered) or `print()` output won't appear in `journalctl`. The `-u` flag is set in `astroshell_ticklogger.service`.
 - **Rate-limiter timestamps start at 0** (v4.2.0): a plain `now - last < interval` test with `last == 0` suppresses the first event after boot (events for 10 s, conflict events for 5 min). Treat 0 as "never sent".
 - **Stop reasons at limit switches**: once a motor is off at a limit, the ISR clears every stop reason except 3 (with the auto-close flag) and 4 on the next tick. Reason 6 (frozen) is therefore only visible mid-travel.
-- **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`.
+- **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`. (v4.3.0: the 62 limit reads were swept the same way.)
+- **Limit confirmation (v4.3.0)**: Portugal, 2026-11-02 08:29 UTC, a single spurious HIGH sample on pin 0 (`lim2closed`, shares RX0) stopped the closing West shutter after 252 ticks; because the tick tracker re-read the pin in the same ISR pass, the stop was logged as a *valid* 252-tick close. The German 253-cycle CSV has no such run. `limSample()` now needs 4 identical samples; USB is never connected to the Portuguese MEGA in operation, so the source is electrical noise on the limit line.
+- **Portugal night close (2026-11-02 05:58 local)**: NINA's AscomDome.CloseShutter waits 3 s and then polls once per second while the state is ShutterClosing, without an own timeout; the wait ended 107.24 s after the call, i.e. at the firmware's 6527-tick timeout (106.9 s), with East closed (5943 ticks) and West intermediate. The ASCOM driver reports ShutterError only when both motors are stopped and the shutters are not both closed or both open, so a NINA ShutterError always means a motor stopped early.
