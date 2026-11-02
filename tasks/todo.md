@@ -75,7 +75,16 @@ Tasks:
 - [x] v4.3.1: far-end plausibility (LIM_MIN_RUN_TICKS 2440, reversals exempt), m*_run_start_dir in the tick tracking, 3 scenarios
       (42/51/42 per site green; v4.2.2 fails the far-end scenario); the night failure may have been the same glitch
 - [x] v4.3.2: ignored far-end levels counted once per episode (web row "Ignored limit levels", `limit_glitch` event), suite 42/51/42
-- [ ] PR #6 merge on the user's word; user re-flashes Portugal with v4.3.2 and repeats open/close from fully open; watch "Ignored limit levels" and the Solo journal for limit_glitch
+- [x] v4.3.2 flashed in Portugal (2026-11-02 ~13:05 local). Four full open/close cycles with it: all clean, "Ignored limit
+      levels" 0, no limit_glitch event. Day total: 8 West closes from fully open, 2 glitch stops (both v4.3.0), 6 clean
+      (5277-5485 ticks); East close 5600-5720; opens West 4753-5028, East 5027-5240 (21-28 C, warm motor, short rests)
+- [ ] PR #6 merge on the user's word
+- [ ] Watch "Ignored limit levels" (web, System Status) and `journalctl -u astroshell_ticklogger | grep limit_glitch` on the
+      Solo over the first NINA nights; the user suspects the West OPEN switch itself (cables judged OK); candidate: an SPDT
+      switch whose second contact touches the "closed" line on release
+- [ ] The Portugal CSV lives on tmpfs (/home/aagsolo) and is lost on a Solo reboot: no Synology there. Decide on a persistent
+      copy (cron to persistent storage, or pull it over SSH now and then); session copy taken 2026-11-02 12:55 UTC
+- [ ] After a few NINA nights: tighten the Portugal static timeouts (currently West close 7930, East close 7320) from the CSV
 - [ ] Portugal, on site: inspect the West limit-switch wiring (pin 0 line vs pin 1 line, shared common, connector), the glitch
       coincides with the release of the OPEN switch
 - [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
