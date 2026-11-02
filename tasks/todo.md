@@ -68,7 +68,7 @@ Tasks:
       a glitch of >= LIM_CONFIRM_TICKS samples is logged as a valid run (logger plausibility check = follow-up)
 - [x] IDE toolchain builds clean (after the review fixes): Germany 44040 B flash / 877 B RAM, Portugal 39942 B / 733 B (+316 B / +7 B vs v4.2.2)
 - [x] README (v4.3.0 section, site table, commissioning step 6), CLAUDE.md, firmware header v4.3.0; MAC :ED / IP_ADR3 177 unchanged
-- [x] Pushed as PR #6 (feature/limit-debounce-site-timeouts), CI run 41416587060 green (6 host builds + 8 Arduino builds)
+- [x] Pushed as PR #6 (feature/limit-debounce-site-timeouts); CI green on both commits (runs 41416587060 and 41420258063: 6 host builds + 8 Arduino builds)
 - [ ] PR #6 merge on the user's word
 - [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
       timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
