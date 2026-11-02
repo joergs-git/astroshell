@@ -74,7 +74,8 @@ Tasks:
       release of the OPEN switch); re-open + close: clean 5485 ticks (89.9 s). East close 5707.
 - [x] v4.3.1: far-end plausibility (LIM_MIN_RUN_TICKS 2440, reversals exempt), m*_run_start_dir in the tick tracking, 3 scenarios
       (42/51/42 per site green; v4.2.2 fails the far-end scenario); the night failure may have been the same glitch
-- [ ] PR #6 merge on the user's word; user re-flashes Portugal with v4.3.1 and repeats open/close from fully open
+- [x] v4.3.2: ignored far-end levels counted once per episode (web row "Ignored limit levels", `limit_glitch` event), suite 42/51/42
+- [ ] PR #6 merge on the user's word; user re-flashes Portugal with v4.3.2 and repeats open/close from fully open; watch "Ignored limit levels" and the Solo journal for limit_glitch
 - [ ] Portugal, on site: inspect the West limit-switch wiring (pin 0 line vs pin 1 line, shared common, connector), the glitch
       coincides with the release of the OPEN switch
 - [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the

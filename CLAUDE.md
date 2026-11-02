@@ -30,7 +30,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
-| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 42 scenarios per site profile (51 with both sensor layers built in) (v4.3.1) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 42 scenarios per site profile (51 with both sensor layers built in) (v4.3.2) |
 | `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
@@ -95,7 +95,7 @@ All real-time operations run in the interrupt service routine:
 - Arduino pushes events to Solo:88/event via HTTP GET
 - Solo server sends Pushover alerts (background thread)
 - Rate-limited: 10s minimum between events, 5min for conflict events
-- Events: frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict
+- Events: frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict, limit_glitch (v4.3.2)
 
 ### Web Server (Port 80)
 - Auto-refresh every 10 seconds
@@ -180,7 +180,7 @@ Rules:
 #define HAVE_TIMEOUT_REGRESSION 1           // v4.3.0: per site (Germany 1, Portugal 0); 0 = probe shows temperature only
 #define STATIC_TIMEOUT_M1_CLOSE 6527        // v4.3.0: per site and physical direction; Portugal 7320 / 6527 / 7930 / 6527
 #define LIM_CONFIRM_TICKS 4                 // v4.3.0: identical ISR samples before a limit level is accepted (~66 ms)
-#define LIM_MIN_RUN_TICKS 2440              // v4.3.1: far end stop of a full run ignored before this (~40 s), reversals exempt
+#define LIM_MIN_RUN_TICKS 2440              // v4.3.1: far end stop of a full run ignored before this (~40 s), reversals exempt; ignored episodes counted (limGlitch*, v4.3.2)
 #define SMOOTH 30                           // Soft-start smoothness
 
 // Dynamic timeout regression coefficients (v4.0)
@@ -256,6 +256,7 @@ timestamp_utc,motor,direction,ticks,temperature,arduino_temp,tof_cm
 | `frozen_clear` | Low | Dome opened successfully after frozen detection |
 | `sensor_fail` | Normal | DS18B20 or VL53L0X failure (10+ consecutive) |
 | `conflict` | Normal | Limit switch vs ToF disagreement (rate-limited 5min) |
+| `limit_glitch` | Normal | A far-end limit level ignored by the plausibility rule (v4.3.2): "M2 at 212 ticks (3 since boot)"; also shown as "Ignored limit levels" on the web page |
 
 **Service Management:**
 ```bash

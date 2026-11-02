@@ -65,7 +65,7 @@ Telescope Protection Priority:
 
 ---
 
-## What's New in v4.3.0 / v4.3.1 — Limit Confirmation and Site Timeouts
+## What's New in v4.3.x — Limit Confirmation and Site Timeouts
 
 | Feature | Description |
 |---------|-------------|
@@ -74,6 +74,7 @@ Telescope Protection Priority:
 | **Regression gate** | `HAVE_TIMEOUT_REGRESSION` (Germany 1, Portugal 0): the v4.0 temperature regression belongs to the German motors. On a site without a regression a DS18B20 only shows the temperature; the static site values stay in force |
 | **Solo address per site** | `SOLO_IP_ADR3` (Germany .151, Portugal .185 "astromonte"): link-check target and tick-logger address. Portugal's Cloudwatcher check now defaults to ON |
 | **Far-end plausibility (v4.3.1)** | A run that started at one end stop cannot reach the other one within `LIM_MIN_RUN_TICKS` (2440, about 40 s; the fastest full run ever measured is 4859 ticks), so the far limit is ignored until then. On the Portuguese dome two of three West closes from fully open were stopped 3.5 to 4.1 s in by a HIGH on pin 0 ("closed") that outlasted the 4-tick confirmation and coincided with the release of the OPEN switch on pin 1; the complete West close takes 5485 ticks (89.9 s). A reversal is exempt, a shutter sent back to its start limit stops there at once. The motor timeout stays the backstop |
+| **Glitch diagnostics (v4.3.2)** | Every far-end level that the plausibility rule ignores is counted once per episode with motor and tick position: web row "Ignored limit levels" (System Status) and a `limit_glitch` event to the Solo (journal, Pushover if configured). The fault no longer stops the shutter, but it stays visible for the wiring hunt |
 | **Review fixes** | The IP/cable auto-close now reverses a shutter that has just started opening from the closed stop (its confirmed level still reads "closed" for the confirmation window; the old test skipped it and the shutter opened fully with the network gone), with a per-motor hold so the ISR does not end that reversal on the stale level. The 200 ms LinkOFF filter stamped `millis() \| 1`, which lies 1 ms in the future on even millis and let the subtraction wrap: the filter was bypassed about half of the time |
 | **Logic tests** | Seven new scenarios per site: a glitch shorter than the confirmation window is ignored, a level that persists for the window counts, a real end stop is honoured within the window, the site timeouts are applied by web commands and panel buttons, one LinkOFF read is not a pulled cable, a cable pulled right after an open from the stop reverses the shutter. Run against v4.2.2, the glitch, LinkOFF, reversal and far-end scenarios fail exactly as the dome did |
 

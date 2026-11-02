@@ -29,6 +29,7 @@
 // a limit switch, one 6527-tick timeout served every motor and direction, the Solo was always .151.
 #ifndef LIM_MIN_RUN_TICKS
 #define LIM_MIN_RUN_TICKS 0                           // pre-4.3.1: no far-end plausibility
+#define PRE_V432 1                                    // pre-4.3.2: no limGlitch* diagnostics
 #endif
 #ifndef LIM_CONFIRM_TICKS
 #define LIM_CONFIRM_TICKS 1
@@ -450,6 +451,10 @@ SCENARIO(limit_glitch_ignored, "a spurious HIGH on the closed-limit input shorte
   CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(stop2reason, 0);
   CHECK(outboundHas("GET /log?m=2&d=1&t=50"));         // exactly one complete run of ~g_travel ticks
   CHECK(m2_last_ticks_closing >= g_travel && m2_last_ticks_closing <= g_travel + LIM_CONFIRM_TICKS + 2);
+#ifndef PRE_V432
+  CHECK_EQ(limGlitchCount, 0);                        // below the confirmation window nothing is even counted
+  CHECK_CONTAINS(page(), "Ignored limit levels</td><td>0</td>");
+#endif
 }
 
 SCENARIO(far_end_glitch_during_full_run_ignored, "a long spurious 'closed' level early in a close from the open stop is ignored (far end implausible)") {
@@ -460,9 +465,17 @@ SCENARIO(far_end_glitch_during_full_run_ignored, "a long spurious 'closed' level
   runTicks(60);
   CHECK(movingToClosed(1)); CHECK(m2_full_run_active);
   CHECK(!outboundHas("GET /log?m=2")); CHECK(!outboundHas("GET /interrupt?m=2"));
+#ifndef PRE_V432
+  CHECK_EQ(limGlitchCount, 1); CHECK_EQ(limGlitchMotor, 2); CHECK(limGlitchTicks >= 195 && limGlitchTicks <= 215);   // one episode, counted once
+  CHECK(outboundHas("GET /event?type=limit_glitch&detail=M2%20at%20"));
+  CHECK_CONTAINS(page(), "Ignored limit levels</td><td>1 (last: M2 at ");
+#endif
   runMs(130000);
   CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(stop2reason, 0);
   CHECK(m2_last_ticks_closing >= g_travel); CHECK(outboundHas("GET /log?m=2&d=1&t=50"));
+#ifndef PRE_V432
+  CHECK_EQ(limGlitchCount, 1);                        // the real arrival is not an episode
+#endif
 }
 
 SCENARIO(far_end_level_after_min_run_counts, "the same level after LIM_MIN_RUN_TICKS is taken as the end stop") {

@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.1)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.2)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -21,6 +21,11 @@
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
 // - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.3.2 Changes (diagnostics for the wiring hunt):
+// - Every far-end level that the plausibility rule ignores is counted once per episode with motor and
+//   tick position: web page row "Ignored limit levels" (System Status) and a "limit_glitch" event to the
+//   Solo (journal / Pushover). The fault no longer stops the shutter, but it stays visible.
 //
 // v4.3.1 Changes (Portugal, 2026-11-02 afternoon, first runs with v4.3.0 on the board):
 // - Far-end plausibility for the limit stops: a run that started at one end stop cannot reach the other
@@ -425,6 +430,14 @@ volatile byte m1LimitHold = 0, m2LimitHold = 0;
 // start direction and the start limit stops the motor as usual. The motor timeout stays the backstop.
 #define LIM_MIN_RUN_TICKS 2440
 #define LIM_FAR_END_IMPLAUSIBLE(startDir, dir, ticks)  ((startDir) == (dir) && (ticks) < LIM_MIN_RUN_TICKS)
+// Diagnostics (v4.3.2): an ignored far-end level is counted once per episode (ISR), shown on the web
+// page and pushed to the Solo as a "limit_glitch" event by reportLimitGlitches() in loop(), so a
+// wiring fault stays visible although it no longer stops the shutter.
+volatile word limGlitchCount = 0;          // episodes since boot
+volatile byte limGlitchMotor = 0;          // motor of the last episode (1 or 2)
+volatile word limGlitchTicks = 0;          // tick position of the last episode
+volatile byte limGlitchActive = 0;         // bit0 = M1, bit1 = M2: episode in progress (ISR only)
+word limGlitchReported = 0;                // loop(): episodes already pushed
 
 static inline byte limBit(byte pin) {
   return pin == lim1open ? 0 : pin == lim1closed ? 1 : pin == lim2open ? 2 : 3;
@@ -683,6 +696,7 @@ void saveConfigFlags();                         // Persist $W flag to EEPROM byt
 void setRemoteCheck(bool on);                   // Switch the Cloudwatcher link check ($W) (v4.2.0)
 void pushTickDataIfReady();                     // Push tick data to logging server
 void pushInterruptDataIfReady();                // Push interrupted stop data
+void reportLimitGlitches();                     // Push ignored far-end levels as limit_glitch events (v4.3.2)
 
 // --- v4.0: Sensor and safety functions ---
 void setupDS18B20();                            // Initialize temperature probe
@@ -1098,6 +1112,20 @@ void pushInterruptDataIfReady() {
 
     m2_interrupt_ready = false;
   }
+}
+
+//=============================================================================
+// LIMIT GLITCH REPORT (v4.3.2)
+//=============================================================================
+/** Pushes every new ignored far-end episode as a "limit_glitch" event (rate-limited like all events). */
+void reportLimitGlitches() {
+  word n, t; byte m;
+  { uint8_t sreg = SREG; cli(); n = limGlitchCount; m = limGlitchMotor; t = limGlitchTicks; SREG = sreg; }
+  if (n == limGlitchReported) return;
+  limGlitchReported = n;
+  char detail[40];
+  snprintf(detail, sizeof(detail), "M%u at %u ticks (%u since boot)", (unsigned)m, (unsigned)t, (unsigned)n);
+  sendEventNotification("limit_glitch", detail);
 }
 
 //=============================================================================
@@ -2020,7 +2048,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.3.1 - Safety Sensors, dual-site"));
+    Serial.println(F("Dome Control v4.3.2 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -3096,6 +3124,13 @@ void sendFullHtmlResponse(Print& client) {
       client.print(F("<tr><td>SWSTOP Pressed</td><td>")); client.print(!digitalRead(SWSTOP) ? F("YES") : F("NO")); client.println(F("</td></tr>"));
       client.print(F("<tr><td>Network Status</td><td>")); client.print(ethernet_initialized ? F("OK") : F("ERROR")); client.println(F("</td></tr>"));
       client.println(F("<tr><td>Limit Wiring</td><td>" WIRING_LABEL "</td></tr>"));   // v4.2.0: site profile
+      {                                                                               // v4.3.2: ignored far-end levels
+        word n, t; byte m;
+        { uint8_t sreg = SREG; cli(); n = limGlitchCount; m = limGlitchMotor; t = limGlitchTicks; SREG = sreg; }
+        client.print(F("<tr><td>Ignored limit levels</td><td>")); client.print(n);
+        if (n) { client.print(F(" (last: M")); client.print(m); client.print(F(" at ")); client.print(t); client.print(F(" ticks)")); }
+        client.println(F("</td></tr>"));
+      }
       client.println(F("</table></div>"));
 
       // --- Tick Logging Section ---
@@ -3219,6 +3254,7 @@ void loop() {
 
     pushTickDataIfReady();      // Push tick data to logging server if available
     pushInterruptDataIfReady(); // Push interrupted stop data if available
+    reportLimitGlitches();      // v4.3.2: ignored far-end levels -> Solo event
   }
 
   if (networkMonitoringEnabled) socketHygiene();  // P1: drop dead clients, keep two listeners
@@ -3291,6 +3327,15 @@ ISR(TIMER2_COMPA_vect) {
   bool hold1 = m1LimitHold != 0, hold2 = m2LimitHold != 0;   // v4.3.0: reversal from the stop, see m*LimitHold
   if (hold1) m1LimitHold--;
   if (hold2) m2LimitHold--;
+  // v4.3.2: count every ignored far-end level once per episode (diagnostics, see limGlitch*)
+  bool imp1 = (limRead(lim1open)   && mot1dir == OPEN  && LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, OPEN,  m1_tick_counter)) ||
+              (limRead(lim1closed) && mot1dir == CLOSE && LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, CLOSE, m1_tick_counter));
+  bool imp2 = (limRead(lim2open)   && mot2dir == OPEN  && LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, OPEN,  m2_tick_counter)) ||
+              (limRead(lim2closed) && mot2dir == CLOSE && LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, CLOSE, m2_tick_counter));
+  if (imp1) { if (!(limGlitchActive & 1)) { limGlitchActive |= 1; limGlitchCount++; limGlitchMotor = 1; limGlitchTicks = m1_tick_counter; } }
+  else limGlitchActive &= (byte)~1;
+  if (imp2) { if (!(limGlitchActive & 2)) { limGlitchActive |= 2; limGlitchCount++; limGlitchMotor = 2; limGlitchTicks = m2_tick_counter; } }
+  else limGlitchActive &= (byte)~2;
   // v4.3.1: the far end stop is ignored during the first LIM_MIN_RUN_TICKS of a full run (see LIM_FAR_END_IMPLAUSIBLE)
   if (!hold1 && limRead(lim1open) && mot1dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, OPEN, m1_tick_counter)) {
     mot1dir = 0;
