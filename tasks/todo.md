@@ -58,12 +58,18 @@ Tasks:
 - [x] STATIC_TIMEOUT_M*_CLOSE/OPEN in the site profile (physical direction); Portugal: West close 7930 (130 s), East close
       7320 (120 s), opens 6527; Germany 6527 x4 (dynamic cap unchanged). HAVE_TIMEOUT_REGRESSION gates the German regression
       (Portugal 0: a probe only shows the temperature). SOLO_IP_ADR3 per site (.151 / .185), Portugal remote-check default ON
-- [x] Host tests: physics can inject limit glitches; 4 new scenarios (glitch ignored, threshold level counts, real end stop
-      within the window, site timeouts) + probe-without-regression for the Portugal sensors build; fallback defines keep
-      `FW=<old.ino>` compiling. New firmware: 36/45/36 per site green; v4.2.2 against the new suite: 4 scenarios fail as intended
-- [x] IDE toolchain builds clean: Germany 43838 B flash / 875 B RAM, Portugal 39722 B / 731 B (+~115 B / +5 B vs v4.2.2)
+- [x] Host tests: physics can inject limit glitches; 7 new scenarios (glitch ignored, threshold level counts, real end stop
+      within the window, site timeouts via web and panel buttons, one LinkOFF read ignored, auto-close reversal right after
+      an open from the stop) + probe-without-regression for the Portugal sensors build; fallback defines keep `FW=<old.ino>`
+      compiling. New firmware: 39/48/39 per site green; v4.2.2 against the new suite fails the glitch, LinkOFF and reversal ones
+- [x] Independent review (subagent, 2026-11-02): no blockers; fixed its two should-fix code findings (auto-close skipped a
+      shutter that had just left the closed stop; `millis() | 1` stamp bypassed the 200 ms LinkOFF filter), the DYN cap guard,
+      the probe-without-regression periodic path, the panel-button timeout checks and the commissioning text. Residual noted:
+      a glitch of >= LIM_CONFIRM_TICKS samples is logged as a valid run (logger plausibility check = follow-up)
+- [x] IDE toolchain builds clean (after the review fixes): Germany 44040 B flash / 877 B RAM, Portugal 39942 B / 733 B (+316 B / +7 B vs v4.2.2)
 - [x] README (v4.3.0 section, site table, commissioning step 6), CLAUDE.md, firmware header v4.3.0; MAC :ED / IP_ADR3 177 unchanged
-- [ ] Push, CI green, PR merge on the user's word
+- [x] Pushed as PR #6 (feature/limit-debounce-site-timeouts), CI run 41416587060 green (6 host builds + 8 Arduino builds)
+- [ ] PR #6 merge on the user's word
 - [ ] User flashes Portugal on site with SITE_PORTUGAL (profile now carries IP .0.177, Solo .185, check ON, DS18B20 0, the
       timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
       logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise

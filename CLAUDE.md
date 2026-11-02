@@ -30,7 +30,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
-| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 36 scenarios per site profile (45 with both sensor layers built in) (v4.3.0) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 39 scenarios per site profile (48 with both sensor layers built in) (v4.3.0) |
 | `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
@@ -453,7 +453,7 @@ This file has documented bugs (see file header for full list):
 7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup. (Germany profile; in the Portugal profile the roles of pins 2 and 7 swap.)
 
 ### Portugal Commissioning Checklist (v4.2.0)
-1. IDE board = Arduino Mega or Mega 2560 (an "Arduino Uno" selection fails with "Sketch too big", 32256 bytes). Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show "Cloudwatcher Check: DISABLED", Sensors must show "Temperature: Not installed".
+1. IDE board = Arduino Mega or Mega 2560 (an "Arduino Uno" selection fails with "Sketch too big", 32256 bytes). Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show the site default "Cloudwatcher Check: ENABLED" (v4.3.0; a `$W` choice stored by an earlier build of the SAME site wins, `$W1`/`$W0` set it), Sensors must show "Temperature: Not installed".
 2. Dome in intermediate position: "OPEN S1" must physically open S1, the page must say "Opening (physically)", `$A` must say `INTERMEDIATE|OPENING|...`. Then "CLOSE S1".
 3. Run one shutter to each end stop: state line "Physically OPEN/CLOSED" and the pin rows (S1 phys. closed = pin 2, phys. open = pin 7) must match.
 4. ASCOM driver: "Swap Open/Close" unchecked; NINA must show the real shutter state.
@@ -470,6 +470,8 @@ These patterns were discovered during lab testing and are critical for future mo
 - **DS18B20 pullup resistor**: 4.7kΩ required (5.1kΩ also works). Without pullup, OneWire open-drain bus cannot communicate.
 - **URL encoding**: Event detail strings sent to the Solo must be URL-encoded (spaces → `%20`). Python's `BaseHTTPRequestHandler` rejects URLs with literal spaces (HTTP 400). Encoding is done in a local buffer before `print()`, not char-by-char via `write()` (which caused TCP issues on W5100/W5500).
 - **Python stdout buffering**: The ticklogger service file must use `python3 -u` (unbuffered) or `print()` output won't appear in `journalctl`. The `-u` flag is set in `astroshell_ticklogger.service`.
+- **Never fake a non-zero timestamp with `| 1`** (v4.3.0 review): `linkOffSince = millis() | 1` is 1 ms in the future on even millis, `millis() - linkOffSince` wraps and the 200 ms LinkOFF filter was bypassed half of the time. Use `if (stamp == 0) stamp = 1` or a separate flag.
+- **Confirmed limit levels lag a motor start by LIM_CONFIRM_TICKS** (v4.3.0 review): a decision like "close everything that is not closed" must treat a motor that is already moving away from the stop explicitly (`mot*dir == DIR_PHYS_OPEN || (mot*dir == 0 && !closed)`), otherwise it skips a shutter that started opening 66 ms ago. The reversal itself needs `m*LimitHold` (ISR limit stop suppressed for `LIM_CONFIRM_TICKS`), or the stale level ends it at once with the shutter a millimetre open.
 - **Rate-limiter timestamps start at 0** (v4.2.0): a plain `now - last < interval` test with `last == 0` suppresses the first event after boot (events for 10 s, conflict events for 5 min). Treat 0 as "never sent".
 - **Stop reasons at limit switches**: once a motor is off at a limit, the ISR clears every stop reason except 3 (with the auto-close flag) and 4 on the next tick. Reason 6 (frozen) is therefore only visible mid-travel.
 - **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`. (v4.3.0: the 62 limit reads were swept the same way.)

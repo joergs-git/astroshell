@@ -38,7 +38,13 @@
 //   the static site values stay in force (a probe in Portugal would otherwise cut the West close at
 //   98.7 s at 15 C).
 // - Solo address per site (SOLO_IP_ADR3): Germany .151, Portugal .185 ("astromonte", tick logger
-//   and Cloudwatcher check target). Portugal's Cloudwatcher check default is ON now that a Solo exists.
+//   and Cloudwatcher check target). Portugal's Cloudwatcher check default is ON now that a Solo exists
+//   (a $W choice stored by an earlier build of the same site still wins, see loadConfigFlags()).
+// - Review fixes: the IP/cable auto-close reverses a shutter that has just started opening from the closed
+//   stop (its confirmed level still says "closed" for LIM_CONFIRM_TICKS; the old test skipped it and the
+//   shutter opened fully with the network gone); m*LimitHold keeps the ISR from ending that reversal on the
+//   stale level. The 200 ms LinkOFF filter stamped "millis() | 1", which
+//   is 1 ms in the future on even millis and let the subtraction wrap: filter bypassed half of the time.
 // - Web page: "Timeout Mode" says "Static (site profile)" instead of quoting 6527.
 //
 // v4.2.2 Changes:
@@ -339,6 +345,12 @@
 #define DYN_TIMEOUT_MIN      2000   // Minimum dynamic timeout (clamp floor)
 #define DYN_TIMEOUT_MAX      6527   // Maximum dynamic timeout (the German static value)
 #define TEMP_FAIL_THRESHOLD   10    // Consecutive failures before fallback to static
+// v4.3.0: the clamp above is the German value. A site that switches HAVE_TIMEOUT_REGRESSION on with
+// longer static timeouts would be cut back to 6527 by the clamp - refuse to build that.
+#if HAVE_TIMEOUT_REGRESSION && (DYN_TIMEOUT_MAX < STATIC_TIMEOUT_M1_CLOSE || DYN_TIMEOUT_MAX < STATIC_TIMEOUT_M1_OPEN || \
+                                DYN_TIMEOUT_MAX < STATIC_TIMEOUT_M2_CLOSE || DYN_TIMEOUT_MAX < STATIC_TIMEOUT_M2_OPEN)
+#error "DYN_TIMEOUT_MAX would cap a static site timeout: the regression coefficients belong to the German dome"
+#endif
 
 //=============================================================================
 // FROZEN DOME DETECTION CONFIGURATION
@@ -392,6 +404,11 @@ volatile byte swstop_pressed_flag = 0; // STOP button state
 #define LIM_CONFIRM_TICKS 4
 volatile byte limConfirmed = 0;        // confirmed levels: bit0 lim1open, bit1 lim1closed, bit2 lim2open, bit3 lim2closed
 static byte limPending[4] = {0, 0, 0, 0};   // consecutive samples that differ from the confirmed level (ISR only)
+// A motor that the auto-close reverses while it is just leaving its stop still carries the confirmed
+// level of that stop for up to LIM_CONFIRM_TICKS; the ISR would end the reversal at once and leave the
+// shutter a millimetre open. The hold suppresses the limit stop of that motor for LIM_CONFIRM_TICKS
+// ticks (at most ~66 ms of pushing against the stop). Set from loop() before startMotor*() (v4.3.0).
+volatile byte m1LimitHold = 0, m2LimitHold = 0;
 
 static inline byte limBit(byte pin) {
   return pin == lim1open ? 0 : pin == lim1closed ? 1 : pin == lim2open ? 2 : 3;
@@ -1174,7 +1191,7 @@ void readTemperatureAsync() {
 }
 
 #else   // ENABLE_DS18B20_DYNAMIC_TIMEOUT == 0: no probe mounted, OneWire layer compiled out (v4.2.1)
-// The probe stays "disconnected": the four timeouts keep their static 6527-tick defaults,
+// The probe stays "disconnected": the four timeouts keep their static site defaults,
 // the web page reports it, and events / tick pushes carry temp=-999.
 void setupDS18B20() {
   ds18b20_connected = false;
@@ -2201,7 +2218,9 @@ void checkRemoteConnectionAndAutoClose() {
         static unsigned long linkOffSince = 0;
         EthernetLinkStatus linkNow = Ethernet.linkStatus();
         if (linkNow == LinkOFF) {
-            if (linkOffSince == 0) linkOffSince = millis() | 1UL;
+            // v4.3.0: the old "millis() | 1" could place the stamp 1 ms in the FUTURE (even millis), the
+            // subtraction below then wrapped and the 200 ms filter was bypassed about half of the time.
+            if (linkOffSince == 0) { linkOffSince = millis(); if (linkOffSince == 0) linkOffSince = 1; }
             if (millis() - linkOffSince < 200UL) return;
         } else {
             linkOffSince = 0;
@@ -2218,14 +2237,16 @@ void checkRemoteConnectionAndAutoClose() {
                 #endif
 
                 bool action_taken = false;
-                if (mot1dir != DIR_PHYS_CLOSE && !limRead(LIM1_PHYS_CLOSED)) {
+                if (mot1dir == DIR_PHYS_OPEN || (mot1dir == 0 && !limRead(LIM1_PHYS_CLOSED))) {   // v4.3.0: an OPENING motor is reversed even while the confirmed level still says 'closed'
+                    if (mot1dir == DIR_PHYS_OPEN) m1LimitHold = LIM_CONFIRM_TICKS;   // leaving the stop: let the confirmed level catch up before a limit stop may end the reversal
                     startMotor1(DIR_PHYS_CLOSE, dynTimeout_M1_Close);
                     m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
                     Serial.println(F(">>> AUTO-CLOSE: S1 motor started (cable removed)"));
                     #endif
                 }
-                if (mot2dir != DIR_PHYS_CLOSE && !limRead(LIM2_PHYS_CLOSED)) {
+                if (mot2dir == DIR_PHYS_OPEN || (mot2dir == 0 && !limRead(LIM2_PHYS_CLOSED))) {
+                    if (mot2dir == DIR_PHYS_OPEN) m2LimitHold = LIM_CONFIRM_TICKS;   // leaving the stop: let the confirmed level catch up before a limit stop may end the reversal
                     startMotor2(DIR_PHYS_CLOSE, dynTimeout_M2_Close);
                     m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                     #if defined(SERIAL_DEBUG_IP)
@@ -2396,14 +2417,16 @@ void checkRemoteConnectionAndAutoClose() {
             // - If motor is opening: reverse to close (soft-start handles transition)
             // - If motor already closing: no change needed
             bool action_taken = false;
-            if (mot1dir != DIR_PHYS_CLOSE && !limRead(LIM1_PHYS_CLOSED)) {
+            if (mot1dir == DIR_PHYS_OPEN || (mot1dir == 0 && !limRead(LIM1_PHYS_CLOSED))) {   // v4.3.0: an OPENING motor is reversed even while the confirmed level still says 'closed'
+                if (mot1dir == DIR_PHYS_OPEN) m1LimitHold = LIM_CONFIRM_TICKS;   // leaving the stop: let the confirmed level catch up before a limit stop may end the reversal
                 startMotor1(DIR_PHYS_CLOSE, dynTimeout_M1_Close);
                 m1AutoClosedByIP = true; stop1reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
                 Serial.println(F(">>> AUTO-CLOSE: S1 motor started (5 failures)"));
                 #endif
             }
-            if (mot2dir != DIR_PHYS_CLOSE && !limRead(LIM2_PHYS_CLOSED)) {
+            if (mot2dir == DIR_PHYS_OPEN || (mot2dir == 0 && !limRead(LIM2_PHYS_CLOSED))) {
+                if (mot2dir == DIR_PHYS_OPEN) m2LimitHold = LIM_CONFIRM_TICKS;   // leaving the stop: let the confirmed level catch up before a limit stop may end the reversal
                 startMotor2(DIR_PHYS_CLOSE, dynTimeout_M2_Close);
                 m2AutoClosedByIP = true; stop2reason = 3; action_taken = true;
                 #if defined(SERIAL_DEBUG_IP)
@@ -3247,7 +3270,10 @@ ISR(TIMER2_COMPA_vect) {
   // because which of the two directions is the physical close depends on the site profile).
   // The flag is cleared here, so the stop-reason housekeeping above normalises reason 3 to 0
   // one tick later and the web page then shows the limit switch as stop reason.
-  if (limRead(lim1open) && mot1dir == OPEN) {
+  bool hold1 = m1LimitHold != 0, hold2 = m2LimitHold != 0;   // v4.3.0: reversal from the stop, see m*LimitHold
+  if (hold1) m1LimitHold--;
+  if (hold2) m2LimitHold--;
+  if (!hold1 && limRead(lim1open) && mot1dir == OPEN) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3255,7 +3281,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1open -> STOP"));
     #endif
   }
-  if (limRead(lim1closed) && mot1dir == CLOSE) {
+  if (!hold1 && limRead(lim1closed) && mot1dir == CLOSE) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3263,7 +3289,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1closed -> STOP"));
     #endif
   }
-  if (limRead(lim2open) && mot2dir == OPEN) {
+  if (!hold2 && limRead(lim2open) && mot2dir == OPEN) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
@@ -3271,7 +3297,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M2 reached lim2open -> STOP"));
     #endif
   }
-  if (limRead(lim2closed) && mot2dir == CLOSE) {
+  if (!hold2 && limRead(lim2closed) && mot2dir == CLOSE) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;

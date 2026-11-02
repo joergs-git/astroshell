@@ -29,6 +29,8 @@
 // a limit switch, one 6527-tick timeout served every motor and direction, the Solo was always .151.
 #ifndef LIM_CONFIRM_TICKS
 #define LIM_CONFIRM_TICKS 1
+#define limRead(pin) digitalRead(pin)                 // pre-4.3.0: raw reads, no confirmation, no reversal hold
+static volatile byte m1LimitHold = 0, m2LimitHold = 0;
 #endif
 #ifndef STATIC_TIMEOUT_M1_CLOSE
 #define STATIC_TIMEOUT_M1_CLOSE 6527
@@ -338,7 +340,8 @@ SCENARIO(probe_without_regression, "DS18B20 built in on a site without a regress
   CHECK_CONTAINS(p, "Timeout Mode</td><td>Static (site profile)");
   http("/?$3"); CHECK(movingToClosed(1)); CHECK(mot2timer > STATIC_TIMEOUT_M2_CLOSE - 20 && mot2timer <= STATIC_TIMEOUT_M2_CLOSE);
   http("/?$5");
-  runMs(30000); CHECK(!dynamicTimeoutActive);            // periodic reads never switch the German regression on here
+  sim::g_tempC = 12.0f;                                  // a CHANGED reading drives updateDynamicTimeouts() on the periodic path
+  runMs(30000); CHECK(!dynamicTimeoutActive); CHECK_EQ(currentTemp_x10, 120);
   CHECK_EQ(dynTimeout_M2_Close, STATIC_TIMEOUT_M2_CLOSE);
 }
 #elif ENABLE_DS18B20_DYNAMIC_TIMEOUT
@@ -409,6 +412,22 @@ SCENARIO(site_static_timeouts, "the static timeouts come from the site profile: 
     CHECK_EQ(STATIC_TIMEOUT_M2_CLOSE, 6527);
     CHECK(motorOff(1)); CHECK(!physClosed(1)); CHECK_EQ(stop2reason, 5); CHECK_EQ(m2_interrupt_ticks, 6527);
   }
+}
+
+SCENARIO(static_timeouts_by_button_and_web, "panel buttons and web commands load the static timeout of the physical direction") {
+  setPos(2500, 2500); boot();
+  pressButton(T.btnClose1); CHECK(movingToClosed(0)); CHECK(mot1timer > STATIC_TIMEOUT_M1_CLOSE - 20 && mot1timer <= STATIC_TIMEOUT_M1_CLOSE);
+  pressButton(T.btnClose1); CHECK(motorOff(0));
+  pressButton(T.btnOpen1);  CHECK(movingToOpen(0));   CHECK(mot1timer > STATIC_TIMEOUT_M1_OPEN - 20 && mot1timer <= STATIC_TIMEOUT_M1_OPEN);
+  pressButton(T.btnOpen1);  CHECK(motorOff(0));
+  pressButton(T.btnClose2); CHECK(movingToClosed(1)); CHECK(mot2timer > STATIC_TIMEOUT_M2_CLOSE - 20 && mot2timer <= STATIC_TIMEOUT_M2_CLOSE);
+  pressButton(T.btnClose2); CHECK(motorOff(1));
+  pressButton(T.btnOpen2);  CHECK(movingToOpen(1));   CHECK(mot2timer > STATIC_TIMEOUT_M2_OPEN - 20 && mot2timer <= STATIC_TIMEOUT_M2_OPEN);
+  pressButton(T.btnOpen2);  CHECK(motorOff(1));
+  http("/?$1"); CHECK(mot1timer > STATIC_TIMEOUT_M1_CLOSE - 20 && mot1timer <= STATIC_TIMEOUT_M1_CLOSE); http("/?$5");
+  http("/?$2"); CHECK(mot1timer > STATIC_TIMEOUT_M1_OPEN - 20  && mot1timer <= STATIC_TIMEOUT_M1_OPEN);  http("/?$5");
+  http("/?$3"); CHECK(mot2timer > STATIC_TIMEOUT_M2_CLOSE - 20 && mot2timer <= STATIC_TIMEOUT_M2_CLOSE); http("/?$5");
+  http("/?$4"); CHECK(mot2timer > STATIC_TIMEOUT_M2_OPEN - 20  && mot2timer <= STATIC_TIMEOUT_M2_OPEN);  http("/?$5");
 }
 
 //=============================================================================
@@ -499,6 +518,33 @@ SCENARIO(ip_autoclose_stops_when_link_returns, "auto-close is stopped when the C
   runMs(100000);
   CHECK(motorOff(0)); CHECK(motorOff(1)); CHECK(!physClosed(0)); CHECK(!physClosed(1));
   CHECK(!m1AutoClosedByIP); CHECK(!m2AutoClosedByIP); CHECK_EQ(stop1reason, 0);
+}
+
+SCENARIO(autoclose_reverses_shutter_just_started_from_closed_stop, "cable pulled right after an open from the closed stop: the shutter is reversed although its confirmed level still says closed") {
+  setPos(2500, 0); boot(); ensureRemoteCheck(true);
+  runMs(5000);
+  sim::g_link = sim::LINK_OFF; runTicks(11);            // 176 ms: inside the 200 ms LinkOFF filter
+  http("/?$4"); CHECK_EQ(mot2dir, DIR_PHYS_OPEN);       // S2 starts opening at 192 ms, still confirmed "closed"
+  CHECK(limRead(LIM2_PHYS_CLOSED));
+  for (int i = 0; i < 4 && totalAutoCloses == 0; i++) runTicks(1);   // the cable auto-close decides inside the window
+  CHECK_EQ(totalAutoCloses, 1);
+  CHECK_EQ(mot2dir, DIR_PHYS_CLOSE); CHECK_EQ(mot1dir, DIR_PHYS_CLOSE);   // S2 reversed (review fix), S1 closes too
+#if LIM_CONFIRM_TICKS > 1
+  CHECK(m2LimitHold > 0);                               // the stale "closed" level must not end the reversal at once
+#endif
+  runMs(5000);
+  CHECK(physClosed(1)); CHECK(motorOff(1)); CHECK_EQ(m2LimitHold, 0);
+  CHECK_CONTAINS(ascom(), "|CLOSED|STOPPED");
+}
+
+SCENARIO(link_glitch_single_read_ignored, "one LinkOFF read is not a pulled cable: no auto-close") {
+  setPos(2500, 2500); boot(); ensureRemoteCheck(true);
+  runMs(5000);
+  sim::g_link = sim::LINK_OFF; runTicks(1); sim::g_link = sim::LINK_ON;
+  runMs(5000);
+  CHECK_EQ(totalAutoCloses, 0); CHECK(idle(0)); CHECK(idle(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
+  sim::g_link = sim::LINK_OFF; runMs(1000);              // a real removal still closes
+  CHECK_EQ(totalAutoCloses, 1); CHECK(movingToClosed(0)); CHECK(movingToClosed(1));
 }
 
 SCENARIO(no_ip_checks_when_closed, "a closed dome never polls the Cloudwatcher and never moves") {
