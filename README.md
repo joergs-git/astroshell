@@ -73,8 +73,12 @@ Telescope Protection Priority:
 | **Static timeouts per site and direction** | `STATIC_TIMEOUT_M1/M2_CLOSE/OPEN` live in the site profile. Portugal: West close 7930 ticks (130 s), East close 7320 (120 s), opening 6527 (107 s). The old single 6527-tick cap was fitted on the German motors and cut the Portuguese West close at 106.9 s every night (NINA: "Failed to close dome shutter. Current shutter state: ShutterError"). Germany keeps 6527 everywhere |
 | **Regression gate** | `HAVE_TIMEOUT_REGRESSION` (Germany 1, Portugal 0): the v4.0 temperature regression belongs to the German motors. On a site without a regression a DS18B20 only shows the temperature; the static site values stay in force |
 | **Solo address per site** | `SOLO_IP_ADR3` (Germany .151, Portugal .185 "astromonte"): link-check target and tick-logger address. Portugal's Cloudwatcher check now defaults to ON |
-| **Far-end plausibility (v4.3.1)** | A run that started at one end stop cannot reach the other one within `LIM_MIN_RUN_TICKS` (2440, about 40 s; the fastest full run ever measured is 4859 ticks), so the far limit is ignored until then. On the Portuguese dome two of three West closes from fully open were stopped 3.5 to 4.1 s in by a HIGH on pin 0 ("closed") that outlasted the 4-tick confirmation and coincided with the release of the OPEN switch on pin 1; the complete West close takes 5485 ticks (89.9 s). A reversal is exempt, a shutter sent back to its start limit stops there at once. The motor timeout stays the backstop |
+| **Far-end plausibility (v4.3.1)** | A run that started at one end stop cannot reach the other one within `LIM_MIN_RUN_TICKS` (2440, about 40 s, until v4.3.2; per direction since v4.3.3, see below), so the far limit is ignored until then. On the Portuguese dome two of three West closes from fully open were stopped 3.5 to 4.1 s in by a HIGH on pin 0 ("closed") that outlasted the 4-tick confirmation and coincided with the release of the OPEN switch on pin 1; the complete West close takes 5485 ticks (89.9 s). A reversal is exempt, a shutter sent back to its start limit stops there at once. The motor timeout stays the backstop |
 | **Glitch diagnostics (v4.3.2)** | Every far-end level that the plausibility rule ignores is counted once per episode with motor and tick position: web row "Ignored limit levels" (System Status) and a `limit_glitch` event to the Solo (journal, Pushover if configured). The fault no longer stops the shutter, but it stays visible for the wiring hunt |
+| **Limit fault (v4.3.3)** | Both end switches of one shutter active cannot happen on a healthy dome: the switches pull their inputs LOW while the shutter is *not* at the stop, so a broken wire, a loose terminal or a dead switch reads as "end stop reached". The firmware reports it as **LIMIT FAULT** on the web page, answers `$S` with `OPEN` and `$A` with `INTERMEDIATE` for that shutter and pushes a `limit_fault` event (high priority on the Solo). Before, the page said "Physically CLOSED" and `$S` said `CLOSED`, so the rain checker took an open dome for closed (Portugal, 2026-11-20: West shutter open, both West inputs HIGH, no command could close it). Normal commands, the panel buttons and the auto-close still do not move a shutter in that state |
+| **Emergency override (v4.3.3)** | `/?$F1` (East) and `/?$F3` (West) close a shutter with its "closed" end switch **ignored** for that one run, for a stuck or broken switch line. The run ends at STOP, an OPEN command or the close timeout; with the shutter already at its stop the motor pushes against it until then, so use it only while watching the dome. Web buttons with a confirmation dialog sit in System Details and, during a limit fault, in the shutter block. Nothing automatic (rain checker, IP/cable auto-close, NINA, panel buttons) ever starts it. See [Emergency Override](#emergency-override-v433) |
+| **Plausibility window per direction (v4.3.3)** | `LIM_MIN_RUN_TICKS_CLOSE` 4220 and `LIM_MIN_RUN_TICKS_OPEN` 3800 replace the single 2440: 80 % of the fastest full run measured on either dome (close 5276, open 4753 ticks). A "closed" level 3268 ticks into a West close had ended the run with the shutter 40 % open, logged as a valid run. A run is logged as valid only if it lasted at least that long |
+| **Start-limit release check (v4.3.3)** | A full run whose start end switch is still active 10 s (`LIM_RELEASE_TICKS` 610) after the motor started is no proven full run: the far end counts at once again and the run is logged as interrupted. A stuck "closed" level with the shutter near the open end used to make an OPEN push against the open stop for the whole window. The check also reports a shutter that does not leave its stop. Web row "Start limit not released", event `limit_stuck` |
 | **Review fixes** | The IP/cable auto-close now reverses a shutter that has just started opening from the closed stop (its confirmed level still reads "closed" for the confirmation window; the old test skipped it and the shutter opened fully with the network gone), with a per-motor hold so the ISR does not end that reversal on the stale level. The 200 ms LinkOFF filter stamped `millis() \| 1`, which lies 1 ms in the future on even millis and let the subtraction wrap: the filter was bypassed about half of the time |
 | **Logic tests** | Seven new scenarios per site: a glitch shorter than the confirmation window is ignored, a level that persists for the window counts, a real end stop is honoured within the window, the site timeouts are applied by web commands and panel buttons, one LinkOFF read is not a pulled cable, a cable pulled right after an open from the stop reverses the shutter. Run against v4.2.2, the glitch, LinkOFF, reversal and far-end scenarios fail exactly as the dome did |
 
@@ -179,7 +183,7 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `close_astroshell.bat` | Windows batch script for NINA - closes dome with Pushover notification |
 | `motortick-statistic-batchrun.sh` | Automated dome open/close cycles for motor tick statistics collection |
 | `ascom-driver/` | Native ASCOM COM driver for NINA dome integration (v1.1.0) |
-| `test/host/` | Host-side logic tests: Arduino mocks + dome physics model, 35 scenarios per site profile (v4.2.0) |
+| `test/host/` | Host-side logic tests: Arduino mocks + dome physics model, 57 scenarios per site profile in the default build (v4.3.3) |
 | `.github/workflows/firmware-ci.yml` | CI: runs the logic tests and compiles both site profiles for the MEGA 2560 (v4.2.0) |
 | `controller_wcapacitor_2025_germany.ino` | Alternative firmware with capacitor backup (has known bugs) |
 | `nocapacitor2023.ino` | Original unmodified AstroShell reference code |
@@ -195,13 +199,29 @@ The VL53L0X should be mounted so it measures the distance across the gap between
 | `/?$3` | CLOSE Shutter 2 (West) |
 | `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
 | `/?$5` | Emergency STOP all motors |
-| `/?$S` | Get plain text status: "OPEN" or "CLOSED" |
+| `/?$S` | Get plain text status: "OPEN" or "CLOSED" (a limit fault on either shutter answers "OPEN", v4.3.3) |
 | `/?$A` | ASCOM status: `S1_STATE\|S1_MOTOR\|S2_STATE\|S2_MOTOR` (v4.0.3) |
 | `/?$R` | Reset EEPROM counters |
 | `/?$L` | Toggle tick logging on/off (default: ON) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be closed (v4.0) |
 | `/?$W` | Toggle Cloudwatcher link check; `/?$W1` = on, `/?$W0` = off (idempotent) — persisted in EEPROM with the site id; OFF also disables the cable-removal auto-close and all pushes to the Solo (v4.2.0) |
+| `/?$F1`, `/?$F3` | **Emergency override (v4.3.3):** close Shutter 1 (East) / Shutter 2 (West) with its "closed" end switch ignored for that run. Ends at STOP, an OPEN command or the close timeout. Only while watching the dome |
+
+### Emergency Override (v4.3.3)
+
+For the case that a shutter cannot be closed because its "closed" end switch line reports "reached" although the shutter is open (stuck or broken switch, loose wire). The web page then shows **LIMIT FAULT** when both end switches of the shutter are active, or a wrong "Physically CLOSED" when only the "closed" line is stuck.
+
+1. Watch the shutter (on site or by camera).
+2. Send `/?$F3` for West or `/?$F1` for East, or use the red **FORCE CLOSE** button (System Details, Emergency Override; during a limit fault also in the shutter block). The page shows "Closing (physically) FORCED, end switch ignored".
+3. Press **STOP ALL MOTORS** (`/?$5`) when the shutter is closed. Without STOP the motor runs until the close timeout of the site (Portugal West 130 s) and pushes against the mechanical stop for the rest of that time.
+
+```bash
+curl "http://192.168.0.177/?\$F3"   # force-close West (Portugal dome)
+curl "http://192.168.0.177/?\$5"    # STOP
+```
+
+The override lasts for one run and only ignores the "closed" end switch of that shutter. An OPEN command reverses normally and stops at the open end switch. Forced runs are not written to the tick log; the Solo receives a `force_close` event.
 
 ---
 
@@ -354,7 +374,7 @@ All v4.0 features were lab-tested on real hardware (Arduino MEGA + DS18B20 + VL5
 
 `test/host/` compiles the unchanged firmware against small Arduino mocks and a dome physics model, then runs the scenario suite per site profile, once with the ToF layer compiled out (the default build) and once built in, each scenario in its own forked process (`make -C test/host test`). The physics decides which PWM pin physically opens and which input pin means "physically closed" for each site, independently of the firmware, so the suite checks what the dome *does*, not which constant the code uses.
 
-Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles. Since v4.3.0 the physics can inject spurious HIGH samples on a limit input (`closedGlitchTicks` / `openGlitchTicks`) and the suite covers the limit confirmation and the per-site timeouts: 42 scenarios per site in the default build, 51 with both sensor layers built in.
+Covered: all web commands and their `$A`/`$S`/web-page reporting, panel buttons and STOP, dynamic and static timeouts, IP auto-close (trigger, reversal of an opening shutter, stop when the link returns, no polling while closed), cable removal, tick/interrupt logging direction, frozen dome (normal opening, frozen at the closed position with lockout and `$U`, frozen mid-travel with physical reverse, cancel by a close command), ToF calibration gate, conflict event, 8 h preventive reset gate, and every `$W` behaviour including the EEPROM upgrade path from v4.1.0. Every scenario also asserts that the 8 s watchdog is never starved and that both PWM pins of a motor are never active together. The same suite runs in GitHub Actions together with an avr-gcc build of both profiles. Since v4.3.0 the physics can inject spurious HIGH samples on a limit input (`closedGlitchTicks` / `openGlitchTicks`) and the suite covers the limit confirmation and the per-site timeouts. Since v4.3.3 it can also hold a limit input HIGH for good (`closedStuck` / `openStuck`, an open-circuit switch line), and 15 more scenarios cover the limit fault, the emergency override, the plausibility windows and the start-limit release check: 57 scenarios per site in the default build, 66 with both sensor layers built in. Run against v4.3.2, exactly those 15 fail.
 
 Running the suite with the Portugal physics against the old v4.1.0 firmware fails 20 of 26 scenarios, including "Cloudwatcher unreachable closes the dome" — that is the hazard the site profile removes.
 

@@ -19,7 +19,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 
 | File | Purpose |
 |------|---------|
-| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.2.1, dual-site (Germany mirrored / Portugal standard), safety sensors, dynamic timeout, frozen dome detection |
+| `domecontrol_JK3.ino` | **Main controller** - Arduino MEGA v4.3.3, dual-site (Germany mirrored / Portugal standard), safety sensors, dynamic timeout, frozen dome detection, limit fault detection, emergency override |
 | `astroshell_ticklogger.py` | **Pi server** - Receives tick data + events from Arduino, logs to CSV, sends Pushover alerts |
 | `astroshell_ticklogger.service` | Systemd service file for tick logger autostart |
 | `controller_wcapacitor_2025_germany.ino` | Alternative controller with capacitor backup (has known bugs, see header) |
@@ -30,7 +30,7 @@ AstroShell Dome Controller - Arduino-based control system for a two-shutter astr
 | `close_astroshell.bat` | **NINA script** - Closes dome via sequence instruction, Pushover notification |
 | `motortick-statistic-batchrun.sh` | **Batch runner** - Automated open/close cycles for motor tick statistics |
 | `ascom-driver/` | **ASCOM COM driver** - Native IDomeV2 driver for NINA dome control (v1.1.0) |
-| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 42 scenarios per site profile (51 with both sensor layers built in) (v4.3.2) |
+| `test/host/` | **Logic tests** - Arduino mocks + dome physics; `make -C test/host test` runs 57 scenarios per site profile (66 with both sensor layers built in) (v4.3.3) |
 | `.github/workflows/firmware-ci.yml` | **Firmware CI** - logic tests + avr-gcc build of both site profiles (v4.2.0) |
 | `README.md` | User documentation with wiring notes |
 
@@ -55,7 +55,9 @@ NO existing pins/wiring can be changed (hardwired on the board). Only MEGA-exclu
 All real-time operations run in the interrupt service routine:
 - Motor PWM control with soft-start (SMOOTH=30)
 - Button debouncing (cnt > 6 ticks = ~100ms)
-- Limit switch sampling: a level counts only after `LIM_CONFIRM_TICKS` (4) identical samples; every reader uses `limRead()` (v4.3.0). The far end stop of a full run is ignored for its first `LIM_MIN_RUN_TICKS` (2440) ticks, reversals exempt (v4.3.1)
+- Limit switch sampling: a level counts only after `LIM_CONFIRM_TICKS` (4) identical samples; every reader uses `limRead()` (v4.3.0). The far end stop of a full run is ignored for its first `LIM_MIN_RUN_TICKS_CLOSE` (4220) / `LIM_MIN_RUN_TICKS_OPEN` (3800) ticks by physical direction, reversals exempt (v4.3.1, per direction since v4.3.3)
+- Start-limit release check (v4.3.3): a full run whose start end switch is still active after `LIM_RELEASE_TICKS` (610) loses its full-run status (`m*_run_start_dir = 0`); the check never stops a motor
+- Emergency override (v4.3.3): while `m*ForceClose` is set the end stop of the physical CLOSE direction is ignored (`LIM_FORCE_IGNORED`); the ISR clears the flag as soon as the motor is not closing
 - Motor timeout safety (dynamic in Germany, otherwise the static site values `STATIC_TIMEOUT_M*_CLOSE/OPEN`)
 - Tick counting for motor runtime measurement
 - Frozen dome tick counter (~4 clock cycles overhead when active)
@@ -95,7 +97,7 @@ All real-time operations run in the interrupt service routine:
 - Arduino pushes events to Solo:88/event via HTTP GET
 - Solo server sends Pushover alerts (background thread)
 - Rate-limited: 10s minimum between events, 5min for conflict events
-- Events: frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict, limit_glitch (v4.3.2)
+- Events: frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict, limit_glitch (v4.3.2), limit_fault, limit_stuck, force_close (v4.3.3)
 
 ### Web Server (Port 80)
 - Auto-refresh every 10 seconds
@@ -110,15 +112,23 @@ All real-time operations run in the interrupt service routine:
 | `/?$3` | CLOSE Shutter 2 (West) |
 | `/?$4` | OPEN Shutter 2 (West) — blocked during frozen lockout |
 | `/?$5` | Emergency STOP all motors |
-| `/?$S` | Get status: "OPEN" or "CLOSE" |
-| `/?$A` | ASCOM status: `S1_STATE\|S1_MOTOR\|S2_STATE\|S2_MOTOR` (pipe-delimited, v4.0.3) |
+| `/?$S` | Get status: "OPEN" or "CLOSED"; CLOSED only if both shutters are at the closed stop with their open end switch inactive (a limit fault answers OPEN, v4.3.3) |
+| `/?$A` | ASCOM status: `S1_STATE\|S1_MOTOR\|S2_STATE\|S2_MOTOR` (pipe-delimited, v4.0.3); a shutter in limit fault reports INTERMEDIATE (v4.3.3) |
 | `/?$R` | Reset EEPROM counters |
 | `/?$L` | Toggle tick logging on/off (default: ON after reboot) |
 | `/?$U` | Unlock dome from frozen lockout (v4.0) |
 | `/?$C` | Calibrate ToF baseline — dome must be fully closed (v4.0) |
 | `/?$W` | Toggle Cloudwatcher link check; `/?$W1` = on, `/?$W0` = off (idempotent; the UI button uses these) — persisted in EEPROM byte 9 with the site id; OFF also disables cable-removal auto-close and all pushes to the Solo (v4.2.0) |
 
+| `/?$F1`, `/?$F3` | Emergency override (v4.3.3): close Shutter 1 (East) / Shutter 2 (West) with its "closed" end switch ignored for that one run; ends at STOP, an OPEN command or the close timeout. Supervised use only, never sent by any script |
+
 **Note:** The web API, `$S`, `$A` and the web page are physical on both sites; the site profile resolves the wiring (see Site Profile and Physical Semantics).
+
+### Limit Fault and Emergency Override (v4.3.3)
+- The limit switches pull their inputs LOW while the shutter is NOT at the stop (INPUT_PULLUP, active HIGH): a broken wire, loose terminal or dead switch reads as "end stop reached". Both end switches of one shutter active is therefore a **limit fault** (`shutter1State()` / `shutter2State()` return `SH_FAULT`): page "LIMIT FAULT", `$S` OPEN, `$A` INTERMEDIATE, `limit_fault` event (urgent, once per episode, retried every 60 s until delivered, at most one per 5 min). Normal commands, panel buttons and the auto-close do not move a shutter in that state (their guards are the raw end switch levels).
+- `$F1` / `$F3` (`forceCloseShutter()`): the only way to close with a stuck "closed" line. Sets `m*ForceClose` together with the motor start in one critical section; the run is never a measured run (no tick log), a close that is already running keeps its remaining timeout. The flag is cleared by the ISR when the motor is not closing any more and by `startMotor*()` / `fdStartMotor()` on every new run. The character after the F is consumed like `$W1` (`forceClosePending`), so `$F1` is not followed by a normal `$1`.
+- Not detectable from two switch levels: only the "closed" line stuck HIGH with the shutter mid-travel reads as "Physically CLOSED". The override covers it (the operator sees the open shutter); `limit_stuck` reports it on the next opening.
+- Bench without limit switches: unconnected limit inputs are HIGH, i.e. a limit fault on that shutter and `$S` = OPEN.
 
 ## Motor Stop Reason Codes
 
@@ -153,7 +163,8 @@ Two domes run this source. Select the site at the top of `domecontrol_JK3.ino` (
 
 Rules:
 - The hardware pairing never changes: the ISR stops direction `OPEN` at `lim*open` and `CLOSE` at `lim*closed`; the PWM pin mapping is fixed.
-- Limit switches are read only through `limRead()` (level confirmed over `LIM_CONFIRM_TICKS` = 4 ISR ticks, v4.3.0). The raw pins are read only in `limSample()` (ISR) and once in `setup()`. Never add a `digitalRead()` of a limit pin anywhere else. The ISR limit stops also apply `LIM_FAR_END_IMPLAUSIBLE()` (v4.3.1): a full run cannot reach its far end within `LIM_MIN_RUN_TICKS`; keep that value well below the fastest full run (4859 ticks measured).
+- Limit switches are read only through `limRead()` (level confirmed over `LIM_CONFIRM_TICKS` = 4 ISR ticks, v4.3.0). The raw pins are read only in `limSample()` (ISR) and once in `setup()`. Never add a `digitalRead()` of a limit pin anywhere else. The ISR limit stops also apply `LIM_FAR_END_IMPLAUSIBLE()` (v4.3.1): a full run cannot reach its far end within `LIM_MIN_RUN_TICKS_CLOSE` / `LIM_MIN_RUN_TICKS_OPEN` (v4.3.3: 4220 / 3800 = 80 % of the fastest full close / open measured on either dome, 5276 / 4753 ticks); keep them below the fastest full run of their direction, a shutter that arrives earlier pushes against its stop until the value is reached.
+- Everything in `loop()` that asks "is this shutter open / closed" (status answers, web page, calibration gate, conflict check) uses `shutter1State()` / `shutter2State()` (v4.3.3: `SH_INTERMEDIATE`, `SH_OPEN`, `SH_CLOSED`, `SH_FAULT`, one snapshot of both levels). The raw `limRead(LIM*_PHYS_*)` level stays the right test for "may a motor start towards this stop" (commands, auto-close, frozen cycle) and in the network gates.
 - **Everything that means "physically open/closed" must use** `DIR_PHYS_CLOSE` / `DIR_PHYS_OPEN` / `LIM1_PHYS_CLOSED` / `LIM1_PHYS_OPEN` / `LIM2_PHYS_CLOSED` / `LIM2_PHYS_OPEN` (plus the `*_NAME` strings and `WIRING_LABEL` for UI text). Raw `OPEN`/`CLOSE`/`lim*` are allowed only in the defines, the PHYSICAL SEMANTICS block, `pinMode`, the ISR limit stops, the ISR PWM output, the ISR stop-reason housekeeping and the ISR panel buttons (which use `BUTTON_MAY_START(dir)` and `TIMEOUT_M*_FOR(dir)`).
 - The web API is physical on both sites: `$1`/`$3` close, `$2`/`$4` open; `$S`, `$A` and the web page report physical state. The ASCOM driver needs no site setting ("Swap Open/Close" stays unchecked on both domes).
 - Before v4.2.0 the mirrored interpretation was hard-coded in 109 places. Flashed on a standard-wired dome, the IP-fail auto-close drove the shutters to the physically OPEN end stop. Never add a raw limit/direction test outside the allowed places; `make -C test/host test` runs every scenario for both sites and catches it.
@@ -180,7 +191,9 @@ Rules:
 #define HAVE_TIMEOUT_REGRESSION 1           // v4.3.0: per site (Germany 1, Portugal 0); 0 = probe shows temperature only
 #define STATIC_TIMEOUT_M1_CLOSE 6527        // v4.3.0: per site and physical direction; Portugal 7320 / 6527 / 7930 / 6527
 #define LIM_CONFIRM_TICKS 4                 // v4.3.0: identical ISR samples before a limit level is accepted (~66 ms)
-#define LIM_MIN_RUN_TICKS 2440              // v4.3.1: far end stop of a full run ignored before this (~40 s), reversals exempt; ignored episodes counted (limGlitch*, v4.3.2)
+#define LIM_MIN_RUN_TICKS_CLOSE 4220        // v4.3.3 (one value 2440 in v4.3.1): far end stop of a full CLOSE ignored before this (~69 s), reversals exempt; ignored episodes counted (limGlitch*, v4.3.2)
+#define LIM_MIN_RUN_TICKS_OPEN  3800        // v4.3.3: the same for a full OPEN (~62 s)
+#define LIM_RELEASE_TICKS 610               // v4.3.3: the start end switch of a full run must have released by then (10 s), else no proven full run (limStuck*)
 #define SMOOTH 30                           // Soft-start smoothness
 
 // Dynamic timeout regression coefficients (v4.0)
@@ -257,6 +270,9 @@ timestamp_utc,motor,direction,ticks,temperature,arduino_temp,tof_cm
 | `sensor_fail` | Normal | DS18B20 or VL53L0X failure (10+ consecutive) |
 | `conflict` | Normal | Limit switch vs ToF disagreement (rate-limited 5min) |
 | `limit_glitch` | Normal | A far-end limit level ignored by the plausibility rule (v4.3.2): "M2 at 212 ticks (3 since boot)"; also shown as "Ignored limit levels" on the web page |
+| `limit_fault` | High + siren | Both end switches of a shutter active for 2 s (v4.3.3): "S2 both end switches active"; position unknown, normal commands refused, the dome may be open |
+| `limit_stuck` | Normal | The end switch a full run started from did not release within 10 s (v4.3.3): "M2 start limit not released (1 since boot)"; stuck switch line or shutter not moving; web row "Start limit not released" |
+| `force_close` | Normal | Emergency override started (v4.3.3): "S2 forced close started" |
 
 **Service Management:**
 ```bash
@@ -289,7 +305,7 @@ Upload `domecontrol_JK3.ino` to Arduino MEGA. Required libraries:
 
 ### Host Logic Tests (v4.2.0)
 `make -C test/host test` compiles the unchanged `.ino` against the mocks in `test/host/mock/` and runs the scenario suite for each site profile in three sensor configurations: default (as flashed), both sensor layers built in, both compiled out (six binaries; one forked process per scenario; a physics model decides what is physically open/closed per site, independently of the firmware). Run it before every firmware commit. CI (`.github/workflows/firmware-ci.yml`) runs it plus an avr-gcc build of both profiles with `-DSITE=1/2`. `./test/host/build/test_site2 frozen` runs only scenarios whose name contains "frozen"; `make -C test/host test FW=/path/old.ino` tests another firmware revision.
-Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position. Since v4.3.0 a limit level is confirmed `LIM_CONFIRM_TICKS` (4) ticks after the pin changes: after `setPos()` on a booted firmware run `runTicks(LIM_CONFIRM_TICKS)` before asserting a state, a motor stops up to 4 ticks after the physical end stop (logged tick counts are up to 4 higher than `g_travel`), and `S[i].closedGlitchTicks` / `openGlitchTicks` inject spurious HIGH samples on a limit input. The test file carries fallback defines so `FW=<pre-4.3.0 .ino>` still compiles; the glitch and site-timeout scenarios then fail on purpose.
+Harness facts: the ISR debounce needs more than 6 ticks between panel-button presses (`pressButton()` waits 8); at a limit switch the ISR clears every stop reason except 3/4 on the next tick, so never assert stop reason 6 at an end stop; the first IP check after boot is skipped, so the 10th failure arrives about 16.5 minutes after the dome left the closed position. Since v4.3.0 a limit level is confirmed `LIM_CONFIRM_TICKS` (4) ticks after the pin changes: after `setPos()` on a booted firmware run `runTicks(LIM_CONFIRM_TICKS)` before asserting a state, a motor stops up to 4 ticks after the physical end stop (logged tick counts are up to 4 higher than `g_travel`), and `S[i].closedGlitchTicks` / `openGlitchTicks` inject spurious HIGH samples on a limit input. The test file carries fallback defines so `FW=<pre-4.3.0 .ino>` still compiles; the glitch and site-timeout scenarios then fail on purpose. Since v4.3.3 `S[i].closedStuck` / `openStuck` hold a limit input HIGH wherever the shutter is (open-circuit line); the 15 limit-fault / override / window / release scenarios all fail against v4.3.2 (`PRE_V433` guards the lines that need new symbols). The mock `Arduino.h` maps `PSTR`, `strcpy_P` and `snprintf_P` to their RAM versions. A second event within 10 s of another one is rate-limited: wait before asserting it, or expect the retry (limit_stuck 45 s, limit_fault 60 s).
 
 ### Toolchain Note (Apple Silicon Mac)
 The Arduino IDE's bundled avr-gcc is x86_64. Without Rosetta neither the IDE nor `arduino-cli` can compile here ("bad CPU type in executable"); install Rosetta (`softwareupdate --install-rosetta --agree-to-license`) or rely on the CI build. Bundled CLI: `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`. Compile from a folder named like the sketch (`domecontrol_JK3/domecontrol_JK3.ino`), never from the repo root (it holds three `.ino` files).
@@ -452,7 +468,8 @@ This file has documented bugs (see file header for full list):
 4. **Frozen dome simulation**: Block ToF sensor during open → verify stop + reverse + 3 retries + lockout
 5. **Unlock**: After lockout → click "UNLOCK DOME" → verify open commands work again
 6. **Graceful degradation**: Disconnect both sensors → verify system behaves identically to v3.3
-7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup. (Germany profile; in the Portugal profile the roles of pins 2 and 7 swap.)
+7. **Lab testing without limit switches**: Connect pin 2 (lim1closed) to GND to allow M1 open commands. Pin 7 stays HIGH (pullup) simulating closed position. Close phase is instant in this setup. (Germany profile; in the Portugal profile the roles of pins 2 and 7 swap.) Since v4.3.3 a shutter with both limit inputs unconnected shows LIMIT FAULT and `$S` answers OPEN; tie one input of each shutter to GND for a "closed" bench state.
+8. **Limit fault and override (v4.3.3)**: dome mid-travel, pull the "closed" end switch wire of one shutter and drive it to the open stop: page must show LIMIT FAULT, `$S` OPEN, CLOSE refused. `$F1`/`$F3` must start the close ("FORCED, end switch ignored"); press STOP when the shutter is closed. Never leave a forced run unattended.
 
 ### Portugal Commissioning Checklist (v4.2.0)
 1. IDE board = Arduino Mega or Mega 2560 (an "Arduino Uno" selection fails with "Sketch too big", 32256 bytes). Build with `#define SITE SITE_PORTUGAL` (or `-DSITE=2`), flash, open the web UI: System Status must show "Limit Wiring: Standard (original AstroShell)", IP Monitoring must show the site default "Cloudwatcher Check: ENABLED" (v4.3.0; a `$W` choice stored by an earlier build of the SAME site wins, `$W1`/`$W0` set it), Sensors must show "Temperature: Not installed".
@@ -478,4 +495,9 @@ These patterns were discovered during lab testing and are critical for future mo
 - **Stop reasons at limit switches**: once a motor is off at a limit, the ISR clears every stop reason except 3 (with the auto-close flag) and 4 on the next tick. Reason 6 (frozen) is therefore only visible mid-travel.
 - **Counted refactors** (v4.2.0): the 109 wiring-sensitive sites were changed by a script that asserted the exact number of occurrences of every replaced snippet per function and refused to write on any mismatch. Use the same approach for future sweeps; then run `make -C test/host test`. (v4.3.0: the 62 limit reads were swept the same way.)
 - **Limit confirmation (v4.3.0) and far-end plausibility (v4.3.1)**: Portugal, 2026-11-02: three West closes from fully open, two stopped at 252 and 212 ticks (4.1 s / 3.5 s) by a HIGH on pin 0 (`lim2closed`, shares RX0) that the firmware logged as *valid* closes; the second one happened with the 4-tick confirmation already active, so the level lasted > 66 ms, and the operator saw it coincide with the release of the OPEN switch (pin 1). The clean run took 5485 ticks (89.9 s). The German 253-cycle CSV has no such run. USB is never connected to the Portuguese MEGA in operation; suspect the West limit wiring (shared/loose line between the two switches). The night failure of 2026-11-02 05:58 may have been this glitch as well (NINA's state poll adds up to ~6 s of latency), not necessarily the timeout.
+- **Portugal 2026-11-20, West shutter could not be closed (v4.3.3)**: the page showed pin 0 and pin 1 both HIGH, "Physically CLOSED" next to stop reason "Limit 'Phys. Open'" (the state line tested "closed" first, the stop reason "open" first), "Last Valid Full-Runs" West close 3268 ticks and 8 ignored limit levels, the last at 2191 ticks. The close guard `!limRead(LIM2_PHYS_CLOSED)` refused every close, `$S` answered CLOSED. The fault is in the pin 0 line (West "closed" switch, wire, terminal or the common return); pin 0 also hangs on the USB-serial chip's TX through 1 kOhm, so a few hundred ohms of contact resistance already read as HIGH there (assumption from the MEGA schematic, to be measured on site: pin 0 to GND must be below 0.5 V with the shutter away from the closed stop).
+- **A state derived from two inputs needs its "both active" case spelled out** (v4.3.3): four independent `if (closed) ... else if (open)` chains disagreed about the same pair of levels. Use `shutter*State()`.
+- **One-run flags must be cleared where runs start, not only where they end** (v4.3.3): `/?$5$1` stops and restarts a motor inside one request, between two ISR ticks; the ISR never sees `mot*dir == 0`. `m*ForceClose` is therefore cleared in `startMotor*()` / `fdStartMotor()` as well as in the ISR. Start motors from `loop()` only through these helpers.
+- **A try-once event is lost when another event went out less than 10 s before** (v4.3.3): `limit_stuck` follows the `limit_glitch` of the same run by about 2 s. Events that must arrive are retried with their own interval (`reportLimitFaults()`), and only `sendEventNotification()` returning true marks them as sent; never retry on every `loop()` pass (a dead Solo costs 1.5 s per connect).
+- **Event texts belong in flash** (v4.3.3): a plain string literal passed as `const char*` lives in RAM on AVR (the first draft of the three new events cost 216 B); build the detail with `strcpy_P` / `snprintf_P` and `PSTR`.
 - **Portugal night close (2026-11-02 05:58 local)**: NINA's AscomDome.CloseShutter waits 3 s and then polls once per second while the state is ShutterClosing, without an own timeout; the wait ended 107.24 s after the call, i.e. at the firmware's 6527-tick timeout (106.9 s), with East closed (5943 ticks) and West intermediate. The ASCOM driver reports ShutterError only when both motors are stopped and the shutters are not both closed or both open, so a NINA ShutterError always means a motor stopped early.

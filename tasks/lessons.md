@@ -89,3 +89,21 @@
 - **Root cause:** The confirmation window was sized from one observation; the fault is a sustained level coupled to the release of the other switch, not a one-sample glitch
 - **Rule:** For safety inputs combine a short debounce with a physical plausibility check (a full run cannot reach the far end before LIM_MIN_RUN_TICKS); never size a filter from a single event. Watch the first real runs after flashing with the logger before declaring a fix done
 - **Applies to:** domecontrol_JK3.ino limit handling, any sensor filter sized from field data
+
+## [2026-11-20] — Two limit inputs, four readers, no "both active" case
+- **Mistake:** With both West end switches HIGH the page said "Physically CLOSED", `$S` said CLOSED, `$A` said OPEN and the stop reason said "Limit 'Phys. Open'"; the close guard refused every close while the shutter stood open. The rain checker would have taken the dome for closed
+- **Root cause:** Every reader had its own `if (closed) ... else if (open)` chain over the same two levels, each with a different order, and none knew the impossible combination. The switches read HIGH when their line is open, so the fault direction is exactly "end stop reached"
+- **Rule:** Derive a multi-input state in ONE function with every combination named (`shutter*State()` with `SH_FAULT`); a status answer that scripts rely on (`$S`) must fail towards "not closed". For an input whose failure mode is "reads active", plan the manual override together with the detection (`$F1`/`$F3`), never an automatic one
+- **Applies to:** domecontrol_JK3.ino status and command paths, any safety state built from several sensors
+
+## [2026-11-20] — A plausibility window sized for one fault moved the damage elsewhere
+- **Mistake:** v4.3.1 ignored the far end for 2440 ticks because the first glitches came 3.5 s into a close; the next ones came at 2191 and 3268 ticks, and the 3268 one ended a close with the shutter 40 % open, logged as valid. The same window also made an OPEN from a falsely "closed" position push against the open stop for up to 40 s
+- **Root cause:** The window was sized from the first observations, and its premise ("the run started at the opposite end stop") was taken from a level that can itself be stuck
+- **Rule:** Size a plausibility window from the physical limit (fastest full run per direction, with margin), not from where the fault showed up first, and check the premise of a rule with its own evidence (the start switch must release, `LIM_RELEASE_TICKS`). A run counts as valid only if it also satisfies the rule that protected it
+- **Applies to:** domecontrol_JK3.ino limit handling, any filter that trusts one sensor to qualify another
+
+## [2026-11-20] — New events silently dropped and 216 B of RAM for three messages
+- **Mistake:** The first draft pushed `limit_stuck` once; it follows the `limit_glitch` of the same run by 2 s and was dropped by the 10 s event spacing in exactly its main use case. The event texts were plain literals: +216 B RAM
+- **Root cause:** `sendEventNotification()` returned nothing, so callers could not tell a delivered event from a dropped one; string literals passed as `const char*` live in RAM on AVR
+- **Rule:** An event that must arrive is retried with its own interval and marked sent only on a true return (never on every loop pass: a dead Solo costs 1.5 s per connect). Event texts go through `PSTR` / `strcpy_P` / `snprintf_P`. Found by a test that asserted the event, and by comparing avr-size before and after: do both for every firmware change
+- **Applies to:** every `sendEventNotification()` caller

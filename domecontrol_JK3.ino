@@ -1,5 +1,5 @@
 //=============================================================================
-// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.2)
+// ASTROSHELL DOME CONTROLLER - SAFETY SENSOR EDITION (v4.3.3)
 //=============================================================================
 // Hardware: Arduino MEGA 2560 + Ethernet Shield (W5100/W5500)
 //           + DS18B20 temperature probe (pin 22)
@@ -21,6 +21,25 @@
 // - Event notifications to Solo Pi for Pushover alerts (v4.0)
 // - Conflicting signal detection: limit switches vs ToF (v4.0)
 // - Dual-site firmware: one source for the mirrored German dome and the standard Portuguese dome (v4.2.0)
+//
+// v4.3.3 Changes (Portugal 2026-11-20: the West shutter could not be closed, both West end switches active):
+// - Limit fault: both end switches of one shutter active is reported as "LIMIT FAULT" (web page), $S
+//   answers OPEN and $A INTERMEDIATE for that shutter, a "limit_fault" event goes to the Solo. Before,
+//   the page said "Physically CLOSED" and $S said CLOSED (rain checker: dome closed) with the shutter
+//   open. Normal commands and the auto-close still do not move a shutter in that state.
+// - Emergency override $F1 (East) / $F3 (West): closes the shutter with its "closed" end switch ignored
+//   for that one run; STOP, an OPEN command or the close timeout end it. Web buttons with a confirm
+//   dialog (System Details, and in the shutter block during a limit fault). For supervised use only:
+//   no automatic path (rain checker, IP/cable auto-close, NINA, panel buttons) ever starts it.
+// - Far-end plausibility per physical direction: LIM_MIN_RUN_TICKS_CLOSE 4220 / LIM_MIN_RUN_TICKS_OPEN
+//   3800 (80 % of the fastest full run measured on either dome) instead of 2440 for both. A "closed"
+//   level 3268 ticks into a West close had ended the run with the shutter 40 % open and was logged as
+//   a valid full run. A run counts as valid only if it lasted at least that long.
+// - Start-limit release check: a full run whose start end switch is still active LIM_RELEASE_TICKS
+//   (10 s) after the motor started is no proven full run (stuck level, or the shutter does not move):
+//   the far end counts at once again and the run is logged as interrupted. Before, a stuck "closed"
+//   level with the shutter near the open end made an OPEN ignore the open stop for the whole window.
+//   Counted on the web page ("Start limit not released") and pushed as "limit_stuck".
 //
 // v4.3.2 Changes (diagnostics for the wiring hunt):
 // - Every far-end level that the plausibility rule ignores is counted once per episode with motor and
@@ -423,13 +442,43 @@ static byte limPending[4] = {0, 0, 0, 0};   // consecutive samples that differ f
 // ticks (at most ~66 ms of pushing against the stop). Set from loop() before startMotor*() (v4.3.0).
 volatile byte m1LimitHold = 0, m2LimitHold = 0;
 // Far-end plausibility (v4.3.1): a run that started at one end stop (m*_run_start_dir != 0, set by the
-// tick tracking) cannot arrive at the opposite end stop within LIM_MIN_RUN_TICKS; the fastest full run
-// ever measured is 4859 ticks (Germany), 5028 (Portugal). Until then the far limit is ignored, which
-// defeats a long spurious HIGH on that input (Portugal 2026-11-02: >= 66 ms on pin 0 when the OPEN
-// switch released, 3.5 s into the close). A reversal is exempt: the direction then differs from the
-// start direction and the start limit stops the motor as usual. The motor timeout stays the backstop.
-#define LIM_MIN_RUN_TICKS 2440
-#define LIM_FAR_END_IMPLAUSIBLE(startDir, dir, ticks)  ((startDir) == (dir) && (ticks) < LIM_MIN_RUN_TICKS)
+// tick tracking) cannot arrive at the opposite end stop within LIM_MIN_RUN_TICKS_*. Until then the far
+// limit is ignored, which defeats a long spurious HIGH on that input (Portugal 2026-11-02: >= 66 ms on
+// pin 0 when the OPEN switch released, 3.5 s into the close). A reversal is exempt: the direction then
+// differs from the start direction and the start limit stops the motor as usual. The motor timeout
+// stays the backstop.
+// v4.3.3: one value per PHYSICAL direction, 80 % of the fastest full run measured on either dome
+// (close: 5276 Germany M2, 5277 Portugal West; open: 4753 Portugal West, 4859 Germany M2), instead of
+// 2440 for everything. Portugal 2026-11-20: a "closed" level 3268 ticks into a West close ended the
+// run with the shutter 40 % open and was logged as a valid full run. A shutter that really arrived
+// earlier than this would push against its stop until the value is reached: stay below the fastest run.
+#define LIM_MIN_RUN_TICKS_CLOSE 4220
+#define LIM_MIN_RUN_TICKS_OPEN  3800
+#define LIM_MIN_RUN_TICKS_FOR(dir)  ((word)((dir) == DIR_PHYS_CLOSE ? LIM_MIN_RUN_TICKS_CLOSE : LIM_MIN_RUN_TICKS_OPEN))
+#define LIM_FAR_END_IMPLAUSIBLE(startDir, dir, ticks)  ((startDir) == (dir) && (ticks) < LIM_MIN_RUN_TICKS_FOR(dir))
+// Start-limit release (v4.3.3): the far-end rule rests on the run having started AT the opposite end
+// stop. If that end switch is still active LIM_RELEASE_TICKS after the motor started, its level is
+// stuck or the shutter does not move: the run is no proven full run any more (m*_run_start_dir = 0),
+// the far end counts at once again and the run is logged as interrupted, never as valid. Without this
+// a stuck "closed" level with the shutter near the open end made an OPEN ignore the open stop for the
+// whole plausibility window. The West OPEN switch in Portugal releases 3.5-4.1 s (212-252 ticks) into
+// a close; 610 ticks = 10 s.
+#define LIM_RELEASE_TICKS 610
+volatile word limStuckCount = 0;           // runs whose start limit did not release, since boot
+volatile byte limStuckMotor = 0;           // motor of the last one (1 or 2)
+word limStuckReported = 0;                 // loop(): runs already pushed
+// Emergency override (v4.3.3): $F1 / $F3 close a shutter with its "closed" end switch ignored for that
+// one run (stuck or broken switch line: every normal close is refused or ends at once). Set together
+// with the motor start by forceCloseShutter(), cleared by the ISR as soon as the motor is not closing
+// any more and by startMotor*() / fdStartMotor() on every new run. No automatic path ever sets it.
+volatile byte m1ForceClose = 0, m2ForceClose = 0;
+byte forceCloseEvent = 0;                  // loop(): bit0 S1, bit1 S2: override started, event not pushed yet
+#define LIM_FORCE_IGNORED(force, dir)  ((force) && (dir) == DIR_PHYS_CLOSE)
+// Limit fault reporting (v4.3.3), see reportLimitFaults()
+#define LIMIT_FAULT_CONFIRM_MS       2000UL    // both end switches active for this long before it is pushed
+#define LIMIT_FAULT_RETRY_INTERVAL  60000UL    // next try while the Solo did not take the event
+#define LIMIT_FAULT_EVENT_INTERVAL 300000UL    // at most one limit_fault event per 5 min (flapping line)
+#define LIMIT_STUCK_RETRY_INTERVAL  45000UL    // next try for a limit_stuck event that was not delivered
 // Diagnostics (v4.3.2): an ignored far-end level is counted once per episode (ISR), shown on the web
 // page and pushed to the Solo as a "limit_glitch" event by reportLimitGlitches() in loop(), so a
 // wiring fault stays visible although it no longer stops the shutter.
@@ -460,6 +509,23 @@ static inline void limSample() {               // ISR only: one sample per tick
     }
   }
 }
+
+// Shutter state from the two confirmed end switch levels (v4.3.3). Both active cannot happen on a
+// healthy dome: the switches pull their inputs LOW while the shutter is NOT at the stop, so a broken
+// wire, a loose terminal or a dead switch reads as "end stop reached". Portugal 2026-11-20: pin 0 and
+// pin 1 both HIGH; the page said "Physically CLOSED", $S said CLOSED and nothing could close the open
+// West shutter. SH_FAULT is neither open nor closed: the position is unknown.
+#define SH_INTERMEDIATE 0
+#define SH_OPEN         1
+#define SH_CLOSED       2
+#define SH_FAULT        3
+static inline byte shutterStateOf(byte physOpenPin, byte physClosedPin) {
+  byte lc = limConfirmed;                        // one snapshot for both levels
+  bool o = (lc >> limBit(physOpenPin)) & 1, c = (lc >> limBit(physClosedPin)) & 1;
+  return (o && c) ? SH_FAULT : c ? SH_CLOSED : o ? SH_OPEN : SH_INTERMEDIATE;
+}
+static inline byte shutter1State() { return shutterStateOf(LIM1_PHYS_OPEN, LIM1_PHYS_CLOSED); }
+static inline byte shutter2State() { return shutterStateOf(LIM2_PHYS_OPEN, LIM2_PHYS_CLOSED); }
 
 //=============================================================================
 // DS18B20 TEMPERATURE SENSOR
@@ -697,6 +763,7 @@ void setRemoteCheck(bool on);                   // Switch the Cloudwatcher link 
 void pushTickDataIfReady();                     // Push tick data to logging server
 void pushInterruptDataIfReady();                // Push interrupted stop data
 void reportLimitGlitches();                     // Push ignored far-end levels as limit_glitch events (v4.3.2)
+void reportLimitFaults();                       // Push limit_fault / limit_stuck / force_close events (v4.3.3)
 
 // --- v4.0: Sensor and safety functions ---
 void setupDS18B20();                            // Initialize temperature probe
@@ -709,7 +776,7 @@ void calibrateToF();                            // Store current ToF as baseline
 void loadToFCalibration();                      // Load baseline from EEPROM
 void frozenDomeStateMachine();                  // Main frozen dome detection logic
 void checkConflictingSignals();                 // Limit switch vs ToF disagreement
-void sendEventNotification(const char* type, const char* detail, bool urgent = false);  // Push event to Solo (P1: urgent = no rate limit)
+bool sendEventNotification(const char* type, const char* detail, bool urgent = false);  // Push event to Solo (P1: urgent = no rate limit); true = delivered (v4.3.3)
 
 //=============================================================================
 // ISR-SAFE MOTOR START HELPERS
@@ -725,7 +792,7 @@ void sendEventNotification(const char* type, const char* detail, bool urgent = f
 // was reversed at full PWM. Restart the soft-start ramp whenever the direction changes.
 inline void startMotor1(byte direction, word timeout) {
   cli();
-  if (mot1dir != direction) mot1speed = 0;
+  if (mot1dir != direction) { mot1speed = 0; m1ForceClose = 0; }   // v4.3.3: a new run is never a forced one
   mot1timer = timeout;
   mot1dir = direction;
   sei();
@@ -733,7 +800,7 @@ inline void startMotor1(byte direction, word timeout) {
 
 inline void startMotor2(byte direction, word timeout) {
   cli();
-  if (mot2dir != direction) mot2speed = 0;
+  if (mot2dir != direction) { mot2speed = 0; m2ForceClose = 0; }   // v4.3.3
   mot2timer = timeout;
   mot2dir = direction;
   sei();
@@ -747,9 +814,9 @@ static bool fdStartMotor(byte motor, byte direction, word timeout) {
   const byte bit = (motor == 2) ? FD_CMD_M2 : FD_CMD_M1;
   uint8_t sreg = SREG; cli();
   if (motor == 1) {
-    if (mot1dir == 0 && !(fdExternalCommand & bit)) { mot1timer = timeout; mot1dir = direction; started = true; }
+    if (mot1dir == 0 && !(fdExternalCommand & bit)) { mot1timer = timeout; mot1dir = direction; m1ForceClose = 0; started = true; }
   } else {
-    if (mot2dir == 0 && !(fdExternalCommand & bit)) { mot2timer = timeout; mot2dir = direction; started = true; }
+    if (mot2dir == 0 && !(fdExternalCommand & bit)) { mot2timer = timeout; mot2dir = direction; m2ForceClose = 0; started = true; }
   }
   SREG = sreg;
   return started;
@@ -761,6 +828,30 @@ static inline void fdNoteCommand(byte bits) {
   uint8_t sreg = SREG; cli();
   fdExternalCommand |= bits;
   SREG = sreg;
+}
+
+// Emergency override (v4.3.3, $F1 / $F3): close one shutter with its "closed" end switch ignored for
+// this run. For a stuck or broken switch line, when every normal close is refused ("already closed")
+// or ends at once. The motor runs until STOP, an OPEN command or the close timeout: with the shutter
+// already at the stop it pushes against it for that long, so someone has to watch it. Direction, flag
+// and the bookkeeping change in one critical section; a close that is already running keeps its
+// remaining time (P2: a repeated command must not reload the timeout).
+static void forceCloseShutter(byte motor) {
+  fdNoteCommand(motor == 2 ? FD_CMD_M2 : FD_CMD_M1);
+  uint8_t sreg = SREG; cli();
+  if (motor == 1) {
+    if (mot1dir != DIR_PHYS_CLOSE) { mot1speed = 0; mot1timer = dynTimeout_M1_Close; }
+    mot1dir = DIR_PHYS_CLOSE; m1ForceClose = 1;
+    m1_full_run_active = false; m1_run_start_dir = 0;    // not a measured run, no far-end rule
+    stop1reason = 0; m1AutoClosedByIP = false;
+  } else {
+    if (mot2dir != DIR_PHYS_CLOSE) { mot2speed = 0; mot2timer = dynTimeout_M2_Close; }
+    mot2dir = DIR_PHYS_CLOSE; m2ForceClose = 1;
+    m2_full_run_active = false; m2_run_start_dir = 0;
+    stop2reason = 0; m2AutoClosedByIP = false;
+  }
+  SREG = sreg;
+  forceCloseEvent |= (motor == 2) ? 2 : 1;
 }
 
 // FIX (P1): after the third frozen verdict an OPEN is refused at once (the state machine
@@ -1126,6 +1217,55 @@ void reportLimitGlitches() {
   char detail[40];
   snprintf(detail, sizeof(detail), "M%u at %u ticks (%u since boot)", (unsigned)m, (unsigned)t, (unsigned)n);
   sendEventNotification("limit_glitch", detail);
+}
+
+//=============================================================================
+// LIMIT FAULT REPORT (v4.3.3)
+//=============================================================================
+/**
+ * Pushes the limit diagnostics that reportLimitGlitches() does not cover:
+ * - "force_close": an emergency override was started ($F1 / $F3).
+ * - "limit_fault": both end switches of a shutter active for LIMIT_FAULT_CONFIRM_MS. Once per episode,
+ *   urgent (not held back by the 10 s event spacing: the dome may be open and cannot be closed);
+ *   retried once a minute until the Solo took it, then at most one per LIMIT_FAULT_EVENT_INTERVAL.
+ * - "limit_stuck": a run whose start end switch did not release (see LIM_RELEASE_TICKS). Retried until
+ *   delivered: a limit_glitch event of the same run usually precedes it by less than the event spacing.
+ */
+void reportLimitFaults() {
+  char detail[56];                          // the texts live in flash (PSTR), not in RAM
+  if (forceCloseEvent) {
+    byte f = forceCloseEvent; forceCloseEvent = 0;
+    strcpy_P(detail, f == 3 ? PSTR("S1 S2 forced close started")
+                   : f == 1 ? PSTR("S1 forced close started") : PSTR("S2 forced close started"));
+    sendEventNotification("force_close", detail);
+  }
+
+  static byte faultPrev = 0;                // bit0 S1, bit1 S2: fault state seen on the last pass
+  static byte faultSent = 0;                // event delivered for the current episode
+  static unsigned long faultSince = 0;      // millis() of the last change of faultPrev
+  static unsigned long lastTry = 0;         // 0 = never tried
+  static unsigned long retryWait = 0;
+  unsigned long now = millis();
+  byte faultNow = (shutter1State() == SH_FAULT ? 1 : 0) | (shutter2State() == SH_FAULT ? 2 : 0);
+  if (faultNow != faultPrev) { faultPrev = faultNow; faultSince = now; }
+  faultSent &= faultNow;                    // episode over: the next one is reported again
+  byte pending = faultNow & (byte)~faultSent;
+  if (pending && now - faultSince >= LIMIT_FAULT_CONFIRM_MS && (lastTry == 0 || now - lastTry >= retryWait)) {
+    lastTry = now; if (lastTry == 0) lastTry = 1;     // 0 means "never tried"
+    strcpy_P(detail, (pending == 3) ? PSTR("S1 S2 both end switches active")
+                   : (pending == 1) ? PSTR("S1 both end switches active") : PSTR("S2 both end switches active"));
+    if (sendEventNotification("limit_fault", detail, true)) { faultSent |= pending; retryWait = LIMIT_FAULT_EVENT_INTERVAL; }
+    else retryWait = LIMIT_FAULT_RETRY_INTERVAL;
+  }
+
+  word n; byte m;
+  { uint8_t sreg = SREG; cli(); n = limStuckCount; m = limStuckMotor; SREG = sreg; }
+  static unsigned long stuckLastTry = 0;    // 0 = never tried
+  if (n != limStuckReported && (stuckLastTry == 0 || now - stuckLastTry >= LIMIT_STUCK_RETRY_INTERVAL)) {
+    stuckLastTry = now; if (stuckLastTry == 0) stuckLastTry = 1;
+    snprintf_P(detail, sizeof(detail), PSTR("M%u start limit not released (%u since boot)"), (unsigned)m, (unsigned)n);
+    if (sendEventNotification("limit_stuck", detail)) { limStuckReported = n; stuckLastTry = 0; }
+  }
 }
 
 //=============================================================================
@@ -1736,8 +1876,8 @@ void checkConflictingSignals() {
   if (!tofCalibrated || !tof_connected || tofDistance_mm <= 0) return;
   if (mot1dir != 0 || mot2dir != 0) return;  // Only check when motors stopped
 
-  bool s1_closed = limRead(LIM1_PHYS_CLOSED);
-  bool s2_closed = limRead(LIM2_PHYS_CLOSED);
+  bool s1_closed = (shutter1State() == SH_CLOSED);   // v4.3.3: a limit fault is neither closed nor open
+  bool s2_closed = (shutter2State() == SH_CLOSED);
   bool tof_says_open = (tofDistance_mm > (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE));
   bool tof_says_closed = (tofDistance_mm <= (int)(tofBaseline_mm + TOF_OPEN_TOLERANCE));
 
@@ -1753,8 +1893,8 @@ void checkConflictingSignals() {
   }
 
   // Conflict: limits say open but ToF says closed (possible frozen top)
-  bool s1_open = limRead(LIM1_PHYS_OPEN);
-  bool s2_open = limRead(LIM2_PHYS_OPEN);
+  bool s1_open = (shutter1State() == SH_OPEN);
+  bool s2_open = (shutter2State() == SH_OPEN);
   if ((s1_open || s2_open) && tof_says_closed) {
     if (lastConflictEventTime == 0 || now - lastConflictEventTime >= CONFLICT_EVENT_INTERVAL) {   // v4.2.0: 0 = never sent
       lastConflictEventTime = now;
@@ -1776,14 +1916,14 @@ void checkConflictingSignals() {
  * @param type   Event type string (e.g., "frozen_dome", "sensor_fail")
  * @param detail Additional detail string
  */
-void sendEventNotification(const char* type, const char* detail, bool urgent) {
+bool sendEventNotification(const char* type, const char* detail, bool urgent) {
   // Rate limiting (FIX (P1): a lockout follows its verdict within seconds and must not be dropped)
   // v4.2.0: lastEventSentTime == 0 means "never sent" - the first event after boot is not dropped
   unsigned long now = millis();
-  if (!urgent && lastEventSentTime != 0 && now - lastEventSentTime < EVENT_MIN_INTERVAL) return;
+  if (!urgent && lastEventSentTime != 0 && now - lastEventSentTime < EVENT_MIN_INTERVAL) return false;
 
   // Skip if network not ready or no Solo on site ($W off, v4.2.0)
-  if (!ethernet_initialized || !networkMonitoringEnabled || !remoteCheckEnabled) return;
+  if (!ethernet_initialized || !networkMonitoringEnabled || !remoteCheckEnabled) return false;
 
   // URL-encode the detail string (replace spaces with %20) into a local buffer
   // so it can be sent in a single print() call for reliable TCP transmission
@@ -1799,6 +1939,7 @@ void sendEventNotification(const char* type, const char* detail, bool urgent) {
   encoded[j] = '\0';
 
   wdt_reset();
+  bool sent = false;                        // v4.3.3: tells the caller whether the Solo took the request
   EthernetClient eventClient;
   eventClient.setConnectionTimeout(1500);
 
@@ -1831,8 +1972,10 @@ void sendEventNotification(const char* type, const char* detail, bool urgent) {
     delay(50);
     eventClient.stop();
     lastEventSentTime = now;
+    sent = true;
   }
   wdt_reset();
+  return sent;
 }
 
 //=============================================================================
@@ -2048,7 +2191,7 @@ void setup() {
     unsigned long setupSerialStart = millis();
     while(!Serial && (millis() - setupSerialStart < 2000)) { delay(10); }
     Serial.println(F("------------------------------"));
-    Serial.println(F("Dome Control v4.3.2 - Safety Sensors, dual-site"));
+    Serial.println(F("Dome Control v4.3.3 - Safety Sensors, dual-site"));
     Serial.println(F("Setup: Serial initialized."));
     if (lim2open == 1 || lim2open == 0 || lim2closed == 1 || lim2closed == 0) {
       Serial.println(F("WARNING: Pins 0/1 used for limit switches! Serial debug may cause malfunctions!"));
@@ -2594,6 +2737,7 @@ void handleWebClient() {
   bool ascom_status_request = false;
   bool reset_counters_request = false;
   bool remoteCheckPending = false;   // v4.2.0: "$W" seen, the next character decides (1 / 0 / toggle)
+  bool forceClosePending = false;    // v4.3.3: "$F" seen, the next character names the shutter (1 / 3)
 
   while (client.connected()) {
     // MUCH MORE AGGRESSIVE TIMEOUT - Key fix!
@@ -2608,6 +2752,11 @@ void handleWebClient() {
       if (remoteCheckPending) {          // v4.2.0: character after "$W": '1' = on, '0' = off, else toggle
         remoteCheckPending = false;
         setRemoteCheck(c == '1' ? true : (c == '0' ? false : !remoteCheckEnabled));
+      }
+      if (forceClosePending) {           // v4.3.3: character after "$F": the digit of the normal CLOSE command
+        forceClosePending = false;       // ('1' = shutter 1, '3' = shutter 2); anything else does nothing
+        if (c == '1') forceCloseShutter(1);
+        else if (c == '3') forceCloseShutter(2);
       }
       if (newInfo && c == ' ') { newInfo = false; }
       if (c == '\n') { inRequestLine = false; }
@@ -2643,6 +2792,14 @@ void handleWebClient() {
           action_parameter_in_url = true;
         }
 
+        // $F1 / $F3 = emergency override (v4.3.3): close shutter 1 / 2 with its "closed" end switch
+        // ignored for that run, see forceCloseShutter(). Like $W the character AFTER the F decides and
+        // is consumed here (newInfo is false by then), so "$F1" is not followed by a normal "$1".
+        if (c == 'F' || c == 'f') {
+          forceClosePending = true;
+          action_parameter_in_url = true;
+        }
+
         // $U = Unlock dome from frozen lockout
         if (c == 'U' || c == 'u') {
           if (fdOpenBlocked()) {   // FIX (P1): also while the lockout is pending after the 3rd verdict
@@ -2656,7 +2813,7 @@ void handleWebClient() {
         // $C = Calibrate ToF baseline (dome must be closed)
         if (c == 'C' || c == 'c') {
           // Only calibrate if dome is fully closed (both shutters at closed limit)
-          if (limRead(LIM1_PHYS_CLOSED) && limRead(LIM2_PHYS_CLOSED) && tof_connected) {
+          if (shutter1State() == SH_CLOSED && shutter2State() == SH_CLOSED && tof_connected) {   // v4.3.3: not during a limit fault
             calibrateToF();
           }
           action_parameter_in_url = true;
@@ -2757,7 +2914,9 @@ void handleWebClient() {
           client.println(F("Content-Type: text/plain"));
           client.println(F("Connection: close"));
           client.println(); 
-          if (limRead(LIM1_PHYS_CLOSED) && limRead(LIM2_PHYS_CLOSED)) {
+          // v4.3.3: CLOSED only if both shutters are at the closed stop AND their open end switches
+          // are inactive. A limit fault (both switches of a shutter active) answers OPEN: not known closed.
+          if (shutter1State() == SH_CLOSED && shutter2State() == SH_CLOSED) {
             client.println(F("CLOSED"));
           } else {
             client.println(F("OPEN")); 
@@ -2772,8 +2931,10 @@ void handleWebClient() {
           client.println();
 
           // Shutter 1 (East) physical state
-          if (limRead(LIM1_PHYS_OPEN))      client.print(F("OPEN"));
-          else if (limRead(LIM1_PHYS_CLOSED)) client.print(F("CLOSED"));
+          // v4.3.3: a limit fault (both end switches active) is reported as INTERMEDIATE: position unknown
+          byte a1 = shutter1State();
+          if (a1 == SH_OPEN)                client.print(F("OPEN"));
+          else if (a1 == SH_CLOSED)         client.print(F("CLOSED"));
           else                              client.print(F("INTERMEDIATE"));
           client.print('|');
 
@@ -2784,8 +2945,9 @@ void handleWebClient() {
           client.print('|');
 
           // Shutter 2 (West) physical state
-          if (limRead(LIM2_PHYS_OPEN))      client.print(F("OPEN"));
-          else if (limRead(LIM2_PHYS_CLOSED)) client.print(F("CLOSED"));
+          byte a2 = shutter2State();
+          if (a2 == SH_OPEN)                client.print(F("OPEN"));
+          else if (a2 == SH_CLOSED)         client.print(F("CLOSED"));
           else                              client.print(F("INTERMEDIATE"));
           client.print('|');
 
@@ -2828,6 +2990,16 @@ void handleWebClient() {
 //=============================================================================
 // HTML WEB INTERFACE GENERATOR
 //=============================================================================
+/** Emergency override button (v4.3.3): "$F1" / "$F3" behind a confirm dialog. */
+static void printForceCloseButton(Print& client, byte shutter) {
+  client.print(F("<a href='/?$F"));
+  client.print(shutter == 1 ? '1' : '3');
+  client.print(F("' class='button b-stop fullwidth' style='margin-top:8px;' onclick=\"return confirm('FORCE CLOSE: the closed end switch is IGNORED. The motor runs until STOP or the motor timeout. Watch the shutter!')\">FORCE CLOSE S"));
+  client.print(shutter);
+  client.print(shutter == 1 ? F(" (East)") : F(" (West)"));
+  client.println(F(", end switch ignored</a>"));
+}
+
 /**
  * Generates the full HTML control page.
  * - Responsive design for mobile devices
@@ -2889,22 +3061,25 @@ void sendFullHtmlResponse(Print& client) {
       client.println(F("</div>"));
       client.println(F("<div class='status'>"));
       // Status display logic for Shutter 1
-      bool s1_is_physically_closed_state = limRead(LIM1_PHYS_CLOSED);
-      bool s1_is_physically_open_state = limRead(LIM1_PHYS_OPEN);
+      byte s1_state = shutter1State();                    // v4.3.3: one snapshot; both end switches active = limit fault
+      bool s1_is_physically_closed_state = (s1_state == SH_CLOSED);
+      bool s1_is_physically_open_state = (s1_state == SH_OPEN);
       client.print(F("<strong>State:</strong> "));
-      if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
+      if (s1_state == SH_FAULT) client.print(F("<span class='warning'>LIMIT FAULT (both end switches active)</span>"));
+      else if (s1_is_physically_closed_state) client.print(F("Physically CLOSED"));
       else if (s1_is_physically_open_state) client.print(F("Physically OPEN"));
       else client.print(F("Intermediate"));
-      if (mot1dir == 0 && !s1_is_physically_open_state && !s1_is_physically_closed_state) client.print(F(" (Stopped)"));
+      if (mot1dir == 0 && s1_state == SH_INTERMEDIATE) client.print(F(" (Stopped)"));
 
       client.print(F("<br><strong>Movement:</strong> "));
-      if (mot1dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m1AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop1reason==4) client.print(F(" (VCC Fail)"));}
+      if (mot1dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m1ForceClose) client.print(F(" <span class='warning'>FORCED, end switch ignored</span>")); if(m1AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop1reason==4) client.print(F(" (VCC Fail)"));}
       else if (mot1dir == DIR_PHYS_OPEN) { client.print(F("Opening (physically)"));}
       else {client.print(F("Stopped"));}
 
       if(mot1dir == 0) {
           client.print(F("<br><strong>Stop Reason:</strong> "));
-          if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (" LIM1_PHYS_OPEN_NAME ")"));
+          if (s1_state == SH_FAULT && stop1reason==0) client.print(F("Unknown (limit fault)"));   // v4.3.3
+          else if (s1_is_physically_open_state && stop1reason==0) client.print(F("Limit 'Phys. Open' (" LIM1_PHYS_OPEN_NAME ")"));
           else if (s1_is_physically_closed_state && stop1reason==0) client.print(F("Limit 'Phys. Closed' (" LIM1_PHYS_CLOSED_NAME ")"));
           else if (stop1reason == 1) client.print(F("Button/SWSTOP"));
           else if (stop1reason == 2) client.print(F("Web STOP"));
@@ -2912,10 +3087,15 @@ void sendFullHtmlResponse(Print& client) {
           else if (stop1reason == 4) client.print(F("VCC Fail Auto-Close"));
           else if (stop1reason == 5) { client.print(F("TIMEOUT at ")); client.print(m1_interrupt_ticks); client.print(F(" ticks")); }
           else if (stop1reason == 6) client.print(F("FROZEN DOME Auto-Reverse"));
-          else if (!s1_is_physically_open_state && !s1_is_physically_closed_state) client.print(F("Manual Stop"));
+          else if (s1_state == SH_INTERMEDIATE) client.print(F("Manual Stop"));
           else client.print(F("Unknown"));
       }
-      client.println(F("</div></div>"));
+      if (s1_state == SH_FAULT) {                         // v4.3.3: say what it means and offer the override
+        client.print(F("<br><span class='warning'>Position unknown: OPEN and CLOSE are refused. Check the end switches and their wiring.</span>"));
+      }
+      client.println(F("</div>"));
+      if (s1_state == SH_FAULT) printForceCloseButton(client, 1);
+      client.println(F("</div>"));
 
       // --- Shutter 2 (West) ---
       client.println(F("<div class='section'><h2>Shutter 2 (West)</h2>"));
@@ -2925,22 +3105,25 @@ void sendFullHtmlResponse(Print& client) {
       client.println(F("</div>"));
       client.println(F("<div class='status'>"));
       // Status display logic for Shutter 2
-      bool s2_is_physically_closed_state = limRead(LIM2_PHYS_CLOSED);
-      bool s2_is_physically_open_state = limRead(LIM2_PHYS_OPEN);
+      byte s2_state = shutter2State();                    // v4.3.3: one snapshot; both end switches active = limit fault
+      bool s2_is_physically_closed_state = (s2_state == SH_CLOSED);
+      bool s2_is_physically_open_state = (s2_state == SH_OPEN);
       client.print(F("<strong>State:</strong> "));
-      if (s2_is_physically_closed_state) client.print(F("Physically CLOSED"));
+      if (s2_state == SH_FAULT) client.print(F("<span class='warning'>LIMIT FAULT (both end switches active)</span>"));
+      else if (s2_is_physically_closed_state) client.print(F("Physically CLOSED"));
       else if (s2_is_physically_open_state) client.print(F("Physically OPEN"));
       else client.print(F("Intermediate"));
-      if (mot2dir == 0 && !s2_is_physically_open_state && !s2_is_physically_closed_state) client.print(F(" (Stopped)"));
+      if (mot2dir == 0 && s2_state == SH_INTERMEDIATE) client.print(F(" (Stopped)"));
 
       client.print(F("<br><strong>Movement:</strong> "));
-      if (mot2dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m2AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop2reason==4) client.print(F(" (VCC Fail)"));}
+      if (mot2dir == DIR_PHYS_CLOSE) { client.print(F("Closing (physically)")); if(m2ForceClose) client.print(F(" <span class='warning'>FORCED, end switch ignored</span>")); if(m2AutoClosedByIP) client.print(F(" (IP Fail)")); if(stop2reason==4) client.print(F(" (VCC Fail)"));}
       else if (mot2dir == DIR_PHYS_OPEN) { client.print(F("Opening (physically)"));}
       else {client.print(F("Stopped"));}
 
       if(mot2dir == 0) {
           client.print(F("<br><strong>Stop Reason:</strong> "));
-          if (s2_is_physically_open_state && stop2reason==0) client.print(F("Limit 'Phys. Open' (" LIM2_PHYS_OPEN_NAME ")"));
+          if (s2_state == SH_FAULT && stop2reason==0) client.print(F("Unknown (limit fault)"));   // v4.3.3
+          else if (s2_is_physically_open_state && stop2reason==0) client.print(F("Limit 'Phys. Open' (" LIM2_PHYS_OPEN_NAME ")"));
           else if (s2_is_physically_closed_state && stop2reason==0) client.print(F("Limit 'Phys. Closed' (" LIM2_PHYS_CLOSED_NAME ")"));
           else if (stop2reason == 1) client.print(F("Button/SWSTOP"));
           else if (stop2reason == 2) client.print(F("Web STOP"));
@@ -2948,10 +3131,15 @@ void sendFullHtmlResponse(Print& client) {
           else if (stop2reason == 4) client.print(F("VCC Fail Auto-Close"));
           else if (stop2reason == 5) { client.print(F("TIMEOUT at ")); client.print(m2_interrupt_ticks); client.print(F(" ticks")); }
           else if (stop2reason == 6) client.print(F("FROZEN DOME Auto-Reverse"));
-          else if (!s2_is_physically_open_state && !s2_is_physically_closed_state) client.print(F("Manual Stop"));
+          else if (s2_state == SH_INTERMEDIATE) client.print(F("Manual Stop"));
           else client.print(F("Unknown"));
       }
-      client.println(F("</div></div>"));
+      if (s2_state == SH_FAULT) {                         // v4.3.3: say what it means and offer the override
+        client.print(F("<br><span class='warning'>Position unknown: OPEN and CLOSE are refused. Check the end switches and their wiring.</span>"));
+      }
+      client.println(F("</div>"));
+      if (s2_state == SH_FAULT) printForceCloseButton(client, 2);
+      client.println(F("</div>"));
 
       // Collapsible details section for system/diagnostic info (default: collapsed)
       client.println(F("<details style='margin-bottom:15px;'><summary style='cursor:pointer;padding:10px;background:#f8f8f8;border:1px solid #ddd;border-radius:5px;font-size:0.95em;font-weight:bold;'>System Details (tap to expand)</summary>"));
@@ -3061,7 +3249,7 @@ void sendFullHtmlResponse(Print& client) {
       if (frozenDomeState == FD_LOCKOUT) {
         client.print(F("<a href='/?$U' class='button b-stop fullwidth'>UNLOCK DOME</a>"));
       }
-      bool domeFullyClosed = limRead(LIM1_PHYS_CLOSED) && limRead(LIM2_PHYS_CLOSED);
+      bool domeFullyClosed = shutter1State() == SH_CLOSED && shutter2State() == SH_CLOSED;   // v4.3.3: not during a limit fault
       if (domeFullyClosed && tof_connected && mot1dir == 0 && mot2dir == 0) {
         client.print(F("<a href='/?$C' class='button b-reset fullwidth'>Calibrate ToF Baseline</a>"));
       }
@@ -3130,8 +3318,19 @@ void sendFullHtmlResponse(Print& client) {
         client.print(F("<tr><td>Ignored limit levels</td><td>")); client.print(n);
         if (n) { client.print(F(" (last: M")); client.print(m); client.print(F(" at ")); client.print(t); client.print(F(" ticks)")); }
         client.println(F("</td></tr>"));
+        { uint8_t sreg = SREG; cli(); n = limStuckCount; m = limStuckMotor; SREG = sreg; }   // v4.3.3: see LIM_RELEASE_TICKS
+        client.print(F("<tr><td>Start limit not released</td><td>")); client.print(n);
+        if (n) { client.print(F(" (last: M")); client.print(m); client.print(F(")")); }
+        client.println(F("</td></tr>"));
       }
       client.println(F("</table></div>"));
+
+      // --- Emergency Override (v4.3.3) ---
+      client.println(F("<div class='section'><h2>Emergency Override</h2>"));
+      client.println(F("<p style='font-size:0.85em;'>Closes a shutter with its 'closed' end switch <strong>ignored</strong> (stuck or broken switch line). The motor runs until STOP or the motor timeout. Only under supervision.</p>"));
+      printForceCloseButton(client, 1);
+      printForceCloseButton(client, 2);
+      client.println(F("</div>"));
 
       // --- Tick Logging Section ---
       client.println(F("<div class='section'><h2>Motor Runtime Logging</h2>"));
@@ -3255,6 +3454,7 @@ void loop() {
     pushTickDataIfReady();      // Push tick data to logging server if available
     pushInterruptDataIfReady(); // Push interrupted stop data if available
     reportLimitGlitches();      // v4.3.2: ignored far-end levels -> Solo event
+    reportLimitFaults();        // v4.3.3: limit fault, start limit not released, emergency override -> Solo event
   }
 
   if (networkMonitoringEnabled) socketHygiene();  // P1: drop dead clients, keep two listeners
@@ -3336,8 +3536,9 @@ ISR(TIMER2_COMPA_vect) {
   else limGlitchActive &= (byte)~1;
   if (imp2) { if (!(limGlitchActive & 2)) { limGlitchActive |= 2; limGlitchCount++; limGlitchMotor = 2; limGlitchTicks = m2_tick_counter; } }
   else limGlitchActive &= (byte)~2;
-  // v4.3.1: the far end stop is ignored during the first LIM_MIN_RUN_TICKS of a full run (see LIM_FAR_END_IMPLAUSIBLE)
-  if (!hold1 && limRead(lim1open) && mot1dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, OPEN, m1_tick_counter)) {
+  // v4.3.1: the far end stop is ignored during the first LIM_MIN_RUN_TICKS_* of a full run (see LIM_FAR_END_IMPLAUSIBLE)
+  // v4.3.3: an emergency override ignores the end stop of the physical CLOSE direction for its run (LIM_FORCE_IGNORED)
+  if (!hold1 && limRead(lim1open) && mot1dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, OPEN, m1_tick_counter) && !LIM_FORCE_IGNORED(m1ForceClose, OPEN)) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3345,7 +3546,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1open -> STOP"));
     #endif
   }
-  if (!hold1 && limRead(lim1closed) && mot1dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, CLOSE, m1_tick_counter)) {
+  if (!hold1 && limRead(lim1closed) && mot1dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m1_run_start_dir, CLOSE, m1_tick_counter) && !LIM_FORCE_IGNORED(m1ForceClose, CLOSE)) {
     mot1dir = 0;
     if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) stop1reason = 0;
     m1AutoClosedByIP = false;
@@ -3353,7 +3554,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M1 reached lim1closed -> STOP"));
     #endif
   }
-  if (!hold2 && limRead(lim2open) && mot2dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, OPEN, m2_tick_counter)) {
+  if (!hold2 && limRead(lim2open) && mot2dir == OPEN && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, OPEN, m2_tick_counter) && !LIM_FORCE_IGNORED(m2ForceClose, OPEN)) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
@@ -3361,7 +3562,7 @@ ISR(TIMER2_COMPA_vect) {
     Serial.println(F("ISR: M2 reached lim2open -> STOP"));
     #endif
   }
-  if (!hold2 && limRead(lim2closed) && mot2dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, CLOSE, m2_tick_counter)) {
+  if (!hold2 && limRead(lim2closed) && mot2dir == CLOSE && !LIM_FAR_END_IMPLAUSIBLE(m2_run_start_dir, CLOSE, m2_tick_counter) && !LIM_FORCE_IGNORED(m2ForceClose, CLOSE)) {
     mot2dir = 0;
     if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) stop2reason = 0;
     m2AutoClosedByIP = false;
@@ -3391,6 +3592,12 @@ ISR(TIMER2_COMPA_vect) {
       }
     }
   }
+
+  //--- EMERGENCY OVERRIDE HOUSEKEEPING (v4.3.3) ---
+  // A forced close lasts for one run: the flag falls as soon as the motor is not closing any more
+  // (timeout, STOP, reversal), before the panel buttons below can start a new, normal run.
+  if (mot1dir != DIR_PHYS_CLOSE) m1ForceClose = 0;
+  if (mot2dir != DIR_PHYS_CLOSE) m2ForceClose = 0;
 
   //--- MOTOR PWM OUTPUT ---
   // Soft-start: gradually increase PWM to reduce mechanical stress
@@ -3484,14 +3691,17 @@ ISR(TIMER2_COMPA_vect) {
   // Detect motor START (transition from stopped to running)
   if (mot1dir != 0 && m1_prev_dir == 0) {
     // Motor just started - check if at a limit switch (valid full-run start)
-    bool at_open_limit = limRead(LIM1_PHYS_OPEN);
-    bool at_closed_limit = limRead(LIM1_PHYS_CLOSED);
+    // v4.3.3: a full run starts at the end stop OPPOSITE to the direction of travel with the target end
+    // switch inactive. Both active (limit fault) or an emergency override is never a measured run.
+    bool closing = (mot1dir == DIR_PHYS_CLOSE);      // physical direction
+    bool at_start_limit  = limRead(closing ? LIM1_PHYS_OPEN : LIM1_PHYS_CLOSED);
+    bool at_target_limit = limRead(closing ? LIM1_PHYS_CLOSED : LIM1_PHYS_OPEN);
 
-    if (at_open_limit || at_closed_limit) {
+    if (at_start_limit && !at_target_limit && !m1ForceClose) {
       // Started at a limit - this could be a valid full-run
       m1_full_run_active = true;
       m1_tick_counter = 0;
-      m1_was_closing = (mot1dir == DIR_PHYS_CLOSE);  // physical direction
+      m1_was_closing = closing;
       m1_run_start_dir = mot1dir;                    // v4.3.1: far-end plausibility
     } else {
       // Started from intermediate position - not a full-run
@@ -3503,6 +3713,13 @@ ISR(TIMER2_COMPA_vect) {
   // Count ticks while motor is running and full-run is active
   if (mot1dir != 0 && m1_full_run_active) {
     m1_tick_counter++;
+    // v4.3.3: the start end switch must have released by now, otherwise this is no proven full run
+    // (stuck level, or the shutter does not move): far end honoured at once, logged as interrupted.
+    if (m1_tick_counter == LIM_RELEASE_TICKS && mot1dir == m1_run_start_dir &&
+        limRead(m1_was_closing ? LIM1_PHYS_OPEN : LIM1_PHYS_CLOSED)) {
+      m1_run_start_dir = 0;
+      limStuckCount++; limStuckMotor = 1;
+    }
   }
 
   // Detect motor STOP (transition from running to stopped)
@@ -3510,14 +3727,18 @@ ISR(TIMER2_COMPA_vect) {
     // Motor just stopped - check if we completed a valid full-run
     if (m1_full_run_active) {
       bool at_target = false;
+      // v4.3.3: valid only as a proven full run (start limit released in time, m1_run_start_dir still
+      // set) that lasted at least the plausibility window of its direction
+      bool proven = (m1_run_start_dir != 0) &&
+                    m1_tick_counter >= (word)(m1_was_closing ? LIM_MIN_RUN_TICKS_CLOSE : LIM_MIN_RUN_TICKS_OPEN);
 
-      if (m1_was_closing && limRead(LIM1_PHYS_CLOSED)) {
+      if (proven && m1_was_closing && limRead(LIM1_PHYS_CLOSED)) {
         // Was closing and reached closed limit - VALID
         at_target = true;
         m1_last_ticks_closing = m1_tick_counter;
         m1_last_direction = 1;  // closing
       }
-      else if (!m1_was_closing && limRead(LIM1_PHYS_OPEN)) {
+      else if (proven && !m1_was_closing && limRead(LIM1_PHYS_OPEN)) {
         // Was opening and reached open limit - VALID
         at_target = true;
         m1_last_ticks_opening = m1_tick_counter;
@@ -3543,13 +3764,14 @@ ISR(TIMER2_COMPA_vect) {
   //--- MOTOR 2 TICK TRACKING ---
   // Detect motor START
   if (mot2dir != 0 && m2_prev_dir == 0) {
-    bool at_open_limit = limRead(LIM2_PHYS_OPEN);
-    bool at_closed_limit = limRead(LIM2_PHYS_CLOSED);
+    bool closing = (mot2dir == DIR_PHYS_CLOSE);      // v4.3.3: start limit opposite to the travel, see motor 1
+    bool at_start_limit  = limRead(closing ? LIM2_PHYS_OPEN : LIM2_PHYS_CLOSED);
+    bool at_target_limit = limRead(closing ? LIM2_PHYS_CLOSED : LIM2_PHYS_OPEN);
 
-    if (at_open_limit || at_closed_limit) {
+    if (at_start_limit && !at_target_limit && !m2ForceClose) {
       m2_full_run_active = true;
       m2_tick_counter = 0;
-      m2_was_closing = (mot2dir == DIR_PHYS_CLOSE);
+      m2_was_closing = closing;
       m2_run_start_dir = mot2dir;                    // v4.3.1
     } else {
       m2_full_run_active = false;
@@ -3560,19 +3782,26 @@ ISR(TIMER2_COMPA_vect) {
   // Count ticks while motor is running
   if (mot2dir != 0 && m2_full_run_active) {
     m2_tick_counter++;
+    if (m2_tick_counter == LIM_RELEASE_TICKS && mot2dir == m2_run_start_dir &&       // v4.3.3: see motor 1
+        limRead(m2_was_closing ? LIM2_PHYS_OPEN : LIM2_PHYS_CLOSED)) {
+      m2_run_start_dir = 0;
+      limStuckCount++; limStuckMotor = 2;
+    }
   }
 
   // Detect motor STOP
   if (mot2dir == 0 && m2_prev_dir != 0) {
     if (m2_full_run_active) {
       bool at_target = false;
+      bool proven = (m2_run_start_dir != 0) &&                                        // v4.3.3: see motor 1
+                    m2_tick_counter >= (word)(m2_was_closing ? LIM_MIN_RUN_TICKS_CLOSE : LIM_MIN_RUN_TICKS_OPEN);
 
-      if (m2_was_closing && limRead(LIM2_PHYS_CLOSED)) {
+      if (proven && m2_was_closing && limRead(LIM2_PHYS_CLOSED)) {
         at_target = true;
         m2_last_ticks_closing = m2_tick_counter;
         m2_last_direction = 1;
       }
-      else if (!m2_was_closing && limRead(LIM2_PHYS_OPEN)) {
+      else if (proven && !m2_was_closing && limRead(LIM2_PHYS_OPEN)) {
         at_target = true;
         m2_last_ticks_opening = m2_tick_counter;
         m2_last_direction = 2;

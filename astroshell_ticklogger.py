@@ -128,7 +128,8 @@ GET /interrupt?m=<motor>&d=<direction>&t=<ticks>&temp=<C>&tof=<cm>
 
 GET /event?type=<type>&detail=<detail>&temp=<C>&tof=<cm>
     Receives event notification from Arduino, sends Pushover alert.
-    type: Event type (frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict)
+    type: Event type (frozen_dome, frozen_lockout, frozen_clear, sensor_fail, conflict,
+          limit_glitch, limit_fault, limit_stuck, force_close)
     detail: Additional detail string
     temp: Current temperature in C
     tof: Current ToF distance in cm
@@ -157,6 +158,13 @@ frozen_lockout  — Dome locked out after 3 failed attempts (HIGH PRIORITY)
 frozen_clear    — Dome opened successfully after previous frozen detection
 sensor_fail     — DS18B20 or VL53L0X failure (10+ consecutive failures)
 conflict        — Limit switch vs ToF disagreement
+limit_glitch    — A far-end limit level was ignored by the plausibility rule (firmware v4.3.2)
+limit_fault     — Both end switches of a shutter active: position unknown, normal commands
+                  are refused, the dome may be open (HIGH PRIORITY, firmware v4.3.3)
+limit_stuck     — The end switch a run started from did not release within 10 s: stuck
+                  switch line, or the shutter does not move (firmware v4.3.3)
+force_close     — Emergency override $F1/$F3 started: close with the end switch ignored
+                  (firmware v4.3.3)
 
 ==============================================================================
 """
@@ -198,11 +206,16 @@ PUSHOVER_PRIORITIES = {
     "sensor_fail":    0,   # Normal priority — degraded but functioning
     "sensor_ok":     -1,   # Low priority — sensor back (P2)
     "conflict":       0,   # Normal priority — informational
+    "limit_glitch":   0,   # Normal priority — wiring diagnostics, the shutter kept moving
+    "limit_fault":    1,   # High priority — dome may be open and cannot be closed normally!
+    "limit_stuck":    0,   # Normal priority — stuck switch line or shutter not moving
+    "force_close":    0,   # Normal priority — someone started the emergency override
 }
 
 # Sound mapping for event types (Pushover sound names)
 PUSHOVER_SOUNDS = {
     "frozen_lockout": "siren",  # Urgent attention needed
+    "limit_fault":    "siren",  # Dome may be open, close commands are refused
 }
 
 def get_solo_temperature():
@@ -363,6 +376,10 @@ def send_pushover_event(event_type, detail, temp=None, tof=None):
             "sensor_fail":    "Sensor Failure",
             "sensor_ok":      "Sensor Restored",
             "conflict":       "Signal Conflict",
+            "limit_glitch":   "Limit Level Ignored",
+            "limit_fault":    "LIMIT SWITCH FAULT - dome may be open!",
+            "limit_stuck":    "Start Limit Not Released",
+            "force_close":    "Forced Close Started",
         }
         title = f"AstroShell: {title_map.get(event_type, event_type)}"
 

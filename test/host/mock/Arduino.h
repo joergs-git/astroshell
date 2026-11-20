@@ -20,6 +20,9 @@ typedef uint16_t word;
 
 class __FlashStringHelper;
 #define F(s) (reinterpret_cast<const __FlashStringHelper*>(s))
+#define PSTR(s) (s)                 // avr/pgmspace.h: flash strings are ordinary strings on the host (v4.3.3)
+#define strcpy_P strcpy
+#define snprintf_P snprintf
 
 // AVR register / interrupt surface used by the sketch
 inline uint8_t SREG = 0;
