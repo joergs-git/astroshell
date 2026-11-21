@@ -102,7 +102,8 @@ Decisions:
   override is explicit (`$F1` / `$F3`), two-step, and no automatic path uses it.
 - A close whose "closed" level is proven false DURING the run (active inside the window, never dropped) runs on to its motor
   timeout instead of stopping a quarter open: the dome's safe direction completes, the timeout is the designed backstop. This
-  is automatic; it is flagged to the user in the hand-over.
+  is automatic; it is flagged to the user in the hand-over. After review round 2 only from a PROVEN start (a valid full
+  opening ended at the open stop); otherwise the close ends at the window and is reported as not closed.
 - Not done (scope): a persistent "closed switch not trusted" lock (refuse OPEN, keep `$S` at OPEN after an interrupted
   override, clear with a command). Proposed to the user.
 Done:
@@ -116,8 +117,8 @@ Done:
 - [x] `reportLimitFaults()`: per-shutter confirmation (1 s), queue that survives the end of an episode, urgent sends spaced by
       the function, back-off 60 s .. 16 min; `sendEventNotification()` returns bool; event texts in flash
 - [x] Tick logger: priorities and titles for limit_glitch, limit_fault (high, siren), limit_stuck, force_close
-- [x] Host tests: stuck inputs in the physics (`closedStuck` / `openStuck`), 22 new scenarios; 64/74/64 per site green; against
-      v4.3.2 exactly those 22 fail
+- [x] Host tests: stuck inputs in the physics (`closedStuck` / `openStuck`), 30 new scenarios (31 with the sensor build);
+      72/82/72 per site green; against v4.3.2 28 of the 30 fail, the other two guard review fixes
 - [x] Independent review (subagent, 2026-11-21) of the first version (commit 466f8f6): override mechanics, parser and ISR
       ordering confirmed (randomized stress, 400 seeds x 4 builds; healthy-dome differential identical to v4.3.2). Findings
       taken: sustained far-end level ended the run at the window (fixed: stale level / run-on), larger windows doubled the
@@ -125,13 +126,24 @@ Done:
       could start the override (fixed: two steps), limit_fault starved by a flapping line / lost with the Solo down / no
       back-off (fixed), late release (mitigated: 915 instead of 610 ticks). Not taken, documented: persistent distrust lock,
       abort of an OPEN whose "closed" switch does not release, stop reason after a timeout at an active limit
-- [x] Differential harness after the fixes: 1200 random healthy runs (2 sites x 2 sensor builds x 300 seeds) tick-exact
-      identical to v4.3.2; randomized stress 600 runs without violation
+- [x] Second review round (2026-11-21) on commit 1d768a4: two-step override, event queue and healthy-dome behaviour held
+      up. Findings taken: run-on with a TRUE "closed" level after a false start position pushed up to 127 s against the stop
+      (fixed: run-on only from a proven start, otherwise window end plus doubted level, never reported closed); a dip of the
+      start switch line at rest cost the next run its far-end rule (fixed: known position falls only while the motor runs);
+      a new fault waited for the back-off of an older event (fixed); the arrival tolerance accepted a level that had been
+      ignored all along (fixed); arming survived STOP, accepted HEAD + GET and never expired for good (fixed: STOP disarms,
+      GET only, 1 s minimum, expiry); the run-on alarm fired for a short glitch across the window end (fixed: raised when the
+      run ends on its timeout). Own finding: STOP during an ignored level reported CLOSED (fixed: doubted level)
+- [x] Differential harness after all fixes, three modes (round-1 mix, commands timed around arrivals, log hashes): 2400
+      random healthy runs (2 sites x 2 sensor builds) tick-exact identical to v4.3.2; randomized stress with a model of the
+      arming rules: 1200 runs, about 3460 forced starts per build, no violation
 - [x] Local avr-gcc 7.3 builds (same toolchain version as the IDE core), all 8 variants without sketch warnings:
-      Germany 49758 B flash / 1020 B RAM, Portugal 45612 B / 876 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
+      Germany 51586 B flash / 1030 B RAM, Portugal 47448 B / 886 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
 - [x] Web page checked in a browser (fault state, armed state, forced run, confirm dialog)
 - [x] README, CLAUDE.md, firmware header, lessons; MAC :ED / IP_ADR3 177 unchanged
-- [ ] Second review round on the review fixes; CI run of the branch `claude/awesome-ptolemy-uybbio`
+- [x] CI green on the branch `claude/awesome-ptolemy-uybbio` for 466f8f6 (run 44837003639) and 1d768a4 (run 44843137607):
+      host suite + 8 Arduino builds
+- [ ] Third, short review round on the round-2 fixes; CI run of the final commit
 - [ ] Portugal, on site: measure pin 0 to GND with the West shutter away from the closed stop (must be below 0.5 V; 1.5-3.5 V =
       contact resistance, 5 V = open circuit), operate the West "closed" switch by hand, check the common return of both
       West switches; then flash v4.3.3 with SITE_PORTUGAL and run sensor test step 8 (CLAUDE.md)

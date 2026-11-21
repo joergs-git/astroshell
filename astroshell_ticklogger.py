@@ -160,9 +160,10 @@ sensor_fail     — DS18B20 or VL53L0X failure (10+ consecutive failures)
 conflict        — Limit switch vs ToF disagreement
 limit_glitch    — A far-end limit level was ignored by the plausibility rule (firmware v4.3.2)
 limit_fault     — Both end switches of a shutter active: position unknown, normal commands
-                  are refused, the dome may be open; or "closed switch stuck, closing on
-                  timeout": a close runs on with a stuck "closed" level (HIGH PRIORITY,
-                  firmware v4.3.3)
+                  are refused, the dome may be open; or "closed switch not trusted, close
+                  stopped": a close ended early on a false "closed" level, the shutter may
+                  be open; or "closed switch stuck, closed on timeout": a close ran past a
+                  stuck "closed" level to its timeout (HIGH PRIORITY, firmware v4.3.3)
 limit_stuck     — The end switch a run started from did not release within 15 s: stuck
                   switch line, or the shutter does not move (firmware v4.3.3)
 force_close     — Emergency override $F1/$F3 started: close with the end switch ignored
