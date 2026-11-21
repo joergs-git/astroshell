@@ -158,7 +158,7 @@ Done:
       the panel STOP disarms in the ISR (a short press was missed while loop() was blocked), `$G` is ignored while the
       panel STOP is held, the confirm dialog says what the page shows after STOP
 - [x] CI green for 9c3667a (run 44849933164)
-- [ ] CI run of the final commit
+- [x] CI green for 3c65104 (run 44852774723) and the final commit 4bd55b9 (run 44853851259): host suite + 8 Arduino builds
 - [ ] Portugal, on site: measure pin 0 to GND with the West shutter away from the closed stop (must be below 0.5 V; 1.5-3.5 V =
       contact resistance, 5 V = open circuit), operate the West "closed" switch by hand, check the common return of both
       West switches; then flash v4.3.3 with SITE_PORTUGAL and run sensor test step 8 (CLAUDE.md)
