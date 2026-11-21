@@ -117,8 +117,8 @@ Done:
 - [x] `reportLimitFaults()`: per-shutter confirmation (1 s), queue that survives the end of an episode, urgent sends spaced by
       the function, back-off 60 s .. 16 min; `sendEventNotification()` returns bool; event texts in flash
 - [x] Tick logger: priorities and titles for limit_glitch, limit_fault (high, siren), limit_stuck, force_close
-- [x] Host tests: stuck inputs in the physics (`closedStuck` / `openStuck`), 30 new scenarios (31 with the sensor build);
-      72/82/72 per site green; against v4.3.2 28 of the 30 fail, the other two guard review fixes
+- [x] Host tests: stuck inputs in the physics (`closedStuck` / `openStuck`), 35 new scenarios (36 with the sensor build);
+      77/87/77 per site green; against v4.3.2 33 of the 35 fail, the other two guard review fixes
 - [x] Independent review (subagent, 2026-11-21) of the first version (commit 466f8f6): override mechanics, parser and ISR
       ordering confirmed (randomized stress, 400 seeds x 4 builds; healthy-dome differential identical to v4.3.2). Findings
       taken: sustained far-end level ended the run at the window (fixed: stale level / run-on), larger windows doubled the
@@ -137,13 +137,23 @@ Done:
 - [x] Differential harness after all fixes, three modes (round-1 mix, commands timed around arrivals, log hashes): 2400
       random healthy runs (2 sites x 2 sensor builds) tick-exact identical to v4.3.2; randomized stress with a model of the
       arming rules: 1200 runs, about 3460 forced starts per build, no violation
+- [x] Third review round (2026-11-21) on commit 9c3667a: round-2 fixes correct, healthy dome identical to v4.3.2. Findings
+      taken (the first four with the reviewer's validated patches): a dip of the line at rest cleared the doubt (fixed: only
+      while the motor runs); the release check ended a stale phase without doubting the level (fixed); "proven" survived a
+      failed release check (fixed); "proven" set by a false "open" level just after the opening window (fixed: needs the
+      close window); two identical GETs processed 1.5 s apart started the override (fixed: `$F` arms, `$G` starts; OPEN and
+      the panel STOP disarm too); an override stopped early read CLOSED (fixed: doubted level unless the run used its whole
+      timeout). Left as documented: a fault that flaps faster than 1 s is not pushed, a shutter that settles onto its switch
+      after the tolerance is "unknown" for one run
+- [x] After round 3: differential 2400 random healthy runs identical to v4.3.2; stress with the arm/confirm model 1200 runs,
+      about 5990 forced starts per build, no violation
 - [x] Local avr-gcc 7.3 builds (same toolchain version as the IDE core), all 8 variants without sketch warnings:
-      Germany 51586 B flash / 1030 B RAM, Portugal 47448 B / 886 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
+      Germany 52242 B flash / 1030 B RAM, Portugal 48106 B / 886 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
 - [x] Web page checked in a browser (fault state, armed state, forced run, confirm dialog)
 - [x] README, CLAUDE.md, firmware header, lessons; MAC :ED / IP_ADR3 177 unchanged
 - [x] CI green on the branch `claude/awesome-ptolemy-uybbio` for 466f8f6 (run 44837003639) and 1d768a4 (run 44843137607):
       host suite + 8 Arduino builds
-- [ ] Third, short review round on the round-2 fixes; CI run of the final commit
+- [ ] CI run of the final commit
 - [ ] Portugal, on site: measure pin 0 to GND with the West shutter away from the closed stop (must be below 0.5 V; 1.5-3.5 V =
       contact resistance, 5 V = open circuit), operate the West "closed" switch by hand, check the common return of both
       West switches; then flash v4.3.3 with SITE_PORTUGAL and run sensor test step 8 (CLAUDE.md)

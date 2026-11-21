@@ -119,3 +119,9 @@
 - **Root cause:** I reasoned from the case I wanted to fix (false level, true position) and did not turn it round (true level, false position); "known" was one flag for evidence of very different strength
 - **Rule:** For every rule that ignores a safety input, write down the opposite failure (the input was right, the premise wrong) and bound its cost before shipping. Grade position evidence (boot or short run = known, valid full run = proven) and give the strong privilege only to the strong evidence. When a rule ends a run on an input it did not believe, keep not believing it afterwards. Plan a second review round for the fixes of the first
 - **Applies to:** domecontrol_JK3.ino limit handling, any override or run-on logic
+
+## [2026-11-21] — Three review rounds, each found something; the last ones were mine to foresee
+- **Mistake:** Round 3 still found: the doubted level cleared by a 6-tick dip at rest (reported CLOSED again, 23 % open), "proven" surviving a failed release check, and the two-step override started by two identical GETs that the firmware processed 1.5 s apart
+- **Root cause:** I had just fixed the very same pattern for `m*_known_stop` (a dip at rest must not change what is known) and did not apply it to the new `m*_stale_stop`; the confirmation was "the same request again", which every retrying client produces
+- **Rule:** When a fix establishes a principle, sweep every variable of the same kind for it before committing. Distrust is cleared by positive evidence only. A confirmation is a different request. Budget review rounds until one comes back with nothing above "low"; validate each round's fixes with the differential and the stress model before the next
+- **Applies to:** domecontrol_JK3.ino, every multi-step safety interlock

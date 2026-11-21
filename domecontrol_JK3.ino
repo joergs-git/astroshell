@@ -27,12 +27,13 @@
 //   answers OPEN and $A INTERMEDIATE for that shutter, a "limit_fault" event goes to the Solo. Before,
 //   the page said "Physically CLOSED" and $S said CLOSED (rain checker: dome closed) with the shutter
 //   open. Normal commands and the auto-close still do not move a shutter in that state.
-// - Emergency override $F1 (East) / $F3 (West): closes the shutter with its "closed" end switch ignored
+// - Emergency override $F1 + $G1 (East) / $F3 + $G3 (West): closes the shutter with its "closed" end switch ignored
 //   for that one run; STOP, an OPEN command or the close timeout end it. Web buttons with a confirm
 //   dialog (System Details, and in the shutter block during a limit fault). For supervised use only:
 //   no automatic path (rain checker, IP/cable auto-close, NINA, panel buttons) ever starts it, and
-//   one request only arms it: a second GET for the same shutter 1 to 30 s later starts, STOP disarms.
-//   While it runs the shutter is never reported CLOSED ($S answers OPEN, $A INTERMEDIATE|CLOSING).
+//   $F only arms it: $G1 / $G3 for the same shutter within 30 s starts, STOP or OPEN disarm. While it
+//   runs the shutter is never reported CLOSED ($S answers OPEN, $A INTERMEDIATE|CLOSING), and after
+//   a run that was cut short its "closed" level stays doubted until the switch has worked again.
 // - Far-end plausibility per physical direction: LIM_MIN_RUN_TICKS_CLOSE 4220 / LIM_MIN_RUN_TICKS_OPEN
 //   3800 (80 % of the fastest full run measured on either dome) instead of 2440 for both. A "closed"
 //   level 3268 ticks into a West close had ended the run with the shutter 40 % open and was logged as
@@ -482,13 +483,12 @@ word limStuckReported = 0;                 // loop(): runs already pushed
 // any more and by startMotor*() / fdStartMotor() on every new run. No automatic path ever sets it.
 volatile byte m1ForceClose = 0, m2ForceClose = 0;
 byte forceCloseEvent = 0;                  // loop(): bit0 S1, bit1 S2: override started, event not pushed yet
-// The override is armed by the first $F1 / $F3 and started by a second one for the same shutter within
-// FORCE_ARM_MS: a single stray request (browser preload, link preview, a client without JavaScript
-// that skips the confirm dialog) cannot push a motor against its stop.
-// The second request must come at least FORCE_ARM_MIN_MS after the first (a HEAD/GET pair of a link
-// preview or a double click is one intention, not two) and must be a GET; STOP ($5) disarms.
+// Two different requests start the override: $F1 / $F3 only ARM it, $G1 / $G3 for the same shutter
+// within FORCE_ARM_MS start it. A stray request (browser preload, link preview, a client without
+// JavaScript that skips the confirm dialog) or any repetition of the arming request (double click,
+// a client that retries a GET, a request that waited while loop() was blocked) cannot push a motor
+// against its stop. Both are taken from GET requests only; STOP and an OPEN command disarm.
 #define FORCE_ARM_MS 30000UL
-#define FORCE_ARM_MIN_MS 1000UL
 byte forceArmShutter = 0;                  // loop(): 0 = not armed, 1 / 2 = shutter waiting for its second $F
 unsigned long forceArmTime = 0;            // millis() of the arming request
 // Stale far-end level (v4.3.3): a far-end level that became active while it could not be true (see
@@ -531,15 +531,18 @@ volatile byte m1_runon_ok = 0, m2_runon_ok = 0;   // this run started from a pro
 volatile byte m1_toward = 0, m2_toward = 0;   // ISR only: direction of the last run
 volatile byte m1_grace = 0, m2_grace = 0;     // ISR only: ticks left in which a level that turns active still counts as an arrival
 // Bookkeeping of an ISR limit stop of motor n at the end switch of direction dir (v4.3.3): a stop on a
-// stale level leaves the position unknown and that level doubted; any other stop makes the position
-// known, and proven if a proven full run ended there (m*_run_start_dir still equals dir).
+// stale or already doubted level leaves the position unknown and that level doubted; any other stop
+// makes the position known, and proven if a proven full run ended there (m*_run_start_dir still equals
+// dir) that lasted at least the longer of the two windows (a false level just after the shorter
+// opening window must not make an "open stop" from which a close would run on).
 #define LIM_STOP_BOOKKEEPING(n, dir) \
   do { \
-    if (m##n##_stale_dir == (dir)) { \
+    if (m##n##_stale_dir == (dir) || m##n##_stale_stop == (dir)) { \
       m##n##_known_stop = 0; m##n##_known_proven = 0; m##n##_stale_stop = (dir); \
       if ((dir) == DIR_PHYS_CLOSE) limStaleStopEvent |= (byte)(1 << ((n) - 1)); \
     } else { \
-      m##n##_known_stop = (dir); m##n##_known_proven = (m##n##_run_start_dir == (dir)); \
+      m##n##_known_stop = (dir); \
+      m##n##_known_proven = (m##n##_run_start_dir == (dir)) && m##n##_tick_counter >= LIM_MIN_RUN_TICKS_CLOSE; \
     } \
     m##n##_grace = 0; \
   } while (0)
@@ -880,7 +883,10 @@ bool sendEventNotification(const char* type, const char* detail, bool urgent = f
 // was reversed at full PWM. Restart the soft-start ramp whenever the direction changes.
 inline void startMotor1(byte direction, word timeout) {
   cli();
-  if (mot1dir != direction) { mot1speed = 0; m1ForceClose = 0; }   // v4.3.3: a new run is never a forced one
+  if (mot1dir != direction) {                 // v4.3.3: a new run is never a forced one, and an override that is
+    mot1speed = 0;                            // cut short leaves its "closed" level doubted (see m*_stale_stop)
+    if (m1ForceClose) { m1_stale_stop = DIR_PHYS_CLOSE; m1ForceClose = 0; }
+  }
   mot1timer = timeout;
   mot1dir = direction;
   sei();
@@ -888,7 +894,10 @@ inline void startMotor1(byte direction, word timeout) {
 
 inline void startMotor2(byte direction, word timeout) {
   cli();
-  if (mot2dir != direction) { mot2speed = 0; m2ForceClose = 0; }   // v4.3.3
+  if (mot2dir != direction) {                 // v4.3.3
+    mot2speed = 0;
+    if (m2ForceClose) { m2_stale_stop = DIR_PHYS_CLOSE; m2ForceClose = 0; }
+  }
   mot2timer = timeout;
   mot2dir = direction;
   sei();
@@ -902,9 +911,9 @@ static bool fdStartMotor(byte motor, byte direction, word timeout) {
   const byte bit = (motor == 2) ? FD_CMD_M2 : FD_CMD_M1;
   uint8_t sreg = SREG; cli();
   if (motor == 1) {
-    if (mot1dir == 0 && !(fdExternalCommand & bit)) { mot1timer = timeout; mot1dir = direction; m1ForceClose = 0; started = true; }
+    if (mot1dir == 0 && !(fdExternalCommand & bit)) { mot1timer = timeout; mot1dir = direction; if (m1ForceClose) { m1_stale_stop = DIR_PHYS_CLOSE; m1ForceClose = 0; } started = true; }
   } else {
-    if (mot2dir == 0 && !(fdExternalCommand & bit)) { mot2timer = timeout; mot2dir = direction; m2ForceClose = 0; started = true; }
+    if (mot2dir == 0 && !(fdExternalCommand & bit)) { mot2timer = timeout; mot2dir = direction; if (m2ForceClose) { m2_stale_stop = DIR_PHYS_CLOSE; m2ForceClose = 0; } started = true; }
   }
   SREG = sreg;
   return started;
@@ -942,27 +951,27 @@ static void forceCloseShutter(byte motor) {
   forceCloseEvent |= (motor == 2) ? 2 : 1;
 }
 
-// $F1 / $F3 as received: the first request for a shutter arms the override, a second one for the same
-// shutter FORCE_ARM_MIN_MS .. FORCE_ARM_MS later starts it. Anything else arms afresh. Only one shutter
-// is armed at a time; forceArmExpire() and STOP end the armed state.
-static void forceCloseRequest(byte motor) {
-  unsigned long now = millis();
-  unsigned long age = now - forceArmTime;
-  if (forceArmShutter == motor && age >= FORCE_ARM_MIN_MS && age <= FORCE_ARM_MS) {
-    forceArmShutter = 0;
-    forceCloseShutter(motor);
-  } else {
-    forceArmShutter = motor;
-    forceArmTime = now;
-  }
+// $F1 / $F3 as received: arm the override for that shutter (again). Only one shutter is armed at a
+// time; forceArmExpire(), STOP and an OPEN command end the armed state.
+static void forceCloseArm(byte motor) {
+  forceArmShutter = motor;
+  forceArmTime = millis();
 }
 static inline bool forceArmedFor(byte motor) {
   return forceArmShutter == motor && millis() - forceArmTime <= FORCE_ARM_MS;
 }
+// $G1 / $G3 as received: start the override if it is armed for that shutter.
+static void forceCloseConfirm(byte motor) {
+  if (forceArmedFor(motor)) {
+    forceArmShutter = 0;
+    forceCloseShutter(motor);
+  }
+}
 // Called from loop(): an arming that was not confirmed is forgotten for good (otherwise the comparison
-// above would be true again for 30 s every time millis() wraps, after 49.7 days).
+// above would be true again for 30 s every time millis() wraps, after 49.7 days); the panel STOP
+// button disarms like $5.
 static inline void forceArmExpire() {
-  if (forceArmShutter != 0 && millis() - forceArmTime > FORCE_ARM_MS) forceArmShutter = 0;
+  if (forceArmShutter != 0 && (millis() - forceArmTime > FORCE_ARM_MS || swstop_pressed_flag)) forceArmShutter = 0;
 }
 
 // FIX (P1): after the third frozen verdict an OPEN is refused at once (the state machine
@@ -2895,6 +2904,7 @@ void handleWebClient() {
   bool reset_counters_request = false;
   bool remoteCheckPending = false;   // v4.2.0: "$W" seen, the next character decides (1 / 0 / toggle)
   bool forceClosePending = false;    // v4.3.3: "$F" seen, the next character names the shutter (1 / 3)
+  bool forceConfirmPending = false;  // v4.3.3: "$G" seen, likewise
   bool firstChar = true, isGet = false;   // v4.3.3: the override is taken from GET requests only (a HEAD of a link preview is none)
 
   while (client.connected()) {
@@ -2914,8 +2924,13 @@ void handleWebClient() {
       if (firstChar) { firstChar = false; isGet = (c == 'G'); }
       if (forceClosePending) {           // v4.3.3: character after "$F": the digit of the normal CLOSE command
         forceClosePending = false;       // ('1' = shutter 1, '3' = shutter 2); anything else does nothing
-        if (isGet && c == '1') forceCloseRequest(1);        // first request arms, a later one within FORCE_ARM_MS starts
-        else if (isGet && c == '3') forceCloseRequest(2);
+        if (isGet && c == '1') forceCloseArm(1);             // arms only; "$G" + the same digit starts
+        else if (isGet && c == '3') forceCloseArm(2);
+      }
+      if (forceConfirmPending) {         // v4.3.3: character after "$G"
+        forceConfirmPending = false;
+        if (isGet && c == '1') forceCloseConfirm(1);
+        else if (isGet && c == '3') forceCloseConfirm(2);
       }
       if (newInfo && c == ' ') { newInfo = false; }
       if (c == '\n') { inRequestLine = false; }
@@ -2951,12 +2966,17 @@ void handleWebClient() {
           action_parameter_in_url = true;
         }
 
-        // $F1 / $F3 = emergency override (v4.3.3): close shutter 1 / 2 with its "closed" end switch
-        // ignored for that run, see forceCloseShutter(). The first request arms, a second one within
-        // FORCE_ARM_MS starts (forceCloseRequest()). Like $W the character AFTER the F decides and
-        // is consumed here (newInfo is false by then), so "$F1" is not followed by a normal "$1".
+        // $F1 / $F3 and $G1 / $G3 = emergency override (v4.3.3): close shutter 1 / 2 with its "closed"
+        // end switch ignored for that run, see forceCloseShutter(). $F arms (forceCloseArm()), $G for
+        // the same shutter within FORCE_ARM_MS starts (forceCloseConfirm()). Like $W the character
+        // AFTER the letter decides and is consumed here (newInfo is false by then), so "$F1" is not
+        // followed by a normal "$1".
         if (c == 'F' || c == 'f') {
           forceClosePending = true;
+          action_parameter_in_url = true;
+        }
+        if (c == 'G' || c == 'g') {
+          forceConfirmPending = true;
           action_parameter_in_url = true;
         }
 
@@ -2991,6 +3011,7 @@ void handleWebClient() {
           }
         } else if (c == '2') {
           // $2 = OPEN Shutter 1 (physically) — check frozen lockout
+          if (forceArmShutter == 1) forceArmShutter = 0;   // v4.3.3: an OPEN cancels an armed override for this shutter
           if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
@@ -3013,6 +3034,7 @@ void handleWebClient() {
           }
         } else if (c == '4') {
           // $4 = OPEN Shutter 2 (physically) — check frozen lockout
+          if (forceArmShutter == 2) forceArmShutter = 0;   // v4.3.3
           if (fdOpenBlocked()) {
             // Blocked: dome is locked due to frozen detection
           } else {
@@ -3152,10 +3174,10 @@ void handleWebClient() {
 // HTML WEB INTERFACE GENERATOR
 //=============================================================================
 /** Emergency override button (v4.3.3). The first click arms ("$F1" / "$F3" behind a confirm dialog),
- *  the page then shows the same link as CONFIRM for FORCE_ARM_MS; only that second request starts. */
+ *  the page then shows a DIFFERENT link ("$G1" / "$G3") as CONFIRM for FORCE_ARM_MS; only that one starts. */
 static void printForceCloseButton(Print& client, byte shutter) {
   bool armed = forceArmedFor(shutter);
-  client.print(F("<a href='/?$F"));
+  client.print(armed ? F("<a href='/?$G") : F("<a href='/?$F"));
   client.print(shutter == 1 ? '1' : '3');
   client.print(F("' class='button b-stop fullwidth' style='margin-top:8px;'"));
   if (!armed) client.print(F(" onclick=\"return confirm('FORCE CLOSE: the closed end switch is IGNORED. The motor runs until STOP or the motor timeout. Watch the shutter! After OK press CONFIRM NOW on the page within 30 s.')\""));
@@ -3261,7 +3283,7 @@ void sendFullHtmlResponse(Print& client) {
       if (s1_state == SH_FAULT) {                         // v4.3.3: say what it means and offer the override
         client.print(F("<br><span class='warning'>Position unknown: OPEN and CLOSE are refused. Check the end switches and their wiring.</span>"));
       } else if (s1_doubt) {
-        client.print(F("<br><span class='warning'>The 'closed' end switch was active before the shutter could arrive and still is: the shutter may be open, CLOSE is refused. Check the switch and its wiring.</span>"));
+        client.print(F("<br><span class='warning'>The 'closed' end switch reads active but is not trusted (active too early, or ignored by an override): the shutter may be open, CLOSE is refused. Check the switch and its wiring.</span>"));
       }
       if (forceArmedFor(1)) client.print(F("<br><span class='warning'>Override ARMED: press CONFIRM NOW within 30 s to start, STOP or wait to cancel.</span>"));
       client.println(F("</div>"));
@@ -3310,7 +3332,7 @@ void sendFullHtmlResponse(Print& client) {
       if (s2_state == SH_FAULT) {                         // v4.3.3: say what it means and offer the override
         client.print(F("<br><span class='warning'>Position unknown: OPEN and CLOSE are refused. Check the end switches and their wiring.</span>"));
       } else if (s2_doubt) {
-        client.print(F("<br><span class='warning'>The 'closed' end switch was active before the shutter could arrive and still is: the shutter may be open, CLOSE is refused. Check the switch and its wiring.</span>"));
+        client.print(F("<br><span class='warning'>The 'closed' end switch reads active but is not trusted (active too early, or ignored by an override): the shutter may be open, CLOSE is refused. Check the switch and its wiring.</span>"));
       }
       if (forceArmedFor(2)) client.print(F("<br><span class='warning'>Override ARMED: press CONFIRM NOW within 30 s to start, STOP or wait to cancel.</span>"));
       client.println(F("</div>"));
@@ -3503,7 +3525,7 @@ void sendFullHtmlResponse(Print& client) {
 
       // --- Emergency Override (v4.3.3) ---
       client.println(F("<div class='section'><h2>Emergency Override</h2>"));
-      client.println(F("<p style='font-size:0.85em;'>Closes a shutter with its 'closed' end switch <strong>ignored</strong> (stuck or broken switch line). The motor runs until STOP or the motor timeout. Only under supervision. Two steps: FORCE CLOSE arms, CONFIRM NOW within 30 s starts.</p>"));
+      client.println(F("<p style='font-size:0.85em;'>Closes a shutter with its 'closed' end switch <strong>ignored</strong> (stuck or broken switch line). The motor runs until STOP or the motor timeout. Only under supervision. Two steps: FORCE CLOSE arms, CONFIRM NOW within 30 s starts. If you end it with STOP the shutter is shown as not trusted until its switch has worked again.</p>"));
       printForceCloseButton(client, 1);
       printForceCloseButton(client, 2);
       client.println(F("</div>"));
@@ -3713,15 +3735,16 @@ ISR(TIMER2_COMPA_vect) {
   if (imp2) { if (!(limGlitchActive & 2)) { limGlitchActive |= 2; limGlitchCount++; limGlitchMotor = 2; limGlitchTicks = m2_tick_counter; } }
   else limGlitchActive &= (byte)~2;
   // v4.3.3: the known position falls when the motor runs and the end switch it rested on reads LOW: the
-  // shutter has left (see m*_known_stop). A level that ended a run as a stale one stays doubted until it drops.
+  // shutter has left (see m*_known_stop). A doubted level stays doubted until the motor runs and it reads
+  // LOW (the switch has let go of a moving shutter); a dip of the line at rest proves nothing.
   if (mot1dir && m1_known_stop == OPEN  && !limRead(lim1open))   { m1_known_stop = 0; m1_known_proven = 0; }
   if (mot1dir && m1_known_stop == CLOSE && !limRead(lim1closed)) { m1_known_stop = 0; m1_known_proven = 0; }
   if (mot2dir && m2_known_stop == OPEN  && !limRead(lim2open))   { m2_known_stop = 0; m2_known_proven = 0; }
   if (mot2dir && m2_known_stop == CLOSE && !limRead(lim2closed)) { m2_known_stop = 0; m2_known_proven = 0; }
-  if (m1_stale_stop == OPEN  && !limRead(lim1open))   m1_stale_stop = 0;
-  if (m1_stale_stop == CLOSE && !limRead(lim1closed)) m1_stale_stop = 0;
-  if (m2_stale_stop == OPEN  && !limRead(lim2open))   m2_stale_stop = 0;
-  if (m2_stale_stop == CLOSE && !limRead(lim2closed)) m2_stale_stop = 0;
+  if (mot1dir && m1_stale_stop == OPEN  && !limRead(lim1open))   m1_stale_stop = 0;
+  if (mot1dir && m1_stale_stop == CLOSE && !limRead(lim1closed)) m1_stale_stop = 0;
+  if (mot2dir && m2_stale_stop == OPEN  && !limRead(lim2open))   m2_stale_stop = 0;
+  if (mot2dir && m2_stale_stop == CLOSE && !limRead(lim2closed)) m2_stale_stop = 0;
   // ... and a level that TURNS active just after the motor stopped on its way there still is an arrival
   // (checked before m*_toward moves on: a restart in the tick of the confirmation must not lose it)
   if (m1_grace && m1_known_stop == 0 && mot1dir != m1_toward && limRead(m1_toward == OPEN ? lim1open : lim1closed)) { m1_known_stop = m1_toward; m1_known_proven = 0; m1_grace = 0; }
@@ -3796,6 +3819,7 @@ ISR(TIMER2_COMPA_vect) {
       // v4.3.3: a close that ran on past a stuck "closed" level is reported; having run its whole timeout
       // from a proven start the shutter rests at the closed stop as surely as the timeout can tell
       if (m1_runon_ok && m1_stale_dir == DIR_PHYS_CLOSE) { limRunOnEvent |= 1; m1_known_stop = DIR_PHYS_CLOSE; m1_known_proven = 0; }
+      if (m1ForceClose) { m1_known_stop = DIR_PHYS_CLOSE; m1_known_proven = 0; m1ForceClose = 0; }   // an override that ran its whole timeout: the same
       mot1dir = 0;  // Timeout reached - stop motor
       if (!((stop1reason == 3 && m1AutoClosedByIP) || stop1reason == 4)) {
         stop1reason = 5; m1AutoClosedByIP = false;  // 5 = Timeout
@@ -3808,6 +3832,7 @@ ISR(TIMER2_COMPA_vect) {
       // v4.3.3: a close that ran on past a stuck "closed" level is reported; having run its whole timeout
       // from a proven start the shutter rests at the closed stop as surely as the timeout can tell
       if (m2_runon_ok && m2_stale_dir == DIR_PHYS_CLOSE) { limRunOnEvent |= 2; m2_known_stop = DIR_PHYS_CLOSE; m2_known_proven = 0; }
+      if (m2ForceClose) { m2_known_stop = DIR_PHYS_CLOSE; m2_known_proven = 0; m2ForceClose = 0; }   // an override that ran its whole timeout: the same
       mot2dir = 0;  // Timeout reached - stop motor
       if (!((stop2reason == 3 && m2AutoClosedByIP) || stop2reason == 4)) {
         stop2reason = 5; m2AutoClosedByIP = false;  // 5 = Timeout
@@ -3816,10 +3841,13 @@ ISR(TIMER2_COMPA_vect) {
   }
 
   //--- EMERGENCY OVERRIDE HOUSEKEEPING (v4.3.3) ---
-  // A forced close lasts for one run: the flag falls as soon as the motor is not closing any more
-  // (timeout, STOP, reversal), before the panel buttons below can start a new, normal run.
-  if (mot1dir != DIR_PHYS_CLOSE) m1ForceClose = 0;
-  if (mot2dir != DIR_PHYS_CLOSE) m2ForceClose = 0;
+  // A forced close lasts for one run: the flag falls as soon as the motor is not closing any more,
+  // before the panel buttons below can start a new, normal run. The timeout branch above has already
+  // taken the flag of a run that used its whole timeout (the shutter is closed as surely as the timeout
+  // can tell); one that was cut short (STOP, panel button) leaves the "closed" level doubted until the
+  // switch has let go of a moving shutter: a shutter stopped half way is not reported closed.
+  if (mot1dir != DIR_PHYS_CLOSE && m1ForceClose) { m1_stale_stop = DIR_PHYS_CLOSE; m1ForceClose = 0; }
+  if (mot2dir != DIR_PHYS_CLOSE && m2ForceClose) { m2_stale_stop = DIR_PHYS_CLOSE; m2ForceClose = 0; }
 
   //--- MOTOR PWM OUTPUT ---
   // Soft-start: gradually increase PWM to reduce mechanical stress
@@ -3942,7 +3970,9 @@ ISR(TIMER2_COMPA_vect) {
     // (stuck level, or the shutter does not move): far end honoured at once, logged as interrupted.
     if (m1_tick_counter == LIM_RELEASE_TICKS && mot1dir == m1_run_start_dir &&
         limRead(m1_was_closing ? LIM1_PHYS_OPEN : LIM1_PHYS_CLOSED)) {
+      if (m1_stale_dir == mot1dir) m1_stale_stop = mot1dir;   // a far-end level that was being ignored stays doubted
       m1_run_start_dir = 0;
+      m1_known_proven = 0;                                    // the stop we started from proves nothing any more
       limStuckCount++; limStuckMotor = 1;
     }
   }
@@ -4012,7 +4042,9 @@ ISR(TIMER2_COMPA_vect) {
     m2_tick_counter++;
     if (m2_tick_counter == LIM_RELEASE_TICKS && mot2dir == m2_run_start_dir &&       // v4.3.3: see motor 1
         limRead(m2_was_closing ? LIM2_PHYS_OPEN : LIM2_PHYS_CLOSED)) {
+      if (m2_stale_dir == mot2dir) m2_stale_stop = mot2dir;
       m2_run_start_dir = 0;
+      m2_known_proven = 0;
       limStuckCount++; limStuckMotor = 2;
     }
   }

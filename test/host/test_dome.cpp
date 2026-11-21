@@ -179,7 +179,7 @@ static int connects(uint16_t port, bool okOnly = false, bool failOnly = false) {
 }
 static bool outboundHas(const char* sub) { for (auto& r : sim::g_outbound) if (r.find(sub) != std::string::npos) return true; return false; }
 static int outboundCount(const char* sub) { int n = 0; for (auto& r : sim::g_outbound) if (r.find(sub) != std::string::npos) n++; return n; }
-static void forceClose(int shutter) { const char* u = shutter == 1 ? "/?$F1" : "/?$F3"; http(u); runMs(1100); http(u); }   // v4.3.3: the first request arms, a second one at least 1 s later starts
+static void forceClose(int shutter) { http(shutter == 1 ? "/?$F1" : "/?$F3"); http(shutter == 1 ? "/?$G1" : "/?$G3"); }   // v4.3.3: $F arms, $G for the same shutter starts
 static void pressButton(int pin) { sim::g_pinIn[pin] = LOW; runTicks(2); sim::g_pinIn[pin] = HIGH; runTicks(8); }   // ISR debounce: cnt > 6 ticks
 static void seedEepromInitialized() {   // EEPROM as left behind by an earlier firmware: magic + zero counters
   sim::g_eeprom[0] = 0x42; for (int a = 1; a <= 5; a++) sim::g_eeprom[a] = 0;
@@ -646,6 +646,9 @@ SCENARIO(force_close_supervised_stop, "a forced close of a falsely 'closed' shut
   CHECK(!m2ForceClose);
 #endif
   CHECK_CONTAINS(page(), "<h2>Emergency Override</h2>");
+  runTicks(LIM_CONFIRM_TICKS);
+  CHECK_STREQ(status(), "OPEN");                                       // ended by STOP: the firmware cannot know, the level stays doubted
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT ('closed' end switch not trusted)");
 }
 
 SCENARIO(force_close_stopped_early_no_known_position, "an override stopped half way with a flaky 'closed' line: the next OPEN is no full run and stops at the open stop at once") {
@@ -658,6 +661,7 @@ SCENARIO(force_close_stopped_early_no_known_position, "an override stopped half 
 #ifndef PRE_V433
   CHECK_EQ(m2_known_stop, 0);                                          // a level that was ignored during the run proves no position
 #endif
+  CHECK_STREQ(status(), "OPEN"); CHECK_STREQ(ascom(), "CLOSED|STOPPED|INTERMEDIATE|STOPPED");   // and the shutter is not reported closed
   int pos = S[1].pos;
   long before = S[1].ticksMovingOpen;
   http("/?$4"); runTicks(300);
@@ -708,10 +712,11 @@ SCENARIO(force_close_is_one_run, "the override ends with its run: STOP, panel ST
 
 SCENARIO(force_close_only_on_request, "only $F1 / $F3 force: $F, $F2, $F4, $F5 and $Fx do nothing, and $F1 on a healthy closed shutter pushes until the timeout") {
   setPos(2500, 2500); boot();
-  for (int k = 0; k < 2; k++) { http("/?$F"); http("/?$F2"); http("/?$F4"); http("/?$F5"); http("/?$Fx"); http("/?$F0"); }
+  for (int k = 0; k < 2; k++) { http("/?$F"); http("/?$F2"); http("/?$F4"); http("/?$F5"); http("/?$Fx"); http("/?$F0");
+                                http("/?$G"); http("/?$G2"); http("/?$G4"); http("/?$G5"); http("/?$Gx"); http("/?$G0"); }
   runTicks(30);
   CHECK(motorOff(0)); CHECK(motorOff(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
-  http("/?$f3"); runMs(1100); http("/?$f3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));
+  http("/?$f3"); http("/?$g3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));
   http("/?$5"); runTicks(3); CHECK(motorOff(1));
   setPos(0, 2500); runTicks(LIM_CONFIRM_TICKS + 1);                    // shutter 1 really closed, switch fine
   long timeout = dynTimeout_M1_Close;
@@ -840,55 +845,61 @@ SCENARIO(healthy_cycle_no_diagnostics, "a normal open/close cycle of both shutte
   CHECK_CONTAINS(pg, "/?$F1"); CHECK_CONTAINS(pg, "/?$F3");
 }
 
-SCENARIO(force_close_two_step, "the override needs two GET requests 1 to 30 s apart for the same shutter: the first only arms (the page offers CONFIRM NOW); it expires, STOP disarms, a HEAD/GET pair or a double click does not start") {
+SCENARIO(force_close_two_step, "the override needs two different GET requests: $F3 only arms (the page offers CONFIRM NOW = $G3), $G3 within 30 s starts; repeating $F3 never starts; it expires, is per shutter, and STOP, OPEN or the panel STOP disarm") {
   auto raw = [](const std::string& r) { sim::g_pendingRequests.push_back(r); for (int i = 0; i < 120; i++) { sim::tickOnce(); loop(); } };
   setPos(2500, 2500); boot();
+  http("/?$G3"); runTicks(30); CHECK(motorOff(1));                       // nothing armed: the start request alone does nothing
   http("/?$F3"); runTicks(60);
   CHECK(motorOff(0)); CHECK(motorOff(1)); CHECK_EQ(S[1].pos, 2500);        // armed: a stray single request moves nothing
   std::string pg = page();
   CHECK_CONTAINS(s2(pg), "Override ARMED"); CHECK_CONTAINS(s2(pg), "CONFIRM NOW: FORCE CLOSE S2 (West)");
-  CHECK_NOT_CONTAINS(s1(pg), "Override ARMED"); CHECK_NOT_CONTAINS(s1(pg), "/?$F1");
+  CHECK_CONTAINS(s2(pg), "/?$G3"); CHECK_NOT_CONTAINS(s2(pg), "/?$F3");   // the confirm link differs from the arming link
+  CHECK_NOT_CONTAINS(s1(pg), "Override ARMED"); CHECK_NOT_CONTAINS(s1(pg), "/?$F1"); CHECK_NOT_CONTAINS(s1(pg), "/?$G1");
+  for (int k = 0; k < 8; k++) { http("/?$F3"); runMs(2500); }            // the arming request again and again (double click, retried GET): never a start
+  CHECK(motorOff(1)); CHECK_EQ(S[1].pos, 2500);
+  http("/?$F3$F3"); runTicks(30); CHECK(motorOff(1));
   runMs(31000);                                                          // not confirmed in time
   CHECK_NOT_CONTAINS(s2(page()), "Override ARMED");
 #ifndef PRE_V433
   CHECK_EQ(forceArmShutter, 0);                                          // forgotten for good, not only out of its window
 #endif
-  http("/?$F3"); runMs(1100); CHECK(motorOff(1));                        // arms again, still nothing
-  http("/?$F1"); runMs(1100); CHECK(motorOff(0)); CHECK(motorOff(1));    // arming the other shutter replaces it
-  http("/?$F3"); runMs(1100); CHECK(motorOff(0)); CHECK(motorOff(1));    // ... so this one only arms shutter 2 again
-  http("/?$5"); runMs(1100);                                             // STOP cancels the arming
-  http("/?$F3"); runMs(200); CHECK(motorOff(1));                         // so this arms once more
-  http("/?$F3"); runTicks(30); CHECK(motorOff(1));                       // a second request 0.2 s later is a double click: arms afresh
-  http("/?$F3$F3"); runTicks(30); CHECK(motorOff(1));                    // both in one request: no start either
-  runMs(31000);
-  raw("HEAD /?$F3 HTTP/1.1\r\nHost: dome\r\n\r\n"); runMs(1500);          // a link preview: HEAD, then GET
-  http("/?$F3"); runTicks(30); CHECK(motorOff(1));                       // the HEAD armed nothing, the GET only arms
-  runMs(1100);
-  http("/?$F3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));   // the deliberate second request starts
+  http("/?$G3"); runTicks(30); CHECK(motorOff(1));                       // too late
+  http("/?$F3"); http("/?$G1"); runTicks(30); CHECK(motorOff(0)); CHECK(motorOff(1));   // armed for shutter 2: $G1 starts nothing
+  http("/?$F1"); http("/?$G3"); runTicks(30); CHECK(motorOff(0)); CHECK(motorOff(1));   // arming the other shutter replaced it
+  http("/?$5"); http("/?$G1"); runTicks(30); CHECK(motorOff(0));                        // STOP cancels the arming
+  http("/?$F3"); http("/?$4"); http("/?$5"); http("/?$G3"); runTicks(30); CHECK(motorOff(1));   // so does an OPEN for that shutter
+  http("/?$F3"); pressButton(SWSTOP); http("/?$G3"); runTicks(30); CHECK(motorOff(1));  // and the panel STOP button
+  http("/?$F3"); raw("HEAD /?$G3 HTTP/1.1\r\nHost: dome\r\n\r\n"); CHECK(motorOff(1));  // a HEAD is no confirmation
+  raw("HEAD /?$F1 HTTP/1.1\r\nHost: dome\r\n\r\n"); http("/?$G1"); runTicks(30); CHECK(motorOff(0));   // and arms nothing
+  http("/?$F3"); runMs(5000);
+  http("/?$G3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));   // the deliberate pair starts
   CHECK_NOT_CONTAINS(s2(page()), "Override ARMED");
   http("/?$5"); runTicks(3); CHECK(motorOff(1));
+  http("/?$F1$G1"); runTicks(10); CHECK(movingToClosed(0)); CHECK(motorOff(1));   // both in one deliberate request
+  http("/?$5"); runTicks(3); CHECK(motorOff(0));
 }
 
 SCENARIO(force_close_parser, "$F next to other commands, in headers and in a cut-off request never starts or disturbs anything unasked") {
   auto raw = [](const std::string& r) { sim::g_pendingRequests.push_back(r); for (int i = 0; i < 120; i++) { sim::tickOnce(); loop(); } };
   setPos(2500, 2500); boot();
-  http("/?$1$F3"); runMs(1100); http("/?$1$F3"); runTicks(10);           // normal close S1 twice, override for S2 armed then started
+  http("/?$1$F3"); http("/?$1$G3"); runTicks(10);                        // normal close S1 twice, override for S2 armed then started
   CHECK(movingToClosed(0)); CHECK(movingToClosed(1));
 #ifndef PRE_V433
   CHECK(!m1ForceClose); CHECK(m2ForceClose);                             // only the shutter named after the F
 #endif
   http("/?$5"); runTicks(3); CHECK(motorOff(0)); CHECK(motorOff(1));
   http("/?$3"); runTicks(10); CHECK(movingToClosed(1));
-  http("/?$F15"); runMs(1100); http("/?$F15"); runTicks(10);             // "$F1" twice; the 5 behind it is no STOP
+  http("/?$F15"); http("/?$G15"); runTicks(10);                          // "$F1" and "$G1"; the 5 behind them is no STOP
   CHECK(movingToClosed(1)); CHECK(movingToClosed(0));
 #ifndef PRE_V433
   CHECK(m1ForceClose); CHECK(!m2ForceClose);
 #endif
   http("/?$5"); runTicks(3); CHECK(motorOff(0)); CHECK(motorOff(1));
   runMs(31000);                                                          // nothing armed any more
-  for (int k = 0; k < 2; k++) raw("GET / HTTP/1.1\r\nHost: dome\r\nReferer: http://dome/?$F3\r\nCookie: last=$F1\r\n\r\n");
+  raw("GET / HTTP/1.1\r\nHost: dome\r\nReferer: http://dome/?$F3\r\nCookie: last=$F1\r\n\r\n");
+  raw("GET / HTTP/1.1\r\nHost: dome\r\nReferer: http://dome/?$G3\r\nCookie: last=$G1\r\n\r\n");
   CHECK(motorOff(0)); CHECK(motorOff(1));                                // commands count in the request line only
-  raw("GET /?$F"); raw("GET /?$F");                                      // cut off after the F
+  raw("GET /?$F"); raw("GET /?$G");                                      // cut off after the letter
   http("/?$3"); runTicks(10);
   CHECK(movingToClosed(1)); CHECK(motorOff(0));
 #ifndef PRE_V433
@@ -1046,6 +1057,90 @@ SCENARIO(known_position_survives_line_dip, "a short dip of the start end switch 
 #endif
   runMs(130000);
   CHECK(physClosed(1)); CHECK(outboundHas("GET /log?m=2&d=1&t=54"));
+}
+
+SCENARIO(doubt_survives_line_dip, "a doubted 'closed' level stays doubted through a dip of the line at rest: the shutter stopped at the window is not reported closed again") {
+  g_travel = 5485;
+  setPos(0, g_travel); boot(); ensureRemoteCheck(true);
+  http("/?$3"); runTicks(1000); S[1].closedStuck = true; runMs(130000);
+  CHECK(motorOff(1)); CHECK(!physClosed(1)); CHECK_STREQ(status(), "OPEN");
+  S[1].closedStuck = false; runTicks(6); S[1].closedStuck = true; runMs(5000);   // 6 ticks LOW, then active again
+  CHECK_STREQ(status(), "OPEN"); CHECK_STREQ(ascom(), "CLOSED|STOPPED|INTERMEDIATE|STOPPED");   // was CLOSED again, 23 % open
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT ('closed' end switch not trusted)");
+}
+
+SCENARIO(release_check_keeps_stale_level_doubted, "a sticky 'open' switch plus a false 'closed' level: when the release check ends the ignoring, that 'closed' level stays doubted also after the open switch lets go") {
+  g_travel = 5485;
+  setPos(0, 0); boot(); ensureRemoteCheck(true);
+  http("/?$4"); runMs(120000); CHECK(physOpen(1));
+  S[1].openStuck = true;                                               // the open switch does not let go
+  http("/?$3"); runTicks(500); S[1].closedStuck = true;                // and the "closed" line opens
+  int n = 500; while (!motorOff(1) && n < 9000) { runTicks(1); n++; }
+  CHECK(n <= 930); CHECK(!physClosed(1));                              // stopped when the release check gave up the full run
+  runTicks(30);
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT (both end switches active)");
+  S[1].openStuck = false; runMs(5000);                                 // at rest the open switch lets go
+  CHECK_STREQ(status(), "OPEN"); CHECK_STREQ(ascom(), "CLOSED|STOPPED|INTERMEDIATE|STOPPED");   // was CLOSED, 83 % open
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT ('closed' end switch not trusted)");
+}
+
+SCENARIO(failed_release_voids_proven_start, "after a close that failed its release check the open stop is no proven start any more: the next close does not run on past a true early 'closed' level") {
+  g_travel = 5485;
+  setPos(0, 0); boot(); ensureRemoteCheck(true);
+  http("/?$4"); runMs(120000); CHECK(physOpen(1));
+  S[1].openStuck = true;                                               // the "open" line opens at rest: invisible
+  http("/?$3"); runTicks(2200); http("/?$5"); runTicks(30);            // first close: release check fails, stopped half way
+  CHECK(!physClosed(1));
+#ifndef PRE_V433
+  CHECK_EQ(limStuckCount, 1); CHECK(!m2_known_proven);
+#endif
+  int pos = S[1].pos;
+  runMs(60000);
+  http("/?$3"); runTicks(300);
+  S[1].openStuck = false;                                              // the line makes contact again
+  int n = 0; while (!physClosed(1) && n < 9000) { runTicks(1); n++; }
+  long atArrival = S[1].ticksMovingClosed;
+  runMs(140000);
+  CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingClosed - atArrival <= LIM_MIN_RUN_TICKS_CLOSE - pos + LIM_CONFIRM_TICKS + 3);   // to the window, not 76 s to the timeout
+  CHECK(!outboundHas("closed%20on%20timeout"));
+}
+
+SCENARIO(false_open_level_after_window_is_not_proven, "an opening that ends on a false 'open' level just after its window is no proven start: the close from there does not run on past the true 'closed' level") {
+  g_travel = 5485;
+  setPos(0, 0); boot(); ensureRemoteCheck(true);
+  http("/?$4"); runTicks(3900);
+  S[1].openStuck = true;                                               // false "open" level 3900 ticks into the opening: taken as the arrival
+  runMs(20000);
+  CHECK(motorOff(1)); CHECK(!physOpen(1));
+  int pos = S[1].pos;
+#ifndef PRE_V433
+  CHECK(!m2_known_proven);
+#endif
+  runMs(60000);
+  http("/?$3"); runTicks(300);
+  S[1].openStuck = false;
+  int n = 0; while (!physClosed(1) && n < 9000) { runTicks(1); n++; }
+  long atArrival = S[1].ticksMovingClosed;
+  runMs(140000);
+  CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingClosed - atArrival <= LIM_MIN_RUN_TICKS_CLOSE - pos + LIM_CONFIRM_TICKS + 3);   // 5 s, not 66 s to the timeout
+  CHECK(!outboundHas("closed%20on%20timeout"));
+}
+
+SCENARIO(brief_glitch_across_window_end_boot_start, "the same glitch on the first close after a restart with the dome open (no proven start): the close ends at the window, but is reported as not closed and raises limit_fault") {
+  g_travel = 5485;
+  setPos(0, g_travel); boot(); ensureRemoteCheck(true);
+  http("/?$3");
+  while (m2_tick_counter < LIM_MIN_RUN_TICKS_CLOSE - 24 && !motorOff(1)) runTicks(1);
+  S[1].closedGlitchTicks = 60;
+  runMs(130000);
+  CHECK(motorOff(1)); CHECK(!physClosed(1));
+  CHECK_STREQ(status(), "OPEN");                                       // honest: the line is not active any more, the shutter stands 23 % open
+  CHECK(!outboundHas("GET /log?m=2")); CHECK(outboundHas("GET /interrupt?m=2&d=1&t=42"));
+  CHECK_EQ(outboundCount("type=limit_fault&detail=S2%20closed%20switch%20not%20trusted,%20close%20stopped"), 1);
+  http("/?$3"); runMs(60000);                                          // a second close finishes the job
+  CHECK(physClosed(1)); CHECK_STREQ(status(), "CLOSED");
 }
 
 SCENARIO(new_event_not_delayed_by_backoff, "a limit fault that begins while an older event is waiting out a long retry pause is pushed at once") {
