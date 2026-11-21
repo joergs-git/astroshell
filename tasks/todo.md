@@ -91,8 +91,56 @@ Tasks:
       timeouts); then one logged open/close cycle and a check of "Last Valid Full-Runs"; tighten the Portugal timeouts from
       logger data after a few nights. USB is never connected in operation (user), so the pin-0 glitch is line noise
 
+## In progress (2026-11-20/21) — v4.3.3: limit fault, emergency override, plausibility windows (Portugal)
+Incident (Portugal dome 192.168.0.177, v4.3.2, user report 2026-11-20): the West shutter could not be closed. Page: pin 0
+("closed") and pin 1 ("open") both HIGH, "Physically CLOSED" next to stop reason "Limit 'Phys. Open'", last valid West close
+3268 ticks (a full one takes 5485), 8 ignored limit levels (last: M2 at 2191 ticks). Reproduced in the host harness: with both
+levels HIGH every close is refused by its guard, `$S` answers CLOSED, the auto-close skips the shutter. Cause: the pin 0 line
+(switch, wire, terminal or common return), not the firmware; three firmware weaknesses made it worse.
+Decisions:
+- The user asked for the three fixes and for an emergency command that ignores the switch, "only under supervision": the
+  override is explicit (`$F1` / `$F3`), two-step, and no automatic path uses it.
+- A close whose "closed" level is proven false DURING the run (active inside the window, never dropped) runs on to its motor
+  timeout instead of stopping a quarter open: the dome's safe direction completes, the timeout is the designed backstop. This
+  is automatic; it is flagged to the user in the hand-over.
+- Not done (scope): a persistent "closed switch not trusted" lock (refuse OPEN, keep `$S` at OPEN after an interrupted
+  override, clear with a command). Proposed to the user.
+Done:
+- [x] Limit fault state (`shutter*State()`, SH_FAULT): page, `$S` OPEN, `$A` INTERMEDIATE, `limit_fault` event; `$C` gate and
+      conflict check use it; network gates and command guards keep the raw levels on purpose
+- [x] Emergency override `$F1` / `$F3`: arm + confirm within 30 s, one run, cleared by the ISR and by every motor start
+      helper, never reported closed while it runs, web buttons (System Details; shutter block during a fault or while armed)
+- [x] Plausibility windows per physical direction (4220 / 3800 = 80 % of the fastest full run of either dome), valid-run
+      criterion, stale far-end level (run-on for CLOSE, window end for OPEN), known-position rule with arrival tolerance
+- [x] Start-limit release check (915 ticks, 15 s), counted on the page, `limit_stuck` event
+- [x] `reportLimitFaults()`: per-shutter confirmation (1 s), queue that survives the end of an episode, urgent sends spaced by
+      the function, back-off 60 s .. 16 min; `sendEventNotification()` returns bool; event texts in flash
+- [x] Tick logger: priorities and titles for limit_glitch, limit_fault (high, siren), limit_stuck, force_close
+- [x] Host tests: stuck inputs in the physics (`closedStuck` / `openStuck`), 22 new scenarios; 64/74/64 per site green; against
+      v4.3.2 exactly those 22 fail
+- [x] Independent review (subagent, 2026-11-21) of the first version (commit 466f8f6): override mechanics, parser and ISR
+      ordering confirmed (randomized stress, 400 seeds x 4 builds; healthy-dome differential identical to v4.3.2). Findings
+      taken: sustained far-end level ended the run at the window (fixed: stale level / run-on), larger windows doubled the
+      stall after a false start level (fixed: known position), override reported CLOSED while running (fixed), single GET
+      could start the override (fixed: two steps), limit_fault starved by a flapping line / lost with the Solo down / no
+      back-off (fixed), late release (mitigated: 915 instead of 610 ticks). Not taken, documented: persistent distrust lock,
+      abort of an OPEN whose "closed" switch does not release, stop reason after a timeout at an active limit
+- [x] Differential harness after the fixes: 1200 random healthy runs (2 sites x 2 sensor builds x 300 seeds) tick-exact
+      identical to v4.3.2; randomized stress 600 runs without violation
+- [x] Local avr-gcc 7.3 builds (same toolchain version as the IDE core), all 8 variants without sketch warnings:
+      Germany 49758 B flash / 1020 B RAM, Portugal 45612 B / 876 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
+- [x] Web page checked in a browser (fault state, armed state, forced run, confirm dialog)
+- [x] README, CLAUDE.md, firmware header, lessons; MAC :ED / IP_ADR3 177 unchanged
+- [ ] Second review round on the review fixes; CI run of the branch `claude/awesome-ptolemy-uybbio`
+- [ ] Portugal, on site: measure pin 0 to GND with the West shutter away from the closed stop (must be below 0.5 V; 1.5-3.5 V =
+      contact resistance, 5 V = open circuit), operate the West "closed" switch by hand, check the common return of both
+      West switches; then flash v4.3.3 with SITE_PORTUGAL and run sensor test step 8 (CLAUDE.md)
+- [ ] User decision: persistent "closed switch not trusted" lock (see above)
+- [ ] After flashing: watch "Start limit not released" and the limit_stuck events on cold nights; if a healthy run raises it,
+      enlarge LIM_RELEASE_TICKS
+
 ## Next
-- [ ] Germany: flash v4.3.2 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON; limit confirmation + far-end rule apply there too)
+- [ ] Germany: flash v4.3.3 with the default profile when convenient (no EEPROM step; Cloudwatcher check stays ON; limit confirmation, far-end rule, limit fault and override apply there too)
 - [ ] Portugal, later: Solo at 192.168.0.151 -> `$W1`; sensors -> flip `ENABLE_DS18B20_DYNAMIC_TIMEOUT` / `ENABLE_TOF_FROZEN_DETECTION` in the profile, calibrate ToF with `$C`
 - [ ] Germany: flash v4.2.0 (default profile) at a convenient moment; no EEPROM step needed, Cloudwatcher check stays ON
 - [ ] When a VL53L0X is mounted: `ENABLE_TOF_FROZEN_DETECTION 1` (per site if only one dome), calibrate with `$C`

@@ -179,6 +179,7 @@ static int connects(uint16_t port, bool okOnly = false, bool failOnly = false) {
 }
 static bool outboundHas(const char* sub) { for (auto& r : sim::g_outbound) if (r.find(sub) != std::string::npos) return true; return false; }
 static int outboundCount(const char* sub) { int n = 0; for (auto& r : sim::g_outbound) if (r.find(sub) != std::string::npos) n++; return n; }
+static void forceClose(int shutter) { const char* u = shutter == 1 ? "/?$F1" : "/?$F3"; http(u); http(u); }   // v4.3.3: first request arms, second starts
 static void pressButton(int pin) { sim::g_pinIn[pin] = LOW; runTicks(2); sim::g_pinIn[pin] = HIGH; runTicks(8); }   // ISR debounce: cnt > 6 ticks
 static void seedEepromInitialized() {   // EEPROM as left behind by an earlier firmware: magic + zero counters
   sim::g_eeprom[0] = 0x42; for (int a = 1; a <= 5; a++) sim::g_eeprom[a] = 0;
@@ -571,7 +572,7 @@ SCENARIO(limit_fault_open_lines, "the 'open' lines of a closed dome open-circuit
 
 SCENARIO(limit_fault_transient_not_pushed, "both levels active for less than the confirmation time: shown, but no limit_fault event") {
   setPos(0, g_travel); boot(); ensureRemoteCheck(true); runMs(3000);
-  S[1].closedGlitchTicks = 60;                                         // 1 s on the "closed" line at the open stop
+  S[1].closedGlitchTicks = 30;                                         // 0.5 s on the "closed" line at the open stop
   runTicks(LIM_CONFIRM_TICKS + 2);
   CHECK_CONTAINS(s2(page()), "LIMIT FAULT");
   runMs(20000);
@@ -588,14 +589,19 @@ SCENARIO(limit_fault_never_closed_automatically, "cable pulled and Cloudwatcher 
   CHECK(physClosed(0)); CHECK(motorOff(1)); CHECK_EQ(S[1].pos, g_travel); CHECK_EQ(S[1].ticksMovingClosed, 0);
   sim::g_link = sim::LINK_ON; runMs(5000);
   CHECK_STREQ(status(), "OPEN");                                       // and nobody is told the dome is closed
+  http("/?$2"); runMs(100000); CHECK(physOpen(0));                     // second path: the Cloudwatcher stops answering
+  sim::g_reachable[80] = false;
+  runMs(19UL * 60 * 1000);
+  CHECK(physClosed(0)); CHECK(totalAutoCloses >= 2);
+  CHECK(motorOff(1)); CHECK_EQ(S[1].pos, g_travel); CHECK_EQ(S[1].ticksMovingClosed, 0);
 }
 
 SCENARIO(force_close_field_case, "$F3 closes the open West shutter whose 'closed' line is stuck: end switch ignored, runs to the close timeout, never logged as a run") {
   g_travel = 5485;
   setPos(0, g_travel); S[1].closedStuck = true; physicsStep();
-  boot(); ensureRemoteCheck(true); runMs(15000);
+  boot(); ensureRemoteCheck(true); runMs(4000);                        // the limit_fault event went out ~3 s ago
   long timeout = dynTimeout_M2_Close;
-  http("/?$F3"); runTicks(10);
+  forceClose(2); runTicks(10);
   CHECK(movingToClosed(1));
   CHECK(motorOff(0)); CHECK(idle(0)); CHECK_EQ(S[0].ticksMovingClosed, 0);   // the other shutter is not touched
 #ifndef PRE_V433
@@ -605,6 +611,11 @@ SCENARIO(force_close_field_case, "$F3 closes the open West shutter whose 'closed
   CHECK_CONTAINS(s2(pg), "Closing (physically)"); CHECK_CONTAINS(s2(pg), "FORCED, end switch ignored");
   CHECK_CONTAINS(ascom(), "|CLOSING");
   http("/?$3"); runTicks(10); CHECK(movingToClosed(1));                // a rain-checker close during the run does not end it
+  runTicks(600);                                                       // open switch released, only the stuck "closed" level is left
+  CHECK(!physClosed(1)); CHECK(movingToClosed(1));
+  CHECK_STREQ(status(), "OPEN");                                       // a travelling shutter is never reported closed
+  CHECK_STREQ(ascom(), "CLOSED|STOPPED|INTERMEDIATE|CLOSING");
+  CHECK_NOT_CONTAINS(s2(page()), "Physically CLOSED");
   int n = 0; while (!physClosed(1) && n < 9000) { runTicks(1); n++; }
   CHECK(physClosed(1)); CHECK(movingToClosed(1));                      // arrived, still driving: nobody pressed STOP
   n = 0; while (!motorOff(1) && n < 9000) { runTicks(1); n++; }
@@ -616,7 +627,8 @@ SCENARIO(force_close_field_case, "$F3 closes the open West shutter whose 'closed
 #endif
   CHECK_STREQ(status(), "CLOSED"); CHECK_CONTAINS(s2(page()), "Physically CLOSED");
   CHECK(!outboundHas("GET /log?m=2")); CHECK(!outboundHas("GET /interrupt?m=2"));
-  CHECK(outboundHas("GET /event?type=force_close&detail=S2%20forced%20close%20started"));
+  CHECK(outboundHas("GET /event?type=limit_fault&detail=S2%20both%20end%20switches%20active"));
+  CHECK_EQ(outboundCount("GET /event?type=force_close&detail=S2%20forced%20close%20started"), 1);   // not lost 4 s after the limit_fault push
   http("/?$3"); runTicks(30); CHECK(motorOff(1));                      // closed now: a normal close does nothing
 }
 
@@ -625,7 +637,7 @@ SCENARIO(force_close_supervised_stop, "a forced close of a falsely 'closed' shut
   boot(); runTicks(LIM_CONFIRM_TICKS);
   CHECK_CONTAINS(s2(page()), "Physically CLOSED");                     // not detectable from two switch levels
   http("/?$3"); runTicks(30); CHECK(motorOff(1)); CHECK_EQ(S[1].pos, 2200);
-  http("/?$F3"); runTicks(5); CHECK(movingToClosed(1));
+  forceClose(2); runTicks(5); CHECK(movingToClosed(1));
   int n = 0; while (!physClosed(1) && n < 9000) { runTicks(1); n++; }
   CHECK(physClosed(1));
   http("/?$5"); runTicks(3);
@@ -638,19 +650,27 @@ SCENARIO(force_close_supervised_stop, "a forced close of a falsely 'closed' shut
 
 SCENARIO(force_close_is_one_run, "the override ends with its run: STOP, panel STOP, reversal and a chained $5$1 leave a normal motor behind") {
   setPos(2500, 2500); boot();
-  http("/?$F1"); runTicks(20); CHECK(movingToClosed(0)); CHECK(motorOff(1));
+  forceClose(1); runTicks(20); CHECK(movingToClosed(0)); CHECK(motorOff(1));
   pressButton(SWSTOP); CHECK(motorOff(0));
 #ifndef PRE_V433
   CHECK(!m1ForceClose);
 #endif
-  http("/?$F1"); runTicks(20); CHECK(movingToClosed(0));
+  forceClose(1); runTicks(20); CHECK(movingToClosed(0));
+  pressButton(T.btnClose1); CHECK(motorOff(0));                        // a panel direction button stops a running motor, forced or not
+  pressButton(T.btnClose1); runTicks(5); CHECK(movingToClosed(0));     // and the next press starts a normal close
+#ifndef PRE_V433
+  CHECK(!m1ForceClose);
+#endif
+  http("/?$5"); runTicks(3);
+  forceClose(1); runTicks(20); CHECK(movingToClosed(0));
+  int posAtReverse = S[0].pos; long openBefore = S[0].ticksMovingOpen;
   http("/?$2"); runTicks(5); CHECK(movingToOpen(0));                   // reversal: a normal opening
 #ifndef PRE_V433
   CHECK(!m1ForceClose);
 #endif
   runMs(60000); CHECK(physOpen(0)); CHECK(motorOff(0));
-  CHECK(S[0].ticksMovingOpen <= (g_travel - 2500) + 60);               // stopped by the open end switch
-  http("/?$F1"); runTicks(20); CHECK(movingToClosed(0));
+  CHECK(S[0].ticksMovingOpen - openBefore <= (g_travel - posAtReverse) + LIM_CONFIRM_TICKS + 5);   // stopped by the open end switch
+  forceClose(1); runTicks(20); CHECK(movingToClosed(0));
   http("/?$5$1"); runTicks(5);                                         // stop and normal close in ONE request: no ISR tick in between
   CHECK(movingToClosed(0));
 #ifndef PRE_V433
@@ -665,13 +685,14 @@ SCENARIO(force_close_is_one_run, "the override ends with its run: STOP, panel ST
 
 SCENARIO(force_close_only_on_request, "only $F1 / $F3 force: $F, $F2, $F4, $F5 and $Fx do nothing, and $F1 on a healthy closed shutter pushes until the timeout") {
   setPos(2500, 2500); boot();
-  http("/?$F"); http("/?$F2"); http("/?$F4"); http("/?$F5"); http("/?$Fx"); http("/?$F0"); runTicks(30);
+  for (int k = 0; k < 2; k++) { http("/?$F"); http("/?$F2"); http("/?$F4"); http("/?$F5"); http("/?$Fx"); http("/?$F0"); }
+  runTicks(30);
   CHECK(motorOff(0)); CHECK(motorOff(1)); CHECK_EQ(S[0].pos, 2500); CHECK_EQ(S[1].pos, 2500);
-  http("/?$f3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));
+  http("/?$f3"); http("/?$f3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));
   http("/?$5"); runTicks(3); CHECK(motorOff(1));
   setPos(0, 2500); runTicks(LIM_CONFIRM_TICKS + 1);                    // shutter 1 really closed, switch fine
   long timeout = dynTimeout_M1_Close;
-  http("/?$F1"); runTicks(10); CHECK(movingToClosed(0));               // the price of the override: it does not stop by itself
+  forceClose(1); runTicks(10); CHECK(movingToClosed(0));               // the price of the override: it does not stop by itself
   runMs(140000);
   CHECK(motorOff(0)); CHECK(S[0].ticksMovingClosed >= timeout - 3 && S[0].ticksMovingClosed <= timeout + 3);
 }
@@ -720,6 +741,9 @@ SCENARIO(valid_run_needs_min_ticks, "a run stopped by hand while a spurious far-
 }
 
 SCENARIO(stuck_start_limit_near_target, "a stuck 'closed' level with the shutter near the open end: OPEN stops at the open stop after the release check, not after the plausibility window") {
+#ifdef PRE_V433
+  const int LIM_RELEASE_TICKS = 915;                                   // the bound this scenario asks for
+#endif
   setPos(0, g_travel - 500); S[1].closedStuck = true; physicsStep();
   boot(); ensureRemoteCheck(true); runMs(15000);
   CHECK_CONTAINS(s2(page()), "Physically CLOSED");                     // the false start limit
@@ -727,15 +751,13 @@ SCENARIO(stuck_start_limit_near_target, "a stuck 'closed' level with the shutter
   int n = 0, reached = -1;
   while (n < 9000) { runTicks(1); n++; if (reached < 0 && physOpen(1)) reached = n; if (n > 10 && motorOff(1)) break; }
   CHECK(reached > 0 && reached <= 510); CHECK(motorOff(1));
+  CHECK(n - reached <= LIM_RELEASE_TICKS - 500 + LIM_CONFIRM_TICKS + 5);   // ~7 s against the stop (v4.3.2: 32 s; with the new window alone 54 s)
 #ifndef PRE_V433
-  CHECK(n - reached <= LIM_RELEASE_TICKS - 500 + LIM_CONFIRM_TICKS + 5);   // ~2 s against the stop (v4.3.2: 32 s, with the new window 54 s)
   CHECK_EQ(limStuckCount, 1); CHECK_EQ(limStuckMotor, 2);
-#else
-  CHECK(n - reached <= 610 - 500 + LIM_CONFIRM_TICKS + 5);
 #endif
   runMs(5000);
   CHECK(!outboundHas("GET /log?m=2"));                                 // never a valid full run
-  CHECK(outboundHas("GET /interrupt?m=2&d=2&t=61"));
+  CHECK(outboundHas(("GET /interrupt?m=2&d=2&t=" + std::to_string(LIM_RELEASE_TICKS) + "&").c_str()));
   CHECK(outboundHas("GET /event?type=limit_fault&detail=S2%20both%20end%20switches%20active"));   // urgent: not held back by the event spacing
   runMs(60000);                                                        // limit_stuck came 2 s after the limit_glitch of the same run: retried
   CHECK(outboundHas("GET /event?type=limit_stuck&detail=M2%20start%20limit%20not%20released%20(1%20since%20boot)"));
@@ -749,7 +771,7 @@ SCENARIO(stuck_start_limit_near_target, "a stuck 'closed' level with the shutter
 SCENARIO(stuck_start_limit_full_travel, "a 'closed' switch that never releases: the opening still ends at the open stop and is not logged as a valid run") {
   setPos(0, 0); boot(); ensureRemoteCheck(true);
   S[1].closedStuck = true;
-  http("/?$4"); runTicks(LIM_CONFIRM_TICKS + 700);
+  http("/?$4"); runTicks(1100);                                        // past LIM_RELEASE_TICKS
   CHECK(movingToOpen(1));                                              // the check never stops a motor
   runMs(120000);
   CHECK(physOpen(1)); CHECK(motorOff(1));
@@ -760,10 +782,10 @@ SCENARIO(stuck_start_limit_full_travel, "a 'closed' switch that never releases: 
   CHECK(outboundHas("type=limit_fault"));
 }
 
-SCENARIO(stalled_shutter_reported, "a shutter that does not leave its stop: counted and pushed after 10 s, the timeout still ends the run and logs it") {
+SCENARIO(stalled_shutter_reported, "a shutter that does not leave its stop: counted and pushed after 15 s, the timeout still ends the run and logs it") {
   setPos(0, 0); boot(); ensureRemoteCheck(true);
   S[0].stuckOpening = true;
-  http("/?$2"); runTicks(700);
+  http("/?$2"); runTicks(1100);                                        // past LIM_RELEASE_TICKS
   CHECK(movingToOpen(0));
 #ifndef PRE_V433
   CHECK_EQ(limStuckCount, 1); CHECK_EQ(limStuckMotor, 1);
@@ -793,6 +815,148 @@ SCENARIO(healthy_cycle_no_diagnostics, "a normal open/close cycle of both shutte
   CHECK_NOT_CONTAINS(pg, "LIMIT FAULT");
   CHECK_NOT_CONTAINS(s1(pg), "/?$F"); CHECK_NOT_CONTAINS(s2(pg), "/?$F");   // the override lives in System Details only
   CHECK_CONTAINS(pg, "/?$F1"); CHECK_CONTAINS(pg, "/?$F3");
+}
+
+SCENARIO(force_close_two_step, "the override needs two requests: the first $F3 only arms (the page offers CONFIRM NOW), the second within 30 s starts; it expires and is per shutter") {
+  setPos(2500, 2500); boot();
+  http("/?$F3"); runTicks(60);
+  CHECK(motorOff(0)); CHECK(motorOff(1)); CHECK_EQ(S[1].pos, 2500);        // armed: a stray single request moves nothing
+  std::string pg = page();
+  CHECK_CONTAINS(s2(pg), "Override ARMED"); CHECK_CONTAINS(s2(pg), "CONFIRM NOW: FORCE CLOSE S2 (West)");
+  CHECK_NOT_CONTAINS(s1(pg), "Override ARMED"); CHECK_NOT_CONTAINS(s1(pg), "/?$F1");
+  runMs(31000);                                                          // not confirmed in time
+  CHECK_NOT_CONTAINS(s2(page()), "Override ARMED");
+  http("/?$F3"); runTicks(30); CHECK(motorOff(1));                       // arms again, still nothing
+  http("/?$F1"); runTicks(30); CHECK(motorOff(0)); CHECK(motorOff(1));   // arming the other shutter replaces it
+  http("/?$F3"); runTicks(30); CHECK(motorOff(0)); CHECK(motorOff(1));   // ... so this one only arms shutter 2 again
+  http("/?$F3"); runTicks(10); CHECK(movingToClosed(1)); CHECK(motorOff(0));
+  CHECK_NOT_CONTAINS(s2(page()), "Override ARMED");
+  http("/?$5"); runTicks(3); CHECK(motorOff(1));
+  http("/?$F1$F1"); runTicks(10); CHECK(movingToClosed(0)); CHECK(motorOff(1));   // both steps in one deliberate request
+  http("/?$5"); runTicks(3); CHECK(motorOff(0));
+}
+
+SCENARIO(force_close_parser, "$F next to other commands, in headers and in a cut-off request never starts or disturbs anything unasked") {
+  auto raw = [](const std::string& r) { sim::g_pendingRequests.push_back(r); for (int i = 0; i < 120; i++) { sim::tickOnce(); loop(); } };
+  setPos(2500, 2500); boot();
+  http("/?$1$F3"); http("/?$1$F3"); runTicks(10);                        // normal close S1 twice, override for S2 armed then started
+  CHECK(movingToClosed(0)); CHECK(movingToClosed(1));
+#ifndef PRE_V433
+  CHECK(!m1ForceClose); CHECK(m2ForceClose);                             // only the shutter named after the F
+#endif
+  http("/?$5"); runTicks(3); CHECK(motorOff(0)); CHECK(motorOff(1));
+  http("/?$3"); runTicks(10); CHECK(movingToClosed(1));
+  http("/?$F15"); http("/?$F15"); runTicks(10);                          // "$F1" twice; the 5 behind it is no STOP
+  CHECK(movingToClosed(1)); CHECK(movingToClosed(0));
+#ifndef PRE_V433
+  CHECK(m1ForceClose); CHECK(!m2ForceClose);
+#endif
+  http("/?$5"); runTicks(3); CHECK(motorOff(0)); CHECK(motorOff(1));
+  runMs(31000);                                                          // nothing armed any more
+  for (int k = 0; k < 2; k++) raw("GET / HTTP/1.1\r\nHost: dome\r\nReferer: http://dome/?$F3\r\nCookie: last=$F1\r\n\r\n");
+  CHECK(motorOff(0)); CHECK(motorOff(1));                                // commands count in the request line only
+  raw("GET /?$F"); raw("GET /?$F");                                      // cut off after the F
+  http("/?$3"); runTicks(10);
+  CHECK(movingToClosed(1)); CHECK(motorOff(0));
+#ifndef PRE_V433
+  CHECK(!m2ForceClose);                                                  // the 3 of a later request is a normal close
+#endif
+  http("/?$5"); runTicks(3);
+}
+
+SCENARIO(stale_closed_level_runs_on, "a 'closed' level that comes 1000 ticks into a West close and stays: the close runs on to its timeout and ends closed, is not reported closed on the way and is no valid run") {
+  g_travel = 5485;
+  setPos(0, g_travel); boot(); ensureRemoteCheck(true);
+  long timeout = dynTimeout_M2_Close;
+  http("/?$3"); runTicks(1000);
+  S[1].closedStuck = true;                                             // the line opens for good
+  runTicks(200);
+  CHECK(movingToClosed(1));
+  CHECK_STREQ(status(), "OPEN"); CHECK_STREQ(ascom(), "CLOSED|STOPPED|INTERMEDIATE|CLOSING");
+  while (m2_tick_counter < LIM_MIN_RUN_TICKS_CLOSE + 100 && !motorOff(1)) runTicks(1);
+  CHECK(movingToClosed(1)); CHECK(!physClosed(1));                     // until now the run ended here: 23 % open, "CLOSED", logged as valid
+  CHECK_STREQ(status(), "OPEN");
+  int n = 0; while (!physClosed(1) && n < 9000) { runTicks(1); n++; }
+  CHECK(physClosed(1));
+  n = 0; while (!motorOff(1) && n < 9000) { runTicks(1); n++; }
+  CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingClosed >= timeout - 3 && S[1].ticksMovingClosed <= timeout + 3);   // the motor timeout ends it
+  runMs(30000);
+  CHECK_STREQ(status(), "CLOSED");                                     // and now it is closed
+  CHECK(!outboundHas("GET /log?m=2"));
+  CHECK(outboundHas(("GET /interrupt?m=2&d=1&t=" + std::to_string(timeout) + "&").c_str()));
+  CHECK(outboundHas("GET /event?type=limit_glitch&detail=M2%20at%20100"));
+  CHECK_EQ(outboundCount("GET /event?type=limit_fault&detail=S2%20closed%20switch%20stuck,%20closing%20on%20timeout"), 1);
+  http("/?$4"); runMs(120000);                                         // the next opening is still accepted and ends in a limit fault
+  CHECK(physOpen(1)); CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingOpen <= g_travel + LIM_CONFIRM_TICKS + 3);     // from an unknown position: the open stop counts at once
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT"); CHECK_STREQ(status(), "OPEN");
+  CHECK_EQ(outboundCount("type=limit_fault&detail=S2%20both%20end%20switches%20active"), 1);
+}
+
+SCENARIO(stale_open_level_ends_at_window, "the mirror case on an opening still ends at the window (no pushing against the open stop), as an interrupted run from a position that is not known afterwards") {
+  setPos(0, 0); boot(); ensureRemoteCheck(true);
+  http("/?$4"); runTicks(1000);
+  S[1].openStuck = true;
+  runMs(120000);
+  CHECK(motorOff(1)); CHECK(!physOpen(1));
+  CHECK(S[1].ticksMovingOpen >= LIM_MIN_RUN_TICKS_OPEN - 2 && S[1].ticksMovingOpen <= LIM_MIN_RUN_TICKS_OPEN + LIM_CONFIRM_TICKS + 2);
+  CHECK(!outboundHas("GET /log?m=2")); CHECK(outboundHas("GET /interrupt?m=2&d=2&t=38"));
+#ifndef PRE_V433
+  CHECK_EQ(m2_known_stop, 0);
+#endif
+  http("/?$3"); runTicks(20); CHECK(movingToClosed(1));
+#ifndef PRE_V433
+  CHECK(!m2_full_run_active);                                          // unknown position: no far-end rule, the real stop counts at once
+#endif
+  runMs(120000);
+  CHECK(physClosed(1)); CHECK(motorOff(1));
+  CHECK(S[1].ticksMovingClosed <= S[1].ticksMovingOpen + LIM_CONFIRM_TICKS + 5);   // no pushing against the closed stop
+}
+
+SCENARIO(level_appearing_at_rest_is_no_start_limit, "an end switch level that appears while the motor is off (a line that opens at rest, mid-travel) is no start limit: the next run stops at its real end stop at once") {
+  setPos(2200, 2500); boot();
+  S[0].closedStuck = true; S[1].openStuck = true;                      // shutter 1 now reads "closed", shutter 2 "open"; neither moved
+  runTicks(LIM_CONFIRM_TICKS + 2);
+  CHECK_CONTAINS(s1(page()), "Physically CLOSED"); CHECK_CONTAINS(s2(page()), "Physically OPEN");
+  http("/?$2"); http("/?$3"); runTicks(300);                           // open shutter 1, close shutter 2
+  CHECK(movingToOpen(0)); CHECK(movingToClosed(1));
+#ifndef PRE_V433
+  CHECK(!m1_full_run_active); CHECK(!m2_full_run_active);
+#endif
+  S[0].closedStuck = false; S[1].openStuck = false;                    // the false levels drop inside the release time
+  runMs(120000);
+  CHECK(physOpen(0)); CHECK(physClosed(1)); CHECK(motorOff(0)); CHECK(motorOff(1));
+  CHECK(S[0].ticksMovingOpen <= (g_travel - 2200) + LIM_CONFIRM_TICKS + 3);   // before: 998 ticks against the open stop
+  CHECK(S[1].ticksMovingClosed <= 2500 + LIM_CONFIRM_TICKS + 3);              // before: 1718 ticks against the closed stop
+  CHECK(!outboundHas("GET /log"));
+}
+
+SCENARIO(limit_fault_not_starved, "a line that flaps on one shutter does not hide a steady limit fault on the other, and a flapping fault is reported at most once per 5 min") {
+  setPos(g_travel, g_travel); boot(); ensureRemoteCheck(true); runMs(3000);
+  S[1].closedStuck = true;                                             // shutter 2: steady fault
+  for (int k = 0; k < 20; k++) { S[0].closedStuck = true; runMs(500); S[0].closedStuck = false; runMs(500); }   // shutter 1: 1 Hz, never 1 s long
+  CHECK_EQ(outboundCount("type=limit_fault&detail=S2%20both%20end%20switches%20active"), 1);
+  CHECK_EQ(outboundCount("type=limit_fault"), 1);
+  for (int k = 0; k < 60; k++) { S[0].closedStuck = true; runMs(1500); S[0].closedStuck = false; runMs(500); }  // now 1.5 s long episodes for 2 min
+  CHECK_EQ(outboundCount("type=limit_fault"), 1);                      // queued, but one such event went out less than 5 min ago
+  for (int k = 0; k < 100; k++) { S[0].closedStuck = true; runMs(1500); S[0].closedStuck = false; runMs(500); }
+  CHECK_EQ(outboundCount("type=limit_fault&detail=S1%20both%20end%20switches%20active"), 1);
+  CHECK_EQ(outboundCount("type=limit_fault"), 2);
+}
+
+SCENARIO(limit_event_retry_backoff, "with the Solo down a limit fault is retried with a growing pause and is still delivered although the episode ended long ago") {
+  setPos(g_travel, g_travel); boot(); ensureRemoteCheck(true); runMs(3000);
+  sim::g_reachable[88] = false;
+  int before = connects(88, false, true);
+  S[1].closedStuck = true; runMs(5000); S[1].closedStuck = false;      // a 5 s episode that nobody could be told about
+  runMs(30UL * 60 * 1000);
+  int tries = connects(88, false, true) - before;
+  CHECK(tries >= 4 && tries <= 6);                                     // 60, 120, 240, 480, 960 s apart
+  CHECK(!outboundHas("type=limit_fault"));
+  sim::g_reachable[88] = true;
+  runMs(17UL * 60 * 1000);
+  CHECK_EQ(outboundCount("type=limit_fault&detail=S2%20both%20end%20switches%20active"), 1);
 }
 
 //=============================================================================
@@ -912,7 +1076,8 @@ SCENARIO(tick_push_direction, "a full close run is logged as d=1 (closing), a fu
   http("/?$2"); runMs(120000);
   CHECK(physOpen(0));
   CHECK(outboundHas("GET /log?m=1&d=2&t=50"));
-  setPos(g_travel, g_travel); runTicks(5);
+  http("/?$4"); runMs(60000); CHECK(physOpen(1));     // from mid-travel to the open stop: not a full run, not logged
+  CHECK(!outboundHas("GET /log?m=2"));
   http("/?$3"); runMs(120000); CHECK(physClosed(1));
   CHECK(outboundHas("GET /log?m=2&d=1&t=50")); CHECK(!outboundHas("GET /log?m=2&d=2"));
   http("/?$4"); runMs(120000); CHECK(physOpen(1));
@@ -1039,6 +1204,22 @@ SCENARIO(lockout_never_blocks_closing, "during a lockout the other, open shutter
   runMs(120000); CHECK(physClosed(1)); CHECK(motorOff(1));
   CHECK_EQ(frozenDomeState, FD_LOCKOUT);                            // lockout untouched by closing
   CHECK_EQ(S[0].pos, 0); CHECK(idle(0));
+}
+
+SCENARIO(force_close_during_lockout, "frozen lockout on one shutter: the override still closes the other one; an OPEN refused by the lockout does not end it, STOP does") {
+  tofFromPhysics(); seedTofCalibration(100);
+  setPos(0, g_travel); boot(); ensureRemoteCheck(true);
+  S[0].stuckOpening = true;
+  sim::g_tofFn = [] { return S[0].stuckOpening ? 100 : 100 + S[0].pos / 5; };   // the sensor watches the frozen half only
+  http("/?$2"); runMs(100000);
+  CHECK_EQ(frozenDomeState, FD_LOCKOUT);
+  S[1].closedStuck = true; runTicks(LIM_CONFIRM_TICKS + 2);            // shutter 2 is open and its "closed" line opens: limit fault
+  CHECK_CONTAINS(s2(page()), "LIMIT FAULT");
+  forceClose(2); runTicks(20); CHECK(movingToClosed(1));
+  http("/?$4"); runTicks(10); CHECK(movingToClosed(1));                // refused during the lockout, changes nothing
+  CHECK_EQ(frozenDomeState, FD_LOCKOUT);
+  http("/?$5"); runTicks(3); CHECK(motorOff(1));
+  CHECK(idle(0)); CHECK_EQ(S[0].pos, 0);
 }
 
 SCENARIO(cable_autoclose_during_frozen_cycle, "cable pulled during the gravity wait: shutter closes and the frozen cycle never re-opens it") {

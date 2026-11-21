@@ -107,3 +107,9 @@
 - **Root cause:** `sendEventNotification()` returned nothing, so callers could not tell a delivered event from a dropped one; string literals passed as `const char*` live in RAM on AVR
 - **Rule:** An event that must arrive is retried with its own interval and marked sent only on a true return (never on every loop pass: a dead Solo costs 1.5 s per connect). Event texts go through `PSTR` / `strcpy_P` / `snprintf_P`. Found by a test that asserted the event, and by comparing avr-size before and after: do both for every firmware change
 - **Applies to:** every `sendEventNotification()` caller
+
+## [2026-11-21] — The independent review found what my own scenarios could not
+- **Mistake:** My first v4.3.3 moved the plausibility window from 2440 to 4220 ticks and called the 3268-tick field case fixed. A level that stays active simply ended the close at tick 4220 instead, a quarter open, reported CLOSED, logged valid. My scenarios only injected 30-tick levels. The larger window also doubled the time a motor pushes against a stop when a false start level drops in time, and the new override flipped the page to "Physically CLOSED" the moment the open switch released
+- **Root cause:** I tested the fault shape I had in mind (a short glitch) and not the one the field showed last (a line that stays open); I sized a filter without asking what happens at its end; I added a command that changes what a level means without re-reading every reader of that level
+- **Rule:** For every filter ask "what if the input is still wrong when the filter ends" and test a sustained fault next to the short one. After a safety change run the previous release and the new one on the same random healthy sequences and demand identical traces. Request the independent review before calling it done (third time it found real defects), and give the reviewer the code, not the conclusion
+- **Applies to:** domecontrol_JK3.ino limit handling, every filter or override on a safety input
