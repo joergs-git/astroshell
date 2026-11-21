@@ -869,6 +869,10 @@ SCENARIO(force_close_two_step, "the override needs two different GET requests: $
   http("/?$5"); http("/?$G1"); runTicks(30); CHECK(motorOff(0));                        // STOP cancels the arming
   http("/?$F3"); http("/?$4"); http("/?$5"); http("/?$G3"); runTicks(30); CHECK(motorOff(1));   // so does an OPEN for that shutter
   http("/?$F3"); pressButton(SWSTOP); http("/?$G3"); runTicks(30); CHECK(motorOff(1));  // and the panel STOP button
+  http("/?$F3"); sim::g_pinIn[SWSTOP] = LOW; sim::tickOnce(); sim::tickOnce(); sim::g_pinIn[SWSTOP] = HIGH; sim::tickOnce();   // a press that loop() never sees
+  http("/?$G3"); runTicks(30); CHECK(motorOff(1));                       // (the ISR disarms)
+  http("/?$F3"); sim::g_pinIn[SWSTOP] = LOW; runTicks(3); http("/?$G3"); runTicks(30); CHECK(motorOff(1));   // armed while STOP is held: no start
+  sim::g_pinIn[SWSTOP] = HIGH; runTicks(10); http("/?$5");
   http("/?$F3"); raw("HEAD /?$G3 HTTP/1.1\r\nHost: dome\r\n\r\n"); CHECK(motorOff(1));  // a HEAD is no confirmation
   raw("HEAD /?$F1 HTTP/1.1\r\nHost: dome\r\n\r\n"); http("/?$G1"); runTicks(30); CHECK(motorOff(0));   // and arms nothing
   http("/?$F3"); runMs(5000);

@@ -148,11 +148,16 @@ Done:
 - [x] After round 3: differential 2400 random healthy runs identical to v4.3.2; stress with the arm/confirm model 1200 runs,
       about 5990 forced starts per build, no violation
 - [x] Local avr-gcc 7.3 builds (same toolchain version as the IDE core), all 8 variants without sketch warnings:
-      Germany 52242 B flash / 1030 B RAM, Portugal 48106 B / 886 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
+      Germany 52312 B flash / 1030 B RAM, Portugal 48174 B / 886 B (v4.3.2 with this toolchain: 44806 / 933 and 40652 / 789)
 - [x] Web page checked in a browser (fault state, armed state, forced run, confirm dialog)
 - [x] README, CLAUDE.md, firmware header, lessons; MAC :ED / IP_ADR3 177 unchanged
 - [x] CI green on the branch `claude/awesome-ptolemy-uybbio` for 466f8f6 (run 44837003639) and 1d768a4 (run 44843137607):
       host suite + 8 Arduino builds
+- [x] Final check by the reviewer (2026-11-21) of commit 3c65104, limited to the arm/confirm split and the end of an
+      override: no blocker (27 URL and two-request cases, own stress model 300 seeds x 4 builds). Taken from its remarks:
+      the panel STOP disarms in the ISR (a short press was missed while loop() was blocked), `$G` is ignored while the
+      panel STOP is held, the confirm dialog says what the page shows after STOP
+- [x] CI green for 9c3667a (run 44849933164)
 - [ ] CI run of the final commit
 - [ ] Portugal, on site: measure pin 0 to GND with the West shutter away from the closed stop (must be below 0.5 V; 1.5-3.5 V =
       contact resistance, 5 V = open circuit), operate the West "closed" switch by hand, check the common return of both

@@ -489,7 +489,7 @@ byte forceCloseEvent = 0;                  // loop(): bit0 S1, bit1 S2: override
 // a client that retries a GET, a request that waited while loop() was blocked) cannot push a motor
 // against its stop. Both are taken from GET requests only; STOP and an OPEN command disarm.
 #define FORCE_ARM_MS 30000UL
-byte forceArmShutter = 0;                  // loop(): 0 = not armed, 1 / 2 = shutter waiting for its second $F
+volatile byte forceArmShutter = 0;         // 0 = not armed, 1 / 2 = shutter waiting for its $G; written by loop(), zeroed by the ISR's STOP branch
 unsigned long forceArmTime = 0;            // millis() of the arming request
 // Stale far-end level (v4.3.3): a far-end level that became active while it could not be true (see
 // LIM_FAR_END_IMPLAUSIBLE) and has not dropped since is the same false level, not an arrival, also
@@ -960,18 +960,18 @@ static void forceCloseArm(byte motor) {
 static inline bool forceArmedFor(byte motor) {
   return forceArmShutter == motor && millis() - forceArmTime <= FORCE_ARM_MS;
 }
-// $G1 / $G3 as received: start the override if it is armed for that shutter.
+// $G1 / $G3 as received: start the override if it is armed for that shutter (never while the panel STOP is held).
 static void forceCloseConfirm(byte motor) {
-  if (forceArmedFor(motor)) {
+  if (forceArmedFor(motor) && !swstop_pressed_flag) {
     forceArmShutter = 0;
     forceCloseShutter(motor);
   }
 }
 // Called from loop(): an arming that was not confirmed is forgotten for good (otherwise the comparison
-// above would be true again for 30 s every time millis() wraps, after 49.7 days); the panel STOP
-// button disarms like $5.
+// above would be true again for 30 s every time millis() wraps, after 49.7 days). The panel STOP
+// button disarms in the ISR, where even a short press is seen while loop() is blocked.
 static inline void forceArmExpire() {
-  if (forceArmShutter != 0 && (millis() - forceArmTime > FORCE_ARM_MS || swstop_pressed_flag)) forceArmShutter = 0;
+  if (forceArmShutter != 0 && millis() - forceArmTime > FORCE_ARM_MS) forceArmShutter = 0;
 }
 
 // FIX (P1): after the third frozen verdict an OPEN is refused at once (the state machine
@@ -3181,7 +3181,7 @@ static void printForceCloseButton(Print& client, byte shutter) {
   client.print(shutter == 1 ? '1' : '3');
   client.print(F("' class='button b-stop fullwidth' style='margin-top:8px;'"));
   if (!armed) client.print(F(" onclick=\"return confirm('FORCE CLOSE: the closed end switch is IGNORED. The motor runs until STOP or the motor timeout. Watch the shutter! After OK press CONFIRM NOW on the page within 30 s.')\""));
-  else        client.print(F(" onclick=\"return confirm('START the forced close now? Press STOP when the shutter is closed.')\""));
+  else        client.print(F(" onclick=\"return confirm('START the forced close now? Press STOP when the shutter is closed. After STOP it is shown as not trusted until its switch has worked again.')\""));
   client.print(armed ? F(">CONFIRM NOW: FORCE CLOSE S") : F(">FORCE CLOSE S"));
   client.print(shutter);
   client.print(shutter == 1 ? F(" (East)") : F(" (West)"));
@@ -3691,6 +3691,7 @@ ISR(TIMER2_COMPA_vect) {
   if (!digitalRead(SWSTOP)) {
     if (!swstop_pressed_flag) {
       fdExternalCommand |= FD_CMD_ALL;   // FIX (P1): STOP cancels a frozen-dome cycle even if motors are already off
+      forceArmShutter = 0;               // v4.3.3: ... and an armed emergency override
       if (mot1dir != 0 || mot2dir != 0) {
         mot1dir = 0; mot2dir = 0;
         stop1reason = 1; stop2reason = 1;
